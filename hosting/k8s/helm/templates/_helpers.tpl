@@ -563,7 +563,7 @@ Generate docker config for image pull secret
 Create the name of the webapp service account to use
 */}}
 {{- define "trigger-v4.webappServiceAccountName" -}}
-{{- if .Values.supervisor.serviceAccount.create }}
+{{- if .Values.webapp.serviceAccount.create }}
 {{- default (printf "%s-webapp" (include "trigger-v4.fullname" .)) .Values.webapp.serviceAccount.name }}
 {{- else }}
 {{- default "default" .Values.webapp.serviceAccount.name }}
