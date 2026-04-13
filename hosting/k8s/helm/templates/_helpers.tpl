@@ -410,7 +410,7 @@ ClickHouse URL for application (with secure parameter)
 {{- $protocol := ternary "https" "http" .Values.clickhouse.external.secure -}}
 {{- $secure := ternary "true" "false" .Values.clickhouse.external.secure -}}
 {{- if .Values.clickhouse.external.existingSecret -}}
-{{ $protocol }}://{{ .Values.clickhouse.external.username }}:${CLICKHOUSE_PASSWORD}@{{ .Values.clickhouse.external.host }}:{{ .Values.clickhouse.external.httpPort | default 8123 }}?secure={{ $secure }}
+{{ $protocol }}://{{ .Values.clickhouse.external.username }}:$(CLICKHOUSE_PASSWORD)@{{ .Values.clickhouse.external.host }}:{{ .Values.clickhouse.external.httpPort | default 8123 }}?secure={{ $secure }}
 {{- else -}}
 {{ $protocol }}://{{ .Values.clickhouse.external.username }}:{{ .Values.clickhouse.external.password }}@{{ .Values.clickhouse.external.host }}:{{ .Values.clickhouse.external.httpPort | default 8123 }}?secure={{ $secure }}
 {{- end -}}
@@ -427,7 +427,7 @@ ClickHouse URL for replication (without secure parameter)
 {{- else if .Values.clickhouse.external.host -}}
 {{- $protocol := ternary "https" "http" .Values.clickhouse.external.secure -}}
 {{- if .Values.clickhouse.external.existingSecret -}}
-{{ $protocol }}://{{ .Values.clickhouse.external.username }}:${CLICKHOUSE_PASSWORD}@{{ .Values.clickhouse.external.host }}:{{ .Values.clickhouse.external.httpPort | default 8123 }}
+{{ $protocol }}://{{ .Values.clickhouse.external.username }}:$(CLICKHOUSE_PASSWORD)@{{ .Values.clickhouse.external.host }}:{{ .Values.clickhouse.external.httpPort | default 8123 }}
 {{- else -}}
 {{ $protocol }}://{{ .Values.clickhouse.external.username }}:{{ .Values.clickhouse.external.password }}@{{ .Values.clickhouse.external.host }}:{{ .Values.clickhouse.external.httpPort | default 8123 }}
 {{- end -}}
