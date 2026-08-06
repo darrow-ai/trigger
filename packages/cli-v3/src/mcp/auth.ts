@@ -1,14 +1,14 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { env } from "std-env";
 import { CliApiClient } from "../apiClient.js";
 import { CLOUD_API_URL } from "../consts.js";
 import { readAuthConfigProfile, writeAuthConfigProfile } from "../utilities/configFiles.js";
 import { NotAccessTokenError, validateAccessToken } from "../utilities/accessTokens.js";
-import { LoginResult, LoginResultOk } from "../utilities/session.js";
+import type { LoginResult, LoginResultOk } from "../utilities/session.js";
 import { getPersonalAccessToken } from "../commands/login.js";
 import open from "open";
 import pRetry from "p-retry";
-import { McpContext } from "./context.js";
+import type { McpContext } from "./context.js";
 import { ApiClient } from "@trigger.dev/core/v3";
 
 export type McpAuthOptions = {
@@ -123,9 +123,10 @@ export async function mcpAuth(options: McpAuthOptions): Promise<LoginResult> {
   const indexResult = await pRetry(
     () => getPersonalAccessToken(apiClient, authorizationCodeResult.authorizationCode),
     {
-      //this means we're polling, same distance between each attempt
+      //poll at a fixed 1s interval. ~5 min window so the user has time to
+      //approve the consent screen; stays within the code's 10-min validity.
       factor: 1,
-      retries: 60,
+      retries: 300,
       minTimeout: 1000,
     }
   );

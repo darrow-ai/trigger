@@ -62,7 +62,7 @@ export const toolsMetadata = {
     name: "trigger_task",
     title: "Trigger Task",
     description:
-      "Trigger a task in the project. Use the get_tasks tool to get a list of tasks and ask the user to select one if it's not clear which one to use. Use the wait_for_run_to_complete tool to wait for the run to complete.",
+      "Trigger a task in the project. Use the get_tasks tool to get a list of tasks and ask the user to select one if it's not clear which one to use. The run executes in the background, so only wait for it to complete (with the wait_for_run_to_complete tool) if the user asked you to.",
   },
   get_run_details: {
     name: "get_run_details",
@@ -136,17 +136,21 @@ export const toolsMetadata = {
     description:
       "Execute a single widget query from a built-in dashboard. Use list_dashboards first to see available dashboards, widget IDs, and their queries. Supports time period and scope options.",
   },
+  get_report: {
+    name: "get_report",
+    title: "Get Report",
+    description:
+      "Render an interpreted report (an answered question, not a raw panel) as text + sparklines. The server computes the verdict deterministically. Currently: 'health' — whether work is flowing, whether the runs that start are healthy, and whether the telemetry is fresh, with a headline verdict and a suggested next action.",
+  },
   whoami: {
     name: "whoami",
     title: "Who Am I",
-    description:
-      "Show the current authenticated user, active CLI profile, email, and API URL.",
+    description: "Show the current authenticated user, active CLI profile, email, and API URL.",
   },
   list_profiles: {
     name: "list_profiles",
     title: "List Profiles",
-    description:
-      "List all configured CLI profiles. Shows which profile is currently active.",
+    description: "List all configured CLI profiles. Shows which profile is currently active.",
   },
   switch_profile: {
     name: "switch_profile",
@@ -212,5 +216,29 @@ export const toolsMetadata = {
     title: "Reactivate Prompt Override",
     description:
       "Reactivate a previous dashboard-sourced version as the active override. Use get_prompt_versions to find dashboard versions that can be reactivated.",
+  },
+  list_agents: {
+    name: "list_agents",
+    title: "List Agents",
+    description:
+      "List all chat agents in the current worker. Agents are tasks created with chat.agent() or chat.customAgent(). Use start_agent_chat with an agent's slug to start a conversation.",
+  },
+  start_agent_chat: {
+    name: "start_agent_chat",
+    title: "Start Agent Chat",
+    description:
+      "Start a conversation with a chat agent. Returns a chatId you can use with send_agent_message. Optionally preloads the agent so it initializes before the first message.",
+  },
+  send_agent_message: {
+    name: "send_agent_message",
+    title: "Send Agent Message",
+    description:
+      "Send a message to an active agent chat and get the full response text back. Use the chatId from start_agent_chat. The agent remembers full context from previous messages in the same chat.",
+  },
+  close_agent_chat: {
+    name: "close_agent_chat",
+    title: "Close Agent Chat",
+    description:
+      "Close an agent chat conversation. The agent exits its loop gracefully. Without this, the agent will close on its own when its idle timeout expires.",
   },
 };

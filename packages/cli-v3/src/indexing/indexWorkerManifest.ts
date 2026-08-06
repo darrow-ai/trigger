@@ -1,14 +1,12 @@
 import { execPathForRuntime } from "@trigger.dev/core/v3/build";
 import {
+  DuplicateTaskIdsError,
   TaskIndexingImportError,
   TaskMetadataParseError,
   UncaughtExceptionError,
 } from "@trigger.dev/core/v3/errors";
-import {
-  BuildRuntime,
-  indexerToWorkerMessages,
-  WorkerManifest,
-} from "@trigger.dev/core/v3/schemas";
+import type { BuildRuntime, WorkerManifest } from "@trigger.dev/core/v3/schemas";
+import { indexerToWorkerMessages } from "@trigger.dev/core/v3/schemas";
 import { parseMessageFromCatalog } from "@trigger.dev/core/v3/zodMessageHandler";
 import { fork } from "node:child_process";
 
@@ -86,6 +84,13 @@ export async function indexWorkerManifest({
           clearTimeout(timeout);
           resolved = true;
           reject(new TaskMetadataParseError(message.payload.zodIssues, message.payload.tasks));
+          child.kill("SIGKILL");
+          break;
+        }
+        case "TASKS_FAILED_TO_INDEX": {
+          clearTimeout(timeout);
+          resolved = true;
+          reject(new DuplicateTaskIdsError(message.payload.collisions));
           child.kill("SIGKILL");
           break;
         }

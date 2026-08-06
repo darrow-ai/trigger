@@ -1,35 +1,47 @@
 import {
   type MachinePreset,
   prettyPrintPacket,
+  RunAnnotations,
   SemanticInternalAttributes,
   type TaskRunContext,
   TaskRunError,
   TriggerTraceContext,
   type V3TaskRunContext,
 } from "@trigger.dev/core/v3";
+
 import { AttemptId, getMaxDuration, parseTraceparent } from "@trigger.dev/core/v3/isomorphic";
+import { runOpsLegacyReplica, runOpsNewReplica, runOpsSplitReadEnabled } from "~/db.server";
 import {
   extractIdempotencyKeyScope,
   getUserProvidedIdempotencyKey,
 } from "@trigger.dev/core/v3/serverOnly";
+import {
+  extractAIEmbedData,
+  extractAISpanData,
+  extractAISummarySpanData,
+  extractAIToolCallData,
+} from "~/components/runs/v3/ai";
 import { RUNNING_STATUSES } from "~/components/runs/v3/TaskRunStatus";
+import { baseWorkerQueue } from "~/runEngine/concerns/workerQueueSplit.server";
 import { logger } from "~/services/logger.server";
+import { safeJsonParse } from "~/utils/json";
 import { rehydrateAttribute } from "~/v3/eventRepository/eventRepository.server";
+import type { IEventRepository } from "~/v3/eventRepository/eventRepository.types";
+import { getEventRepositoryForStore } from "~/v3/eventRepository/index.server";
 import { machinePresetFromRun } from "~/v3/machinePresets.server";
+import { findRunByIdWithMollifierFallback } from "~/v3/mollifier/readFallback.server";
+import { buildSyntheticSpanRun } from "~/v3/mollifier/syntheticSpanRun.server";
+import { engine } from "~/v3/runEngine.server";
+import { runStore } from "~/v3/runStore.server";
 import { getTaskEventStoreTableForRun, type TaskEventStoreTable } from "~/v3/taskEventStore.server";
 import { isFailedRunStatus, isFinalRunStatus } from "~/v3/taskStatus";
 import { BasePresenter } from "./basePresenter.server";
 import { WaitpointPresenter } from "./WaitpointPresenter.server";
-import { engine } from "~/v3/runEngine.server";
-import { resolveEventRepositoryForStore } from "~/v3/eventRepository/index.server";
-import { IEventRepository, SpanDetail } from "~/v3/eventRepository/eventRepository.types";
-import { safeJsonParse } from "~/utils/json";
 import {
-  extractAISpanData,
-  extractAISummarySpanData,
-  extractAIToolCallData,
-  extractAIEmbedData,
-} from "~/components/runs/v3/ai";
+  controlPlaneResolver,
+  type ResolvedRunLockedWorker,
+} from "~/v3/runOpsMigration/controlPlaneResolver.server";
+import type { AuthenticatedEnvironment } from "@trigger.dev/core/v3/auth/environment";
 
 export type PromptSpanData = {
   slug: string;
@@ -42,9 +54,7 @@ export type PromptSpanData = {
   config?: string;
 };
 
-function extractPromptSpanData(
-  properties: Record<string, unknown>
-): PromptSpanData | undefined {
+function extractPromptSpanData(properties: Record<string, unknown>): PromptSpanData | undefined {
   // Properties come as an unflattened nested object from ClickHouse,
   // e.g. { prompt: { slug: "...", version: 3, ... } }
   const prompt = properties.prompt;
@@ -72,24 +82,38 @@ function extractPromptSpanData(
   };
 }
 
+// Grounded in `getRun` (the canonical shape source), not inferred from `call`:
+// `call`'s buffered branch returns `buildSyntheticSpanRun` which is annotated
+// `Promise<SpanRun>`, so deriving SpanRun from `call` would be a circular type
+// reference TS rejects. `getRun` doesn't recurse, breaking the cycle.
+export type SpanRun = NonNullable<
+  Awaited<ReturnType<InstanceType<typeof SpanPresenter>["getRun"]>>
+>;
 type Result = Awaited<ReturnType<SpanPresenter["call"]>>;
 export type Span = NonNullable<NonNullable<Result>["span"]>;
-export type SpanRun = NonNullable<NonNullable<Result>["run"]>;
 type FindRunResult = NonNullable<
   Awaited<ReturnType<InstanceType<typeof SpanPresenter>["findRun"]>>
 >;
-type GetSpanResult = SpanDetail;
 
+// Run-ops TaskRun reads (parent run in `call`, hydrate in `findRun`, children in
+// `#getSpan`) go through the `runStore` seam; split routing is the RoutingRunStore's
+// job below it. Control-plane reads stay on `this._replica`/`this._prisma`.
 export class SpanPresenter extends BasePresenter {
   public async call({
     userId,
     projectSlug,
+    envSlug,
     spanId,
     runFriendlyId,
     linkedRunId,
   }: {
     userId: string;
     projectSlug: string;
+    // Optional for backwards compatibility, required for the mollifier
+    // buffer fallback when the parent run isn't yet in PG — we need to
+    // resolve the env id to satisfy `findRunByIdWithMollifierFallback`'s
+    // auth check.
+    envSlug?: string;
     spanId: string;
     runFriendlyId: string;
     linkedRunId?: string;
@@ -111,35 +135,66 @@ export class SpanPresenter extends BasePresenter {
       throw new Error("Project not found");
     }
 
-    const parentRun = await this._prisma.taskRun.findFirst({
-      select: {
-        traceId: true,
-        runtimeEnvironmentId: true,
-        projectId: true,
-        taskEventStore: true,
-        createdAt: true,
-        completedAt: true,
-      },
-      where: {
+    const parentRun = await runStore.findRun(
+      {
         friendlyId: runFriendlyId,
         projectId: project.id,
       },
-    });
+      {
+        select: {
+          traceId: true,
+          runtimeEnvironmentId: true,
+          projectId: true,
+          taskEventStore: true,
+          createdAt: true,
+          completedAt: true,
+        },
+      },
+      this._prisma
+    );
 
     if (!parentRun) {
-      return;
+      // PG miss → fall back to the mollifier buffer. Without this the
+      // right-side span detail panel on the run-detail page never
+      // resolves for buffered runs: `call()` returns undefined, the
+      // resource route redirects with an "Event not found" toast, the
+      // run-detail page reloads, the toast fires again — a perpetual
+      // spin until the drainer materialises the row. Synthesise a
+      // SpanRun straight from the buffer snapshot, reusing
+      // `buildSyntheticSpanRun` (the same helper the run-detail
+      // loader's header fallback already uses).
+      if (!envSlug) return;
+      const envRow = await this._replica.runtimeEnvironment.findFirst({
+        where: { project: { id: project.id }, slug: envSlug },
+        select: { id: true, slug: true, type: true, organizationId: true },
+      });
+      if (!envRow) return;
+      const buffered = await findRunByIdWithMollifierFallback({
+        runId: runFriendlyId,
+        environmentId: envRow.id,
+        organizationId: envRow.organizationId,
+      });
+      if (!buffered) return;
+      const synth = await buildSyntheticSpanRun({
+        run: buffered,
+        environment: { id: envRow.id, slug: envRow.slug, type: envRow.type },
+      });
+      return { type: "run" as const, run: synth };
     }
 
     const { traceId } = parentRun;
 
-    const eventRepository = resolveEventRepositoryForStore(parentRun.taskEventStore);
+    const repository = await getEventRepositoryForStore(
+      parentRun.taskEventStore,
+      project.organizationId
+    );
 
     const eventStore = getTaskEventStoreTableForRun(parentRun);
 
     const run = await this.getRun({
       eventStore,
       traceId,
-      eventRepository,
+      eventRepository: repository,
       spanId,
       linkedRunId,
       createdAt: parentRun.createdAt,
@@ -161,7 +216,7 @@ export class SpanPresenter extends BasePresenter {
       projectId: parentRun.projectId,
       createdAt: parentRun.createdAt,
       completedAt: parentRun.completedAt,
-      eventRepository,
+      eventRepository: repository,
     });
 
     if (!span) {
@@ -200,21 +255,34 @@ export class SpanPresenter extends BasePresenter {
       return;
     }
 
+    const environment = await controlPlaneResolver.resolveAuthenticatedEnv(
+      run.runtimeEnvironmentId
+    );
+
+    if (!environment) {
+      return undefined;
+    }
+
+    const lockedWorker = await controlPlaneResolver.resolveRunLockedWorker({
+      lockedById: run.lockedById,
+      lockedToVersionId: run.lockedToVersionId,
+    });
+
     const isFinished = isFinalRunStatus(run.status);
     const output = !isFinished
       ? undefined
       : run.outputType === "application/store"
-      ? `/resources/packets/${run.runtimeEnvironment.id}/${run.output}`
-      : typeof run.output !== "undefined" && run.output !== null
-      ? await prettyPrintPacket(run.output, run.outputType ?? undefined)
-      : undefined;
+        ? `/resources/packets/${environment.id}/${run.output}`
+        : typeof run.output !== "undefined" && run.output !== null
+          ? await prettyPrintPacket(run.output, run.outputType ?? undefined)
+          : undefined;
 
     const payload =
       run.payloadType === "application/store"
-        ? `/resources/packets/${run.runtimeEnvironment.id}/${run.payload}`
+        ? `/resources/packets/${environment.id}/${run.payload}`
         : typeof run.payload !== "undefined" && run.payload !== null
-        ? await prettyPrintPacket(run.payload, run.payloadType ?? undefined)
-        : undefined;
+          ? await prettyPrintPacket(run.payload, run.payloadType ?? undefined)
+          : undefined;
 
     let error: TaskRunError | undefined = undefined;
 
@@ -238,25 +306,81 @@ export class SpanPresenter extends BasePresenter {
 
     const machine = run.machinePreset ? machinePresetFromRun(run) : undefined;
 
-    const context = await this.#getTaskRunContext({ run, machine: machine ?? undefined });
+    const context = await this.#getTaskRunContext({
+      run,
+      machine: machine ?? undefined,
+      environment,
+      lockedWorker,
+    });
 
     const externalTraceId = this.#getExternalTraceId(run.traceContext);
 
+    const taskKind = RunAnnotations.safeParse(run.annotations).data?.taskKind;
+    const isAgentRun = taskKind === "AGENT";
+    const isScheduled = taskKind === "SCHEDULED";
+
     let region: { name: string; location: string | null } | null = null;
 
-    if (run.runtimeEnvironment.type !== "DEVELOPMENT" && run.engine !== "V1") {
+    if (environment.type !== "DEVELOPMENT" && run.engine !== "V1") {
       const workerGroup = await this._replica.workerInstanceGroup.findFirst({
         select: {
           name: true,
           location: true,
         },
         where: {
-          masterQueue: run.workerQueue,
+          // masterQueue is unique and IS the run's backing queue, so this finds
+          // the group the run actually ran on.
+          masterQueue: baseWorkerQueue(run.workerQueue),
         },
       });
 
-      region = workerGroup ?? null;
+      // Show the stamped geo region as the name so a migrated run never reveals
+      // its compute backing; fall back to the group name for unstamped runs.
+      region = workerGroup
+        ? { name: run.region ?? workerGroup.name, location: workerGroup.location }
+        : null;
     }
+
+    // Only AGENT-tagged runs can be session-bound, so skip the SessionRun lookup
+    // for the much larger set of standard runs — the cheapest query is the one we
+    // don't run.
+    const sessionRun = isAgentRun
+      ? await this._replica.sessionRun.findFirst({
+          where: { runId: run.id },
+          select: {
+            reason: true,
+            triggeredAt: true,
+            session: {
+              select: {
+                friendlyId: true,
+                externalId: true,
+                type: true,
+                taskIdentifier: true,
+                closedAt: true,
+                expiresAt: true,
+              },
+            },
+          },
+        })
+      : null;
+
+    const session = sessionRun
+      ? {
+          friendlyId: sessionRun.session.friendlyId,
+          externalId: sessionRun.session.externalId,
+          type: sessionRun.session.type,
+          taskIdentifier: sessionRun.session.taskIdentifier,
+          status:
+            sessionRun.session.closedAt != null
+              ? ("CLOSED" as const)
+              : sessionRun.session.expiresAt != null &&
+                  sessionRun.session.expiresAt.getTime() < Date.now()
+                ? ("EXPIRED" as const)
+                : ("ACTIVE" as const),
+          reason: sessionRun.reason,
+          triggeredAt: sessionRun.triggeredAt,
+        }
+      : undefined;
 
     return {
       id: run.id,
@@ -273,13 +397,13 @@ export class SpanPresenter extends BasePresenter {
       logsDeletedAt: run.logsDeletedAt,
       ttl: run.ttl,
       taskIdentifier: run.taskIdentifier,
-      version: run.lockedToVersion?.version,
-      sdkVersion: run.lockedToVersion?.sdkVersion,
-      runtime: run.lockedToVersion?.runtime,
-      runtimeVersion: run.lockedToVersion?.runtimeVersion,
+      version: lockedWorker?.lockedToVersion?.version,
+      sdkVersion: lockedWorker?.lockedToVersion?.sdkVersion,
+      runtime: lockedWorker?.lockedToVersion?.runtime,
+      runtimeVersion: lockedWorker?.lockedToVersion?.runtimeVersion,
       isTest: run.isTest,
       replayedFromTaskRunFriendlyId: run.replayedFromTaskRunFriendlyId,
-      environmentId: run.runtimeEnvironment.id,
+      environmentId: environment.id,
       idempotencyKey: getUserProvidedIdempotencyKey(run),
       idempotencyKeyExpiresAt: run.idempotencyKeyExpiresAt,
       idempotencyKeyScope: extractIdempotencyKeyScope(run),
@@ -299,6 +423,8 @@ export class SpanPresenter extends BasePresenter {
       isFinished,
       isRunning: RUNNING_STATUSES.includes(run.status),
       isError: isFailedRunStatus(run.status),
+      isAgentRun,
+      isScheduled,
       payload,
       payloadType: run.payloadType,
       output,
@@ -317,12 +443,14 @@ export class SpanPresenter extends BasePresenter {
       metadata,
       maxDurationInSeconds: getMaxDuration(run.maxDurationInSeconds),
       batch: run.batch ? { friendlyId: run.batch.friendlyId } : undefined,
+      session,
       engine: run.engine,
       region,
       workerQueue: run.workerQueue,
       traceId: run.traceId,
       spanId: run.spanId,
       isCached: !!linkedRunId,
+      isBuffered: false,
       machinePreset: machine?.name,
       taskEventStore: run.taskEventStore,
       externalTraceId,
@@ -391,119 +519,8 @@ export class SpanPresenter extends BasePresenter {
     spanId: string;
     environmentId: string;
   }) {
-    const run = await this._replica.taskRun.findFirst({
-      select: {
-        id: true,
-        spanId: true,
-        traceId: true,
-        traceContext: true,
-        //metadata
-        number: true,
-        taskIdentifier: true,
-        friendlyId: true,
-        isTest: true,
-        maxDurationInSeconds: true,
-        taskEventStore: true,
-        runTags: true,
-        machinePreset: true,
-        lockedToVersion: {
-          select: {
-            version: true,
-            sdkVersion: true,
-            runtime: true,
-            runtimeVersion: true,
-          },
-        },
-        engine: true,
-        workerQueue: true,
-        error: true,
-        output: true,
-        outputType: true,
-        //status + duration
-        status: true,
-        statusReason: true,
-        startedAt: true,
-        executedAt: true,
-        createdAt: true,
-        updatedAt: true,
-        queuedAt: true,
-        completedAt: true,
-        logsDeletedAt: true,
-        //idempotency
-        idempotencyKey: true,
-        idempotencyKeyExpiresAt: true,
-        idempotencyKeyOptions: true,
-        //debounce
-        debounce: true,
-        //delayed
-        delayUntil: true,
-        //ttl
-        ttl: true,
-        expiredAt: true,
-        //queue
-        queue: true,
-        concurrencyKey: true,
-        //schedule
-        scheduleId: true,
-        //usage
-        baseCostInCents: true,
-        costInCents: true,
-        usageDurationMs: true,
-        //env
-        runtimeEnvironment: {
-          select: { id: true, slug: true, type: true },
-        },
-        payload: true,
-        payloadType: true,
-        metadata: true,
-        metadataType: true,
-        maxAttempts: true,
-        project: {
-          include: {
-            organization: true,
-          },
-        },
-        lockedBy: {
-          select: {
-            filePath: true,
-          },
-        },
-        //relationships
-        rootTaskRun: {
-          select: {
-            taskIdentifier: true,
-            friendlyId: true,
-            spanId: true,
-            createdAt: true,
-          },
-        },
-        parentTaskRun: {
-          select: {
-            taskIdentifier: true,
-            friendlyId: true,
-            spanId: true,
-          },
-        },
-        batch: {
-          select: {
-            friendlyId: true,
-          },
-        },
-        replayedFromTaskRunFriendlyId: true,
-        attempts: {
-          take: 1,
-          orderBy: {
-            createdAt: "desc",
-          },
-          select: {
-            number: true,
-            status: true,
-            createdAt: true,
-            friendlyId: true,
-          },
-        },
-      },
-      where: originalRunId
+    const run = await runStore.findRun(
+      originalRunId
         ? {
             friendlyId: originalRunId,
             runtimeEnvironmentId: environmentId,
@@ -512,7 +529,104 @@ export class SpanPresenter extends BasePresenter {
             spanId,
             runtimeEnvironmentId: environmentId,
           },
-    });
+      {
+        select: {
+          id: true,
+          runtimeEnvironmentId: true,
+          lockedById: true,
+          lockedToVersionId: true,
+          spanId: true,
+          traceId: true,
+          traceContext: true,
+          //metadata
+          number: true,
+          taskIdentifier: true,
+          friendlyId: true,
+          isTest: true,
+          maxDurationInSeconds: true,
+          taskEventStore: true,
+          runTags: true,
+          machinePreset: true,
+          engine: true,
+          workerQueue: true,
+          region: true,
+          error: true,
+          output: true,
+          outputType: true,
+          //status + duration
+          status: true,
+          statusReason: true,
+          startedAt: true,
+          executedAt: true,
+          createdAt: true,
+          updatedAt: true,
+          queuedAt: true,
+          completedAt: true,
+          logsDeletedAt: true,
+          //idempotency
+          idempotencyKey: true,
+          idempotencyKeyExpiresAt: true,
+          idempotencyKeyOptions: true,
+          //debounce
+          debounce: true,
+          //delayed
+          delayUntil: true,
+          //ttl
+          ttl: true,
+          expiredAt: true,
+          //queue
+          queue: true,
+          concurrencyKey: true,
+          //schedule
+          scheduleId: true,
+          //usage
+          baseCostInCents: true,
+          costInCents: true,
+          usageDurationMs: true,
+          payload: true,
+          payloadType: true,
+          metadata: true,
+          metadataType: true,
+          annotations: true,
+          maxAttempts: true,
+          //relationships
+          rootTaskRun: {
+            select: {
+              taskIdentifier: true,
+              friendlyId: true,
+              spanId: true,
+              createdAt: true,
+            },
+          },
+          parentTaskRun: {
+            select: {
+              taskIdentifier: true,
+              friendlyId: true,
+              spanId: true,
+            },
+          },
+          batch: {
+            select: {
+              friendlyId: true,
+            },
+          },
+          replayedFromTaskRunFriendlyId: true,
+          attempts: {
+            take: 1,
+            orderBy: {
+              createdAt: "desc",
+            },
+            select: {
+              number: true,
+              status: true,
+              createdAt: true,
+              friendlyId: true,
+            },
+          },
+        },
+      },
+      this._replica
+    );
 
     return run;
   }
@@ -550,18 +664,21 @@ export class SpanPresenter extends BasePresenter {
       return;
     }
 
-    const triggeredRuns = await this._replica.taskRun.findMany({
-      select: {
-        friendlyId: true,
-        taskIdentifier: true,
-        spanId: true,
-        createdAt: true,
-        status: true,
+    const triggeredRuns = await runStore.findRuns(
+      {
+        where: {
+          parentSpanId: spanId,
+        },
+        select: {
+          friendlyId: true,
+          taskIdentifier: true,
+          spanId: true,
+          createdAt: true,
+          status: true,
+        },
       },
-      where: {
-        parentSpanId: spanId,
-      },
-    });
+      this._replica
+    );
 
     const data = {
       spanId: span.spanId,
@@ -592,10 +709,7 @@ export class SpanPresenter extends BasePresenter {
       triggeredRuns,
       aiData:
         span.properties && typeof span.properties === "object"
-          ? extractAISpanData(
-              span.properties as Record<string, unknown>,
-              span.duration / 1_000_000
-            )
+          ? extractAISpanData(span.properties as Record<string, unknown>, span.duration / 1_000_000)
           : undefined,
     };
 
@@ -609,7 +723,11 @@ export class SpanPresenter extends BasePresenter {
           return { ...data, entity: null };
         }
 
-        const presenter = new WaitpointPresenter();
+        const presenter = new WaitpointPresenter(undefined, undefined, {
+          newClient: runOpsNewReplica,
+          legacyReplica: runOpsLegacyReplica,
+          splitEnabled: runOpsSplitReadEnabled,
+        });
         const waitpoint = await presenter.call({
           friendlyId: span.entity.id,
           environmentId,
@@ -739,10 +857,7 @@ export class SpanPresenter extends BasePresenter {
           "ai.streamObject",
         ];
 
-        if (
-          typeof span.message === "string" &&
-          AI_SUMMARY_MESSAGES.includes(span.message)
-        ) {
+        if (typeof span.message === "string" && AI_SUMMARY_MESSAGES.includes(span.message)) {
           const aiSummaryData = extractAISummarySpanData(
             span.properties as Record<string, unknown>,
             span.duration / 1_000_000
@@ -859,9 +974,19 @@ export class SpanPresenter extends BasePresenter {
     };
   }
 
-  async #getTaskRunContext({ run, machine }: { run: FindRunResult; machine?: MachinePreset }) {
+  async #getTaskRunContext({
+    run,
+    machine,
+    environment,
+    lockedWorker,
+  }: {
+    run: FindRunResult;
+    machine?: MachinePreset;
+    environment: AuthenticatedEnvironment;
+    lockedWorker: ResolvedRunLockedWorker | null;
+  }) {
     if (run.engine === "V1") {
-      return this.#getV3TaskRunContext({ run, machine });
+      return this.#getV3TaskRunContext({ run, machine, environment, lockedWorker });
     } else {
       return this.#getV4TaskRunContext({ run });
     }
@@ -870,9 +995,13 @@ export class SpanPresenter extends BasePresenter {
   async #getV3TaskRunContext({
     run,
     machine,
+    environment,
+    lockedWorker,
   }: {
     run: FindRunResult;
     machine?: MachinePreset;
+    environment: AuthenticatedEnvironment;
+    lockedWorker: ResolvedRunLockedWorker | null;
   }): Promise<V3TaskRunContext> {
     const attempt = run.attempts[0];
 
@@ -892,20 +1021,21 @@ export class SpanPresenter extends BasePresenter {
           },
       task: {
         id: run.taskIdentifier,
-        filePath: run.lockedBy?.filePath ?? "",
+        filePath: lockedWorker?.lockedBy?.filePath ?? "",
       },
       run: {
         id: run.friendlyId,
         createdAt: run.createdAt,
         tags: run.runTags,
         isTest: run.isTest,
+        isReplay: !!run.replayedFromTaskRunFriendlyId,
         idempotencyKey: getUserProvidedIdempotencyKey(run) ?? undefined,
         startedAt: run.startedAt ?? run.createdAt,
         durationMs: run.usageDurationMs,
         costInCents: run.costInCents,
         baseCostInCents: run.baseCostInCents,
         maxAttempts: run.maxAttempts ?? undefined,
-        version: run.lockedToVersion?.version,
+        version: lockedWorker?.lockedToVersion?.version,
         maxDuration: run.maxDurationInSeconds ?? undefined,
       },
       queue: {
@@ -913,20 +1043,20 @@ export class SpanPresenter extends BasePresenter {
         id: run.queue,
       },
       environment: {
-        id: run.runtimeEnvironment.id,
-        slug: run.runtimeEnvironment.slug,
-        type: run.runtimeEnvironment.type,
+        id: environment.id,
+        slug: environment.slug,
+        type: environment.type,
       },
       organization: {
-        id: run.project.organization.id,
-        slug: run.project.organization.slug,
-        name: run.project.organization.title,
+        id: environment.organization.id,
+        slug: environment.organization.slug,
+        name: environment.organization.title,
       },
       project: {
-        id: run.project.id,
-        ref: run.project.externalRef,
-        slug: run.project.slug,
-        name: run.project.name,
+        id: environment.project.id,
+        ref: environment.project.externalRef,
+        slug: environment.project.slug,
+        name: environment.project.name,
       },
       machine,
     } satisfies V3TaskRunContext;

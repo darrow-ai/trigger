@@ -1,5 +1,4 @@
 import { Form, useActionData, useSearchParams } from "@remix-run/react";
-import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/server-runtime";
 import { redirect } from "@remix-run/server-runtime";
 import { typedjson } from "remix-typedjson";
 import { z } from "zod";
@@ -7,16 +6,13 @@ import { useState } from "react";
 import { Button, LinkButton } from "~/components/primitives/Buttons";
 import { Input } from "~/components/primitives/Input";
 import { prisma } from "~/db.server";
-import { requireUserId } from "~/services/session.server";
+import { dashboardAction, dashboardLoader } from "~/services/routeBuilders/dashboardBuilder";
 import { generateFriendlyId } from "~/v3/friendlyIdentifiers";
 import { llmPricingRegistry } from "~/v3/llmPricingRegistry.server";
 
-export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const userId = await requireUserId(request);
-  const user = await prisma.user.findUnique({ where: { id: userId } });
-  if (!user?.admin) throw redirect("/");
+export const loader = dashboardLoader({ authorization: { requireSuper: true } }, async () => {
   return typedjson({});
-};
+});
 
 const CreateSchema = z.object({
   modelName: z.string().min(1),
@@ -28,85 +24,102 @@ const CreateSchema = z.object({
   maxOutputTokens: z.string().optional(),
   capabilities: z.string().optional(),
   isHidden: z.string().optional(),
+  pricingUnit: z.string().optional(),
 });
 
-export async function action({ request }: ActionFunctionArgs) {
-  const userId = await requireUserId(request);
-  const user = await prisma.user.findUnique({ where: { id: userId } });
-  if (!user?.admin) throw redirect("/");
+export const action = dashboardAction(
+  { authorization: { requireSuper: true } },
+  async ({ request }) => {
+    const formData = await request.formData();
+    const raw = Object.fromEntries(formData);
+    console.log("[admin] create model form data:", JSON.stringify(raw).slice(0, 500));
+    const parsed = CreateSchema.safeParse(raw);
 
-  const formData = await request.formData();
-  const raw = Object.fromEntries(formData);
-  console.log("[admin] create model form data:", JSON.stringify(raw).slice(0, 500));
-  const parsed = CreateSchema.safeParse(raw);
+    if (!parsed.success) {
+      console.log("[admin] create model validation error:", JSON.stringify(parsed.error.issues));
+      return typedjson(
+        { error: "Invalid form data", details: parsed.error.issues },
+        { status: 400 }
+      );
+    }
 
-  if (!parsed.success) {
-    console.log("[admin] create model validation error:", JSON.stringify(parsed.error.issues));
-    return typedjson({ error: "Invalid form data", details: parsed.error.issues }, { status: 400 });
-  }
+    const { modelName, matchPattern, pricingTiersJson } = parsed.data;
 
-  const { modelName, matchPattern, pricingTiersJson } = parsed.data;
+    // Validate regex — strip (?i) POSIX flag since our registry handles it
+    try {
+      const testPattern = matchPattern.startsWith("(?i)") ? matchPattern.slice(4) : matchPattern;
+      new RegExp(testPattern);
+    } catch {
+      return typedjson({ error: "Invalid regex in matchPattern" }, { status: 400 });
+    }
 
-  // Validate regex — strip (?i) POSIX flag since our registry handles it
-  try {
-    const testPattern = matchPattern.startsWith("(?i)") ? matchPattern.slice(4) : matchPattern;
-    new RegExp(testPattern);
-  } catch {
-    return typedjson({ error: "Invalid regex in matchPattern" }, { status: 400 });
-  }
+    let pricingTiers: Array<{
+      name: string;
+      isDefault: boolean;
+      priority: number;
+      conditions: Array<{ usageDetailPattern: string; operator: string; value: number }>;
+      prices: Record<string, number>;
+    }>;
+    try {
+      pricingTiers = JSON.parse(pricingTiersJson) as typeof pricingTiers;
+    } catch {
+      return typedjson({ error: "Invalid pricing tiers JSON" }, { status: 400 });
+    }
 
-  let pricingTiers: Array<{
-    name: string;
-    isDefault: boolean;
-    priority: number;
-    conditions: Array<{ usageDetailPattern: string; operator: string; value: number }>;
-    prices: Record<string, number>;
-  }>;
-  try {
-    pricingTiers = JSON.parse(pricingTiersJson) as typeof pricingTiers;
-  } catch {
-    return typedjson({ error: "Invalid pricing tiers JSON" }, { status: 400 });
-  }
+    const {
+      provider,
+      description,
+      contextWindow,
+      maxOutputTokens,
+      capabilities,
+      isHidden,
+      pricingUnit,
+    } = parsed.data;
 
-  const { provider, description, contextWindow, maxOutputTokens, capabilities, isHidden } = parsed.data;
-
-  const model = await prisma.llmModel.create({
-    data: {
-      friendlyId: generateFriendlyId("llm_model"),
-      modelName,
-      matchPattern,
-      source: "admin",
-      provider: provider || null,
-      description: description || null,
-      contextWindow: contextWindow ? parseInt(contextWindow) || null : null,
-      maxOutputTokens: maxOutputTokens ? parseInt(maxOutputTokens) || null : null,
-      capabilities: capabilities ? capabilities.split(",").map((s) => s.trim()).filter(Boolean) : [],
-      isHidden: isHidden === "on",
-    },
-  });
-
-  for (const tier of pricingTiers) {
-    await prisma.llmPricingTier.create({
+    const model = await prisma.llmModel.create({
       data: {
-        modelId: model.id,
-        name: tier.name,
-        isDefault: tier.isDefault,
-        priority: tier.priority,
-        conditions: tier.conditions,
-        prices: {
-          create: Object.entries(tier.prices).map(([usageType, price]) => ({
-            modelId: model.id,
-            usageType,
-            price,
-          })),
-        },
+        friendlyId: generateFriendlyId("llm_model"),
+        modelName,
+        matchPattern,
+        source: "admin",
+        provider: provider || null,
+        description: description || null,
+        contextWindow: contextWindow ? parseInt(contextWindow) || null : null,
+        maxOutputTokens: maxOutputTokens ? parseInt(maxOutputTokens) || null : null,
+        capabilities: capabilities
+          ? capabilities
+              .split(",")
+              .map((s) => s.trim())
+              .filter(Boolean)
+          : [],
+        isHidden: isHidden === "on",
+        pricingUnit: pricingUnit || null,
       },
     });
-  }
 
-  await llmPricingRegistry?.reload();
-  return redirect(`/admin/llm-models/${model.friendlyId}`);
-}
+    for (const tier of pricingTiers) {
+      await prisma.llmPricingTier.create({
+        data: {
+          modelId: model.id,
+          name: tier.name,
+          isDefault: tier.isDefault,
+          priority: tier.priority,
+          conditions: tier.conditions,
+          prices: {
+            create: Object.entries(tier.prices).map(([usageType, price]) => ({
+              modelId: model.id,
+              usageType,
+              price,
+            })),
+          },
+        },
+      });
+    }
+
+    await llmPricingRegistry?.reload();
+    return redirect(`/admin/llm-models/${model.friendlyId}`);
+  }
+);
 
 export default function AdminLlmModelNewRoute() {
   const actionData = useActionData<{ error?: string; details?: unknown[] }>();
@@ -120,17 +133,22 @@ export default function AdminLlmModelNewRoute() {
   const [maxOutputTokens, setMaxOutputTokens] = useState("");
   const [capabilities, setCapabilities] = useState("");
   const [isHidden, setIsHidden] = useState(false);
+  const [pricingUnit, setPricingUnit] = useState("tokens");
   const [testInput, setTestInput] = useState("");
   const [tiers, setTiers] = useState<TierData[]>([
-    { name: "Standard", isDefault: true, priority: 0, conditions: [], prices: { input: 0, output: 0 } },
+    {
+      name: "Standard",
+      isDefault: true,
+      priority: 0,
+      conditions: [],
+      prices: { input: 0, output: 0 },
+    },
   ]);
 
   let testResult: boolean | null = null;
   if (testInput && matchPattern) {
     try {
-      const pattern = matchPattern.startsWith("(?i)")
-        ? matchPattern.slice(4)
-        : matchPattern;
+      const pattern = matchPattern.startsWith("(?i)") ? matchPattern.slice(4) : matchPattern;
       testResult = new RegExp(pattern, "i").test(testInput);
     } catch {
       testResult = null;
@@ -173,7 +191,9 @@ export default function AdminLlmModelNewRoute() {
 
             <div className="space-y-2">
               <div className="flex items-center justify-between">
-                <label className="text-xs font-medium text-text-dimmed">Match Pattern (regex)</label>
+                <label className="text-xs font-medium text-text-dimmed">
+                  Match Pattern (regex)
+                </label>
                 <button
                   type="button"
                   onClick={autoPattern}
@@ -269,7 +289,9 @@ export default function AdminLlmModelNewRoute() {
                   />
                 </div>
                 <div className="space-y-1">
-                  <label className="text-xs font-medium text-text-dimmed">Features (comma-separated)</label>
+                  <label className="text-xs font-medium text-text-dimmed">
+                    Features (comma-separated)
+                  </label>
                   <Input
                     name="capabilities"
                     value={capabilities}
@@ -279,6 +301,23 @@ export default function AdminLlmModelNewRoute() {
                     placeholder="vision, tool_use, streaming, json_mode"
                   />
                 </div>
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-xs font-medium text-text-dimmed">Pricing Unit</label>
+                <select
+                  name="pricingUnit"
+                  value={pricingUnit}
+                  onChange={(e) => setPricingUnit(e.target.value)}
+                  className="w-full rounded border border-grid-dimmed bg-background-hover px-2 py-1.5 text-sm text-text-bright"
+                >
+                  <option value="">(unset)</option>
+                  {PRICING_UNITS.map((u) => (
+                    <option key={u} value={u}>
+                      {u}
+                    </option>
+                  ))}
+                </select>
               </div>
 
               <label className="flex items-center gap-2 text-xs text-text-dimmed">
@@ -368,6 +407,16 @@ type TierData = {
   prices: Record<string, number>;
 };
 
+const PRICING_UNITS = [
+  "tokens",
+  "characters",
+  "images",
+  "minutes",
+  "requests",
+  "free",
+  "not_findable",
+];
+
 const COMMON_USAGE_TYPES = [
   "input",
   "output",
@@ -388,11 +437,11 @@ function TierEditor({
   const [newUsageType, setNewUsageType] = useState("");
 
   return (
-    <div className="rounded-md border border-grid-dimmed bg-charcoal-800 p-3 space-y-3">
+    <div className="rounded-md border border-grid-dimmed bg-background-bright p-3 space-y-3">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           <input
-            className="bg-charcoal-750 text-text-bright rounded px-2 py-1 text-sm border border-grid-dimmed"
+            className="bg-background-hover text-text-bright rounded px-2 py-1 text-sm border border-grid-dimmed"
             value={tier.name}
             onChange={(e) => onChange({ ...tier, name: e.target.value })}
             placeholder="Tier name"
@@ -409,7 +458,7 @@ function TierEditor({
             Priority:
             <input
               type="number"
-              className="w-12 bg-charcoal-750 text-text-bright rounded px-1 py-0.5 text-xs border border-grid-dimmed"
+              className="w-12 bg-background-hover text-text-bright rounded px-1 py-0.5 text-xs border border-grid-dimmed"
               value={tier.priority}
               onChange={(e) => onChange({ ...tier, priority: parseInt(e.target.value) || 0 })}
             />
@@ -432,7 +481,7 @@ function TierEditor({
               <span className="w-48 text-xs font-mono text-text-dimmed">{usageType}</span>
               <input
                 type="text"
-                className="w-32 bg-charcoal-750 text-text-bright rounded px-2 py-0.5 text-xs font-mono border border-grid-dimmed"
+                className="w-32 bg-background-hover text-text-bright rounded px-2 py-0.5 text-xs font-mono border border-grid-dimmed"
                 value={price}
                 onChange={(e) => {
                   const val = parseFloat(e.target.value);
@@ -457,7 +506,7 @@ function TierEditor({
 
         <div className="flex items-center gap-2 pt-1">
           <select
-            className="bg-charcoal-750 text-text-dimmed rounded px-2 py-0.5 text-xs border border-grid-dimmed"
+            className="bg-background-hover text-text-dimmed rounded px-2 py-0.5 text-xs border border-grid-dimmed"
             value={newUsageType}
             onChange={(e) => setNewUsageType(e.target.value)}
           >
@@ -475,9 +524,7 @@ function TierEditor({
               variant="tertiary/small"
               onClick={() => {
                 const key =
-                  newUsageType === "__custom"
-                    ? prompt("Usage type name:") ?? ""
-                    : newUsageType;
+                  newUsageType === "__custom" ? (prompt("Usage type name:") ?? "") : newUsageType;
                 if (key) {
                   onChange({ ...tier, prices: { ...tier.prices, [key]: 0 } });
                   setNewUsageType("");

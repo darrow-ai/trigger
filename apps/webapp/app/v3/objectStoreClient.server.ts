@@ -2,6 +2,16 @@ import { AwsClient } from "aws4fetch";
 import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
+/**
+ * Normalize a logical object-store key the same way Aws4FetchClient assigns URL pathnames.
+ * Decodes percent-escapes and resolves `.` / `..` segments before the request is signed.
+ */
+export function normalizeObjectStoreLogicalKeyPathname(logicalKey: string): string {
+  const url = new URL("https://trigger.invalid");
+  url.pathname = `/${logicalKey.replace(/^\/+/, "")}`;
+  return url.pathname;
+}
+
 interface IObjectStoreClient {
   putObject(key: string, body: ReadableStream | string, contentType: string): Promise<string>;
   getObject(key: string): Promise<string>;
@@ -32,11 +42,15 @@ class Aws4FetchClient implements IObjectStoreClient {
 
   private buildUrl(key: string): string {
     const url = new URL(this.config.baseUrl);
-    url.pathname = `/${key}`;
+    url.pathname = normalizeObjectStoreLogicalKeyPathname(key);
     return url.toString();
   }
 
-  async putObject(key: string, body: ReadableStream | string, contentType: string): Promise<string> {
+  async putObject(
+    key: string,
+    body: ReadableStream | string,
+    contentType: string
+  ): Promise<string> {
     const objectUrl = this.buildUrl(key);
     const response = await this.awsClient.fetch(objectUrl, {
       method: "PUT",
@@ -59,7 +73,7 @@ class Aws4FetchClient implements IObjectStoreClient {
 
   async presign(key: string, method: "PUT" | "GET", expiresIn: number): Promise<string> {
     const url = new URL(this.config.baseUrl);
-    url.pathname = `/${key}`;
+    url.pathname = normalizeObjectStoreLogicalKeyPathname(key);
     url.searchParams.set("X-Amz-Expires", String(expiresIn));
 
     const signed = await this.awsClient.sign(new Request(url, { method }), {
@@ -100,11 +114,15 @@ class AwsSdkClient implements IObjectStoreClient {
 
   private logicalObjectUrl(logicalKey: string): string {
     const url = new URL(this.config.baseUrl);
-    url.pathname = `/${logicalKey}`;
+    url.pathname = normalizeObjectStoreLogicalKeyPathname(logicalKey);
     return url.href;
   }
 
-  async putObject(key: string, body: ReadableStream | string, contentType: string): Promise<string> {
+  async putObject(
+    key: string,
+    body: ReadableStream | string,
+    contentType: string
+  ): Promise<string> {
     const s3Key = this.toS3ObjectKey(key);
     await this.s3Client.send(
       new PutObjectCommand({

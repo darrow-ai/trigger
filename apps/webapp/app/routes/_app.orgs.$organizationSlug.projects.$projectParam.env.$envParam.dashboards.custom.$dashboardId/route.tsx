@@ -2,7 +2,8 @@ import { ArrowUpCircleIcon, PlusIcon, TrashIcon } from "@heroicons/react/20/soli
 import { DialogClose } from "@radix-ui/react-dialog";
 import { type ActionFunctionArgs, type LoaderFunctionArgs } from "@remix-run/node";
 import { Form, useNavigation } from "@remix-run/react";
-import { IconChartHistogram, IconEdit, IconTypography } from "@tabler/icons-react";
+import { IconChartHistogram, IconEdit } from "@tabler/icons-react";
+import { Type } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { typedjson, useTypedLoaderData } from "remix-typedjson";
 import { z } from "zod";
@@ -35,7 +36,7 @@ import { Sheet, SheetContent } from "~/components/primitives/SheetV3";
 import { useToast } from "~/components/primitives/Toast";
 import { SimpleTooltip } from "~/components/primitives/Tooltip";
 import { QueryEditor, type QueryEditorSaveData } from "~/components/query/QueryEditor";
-import { $replica, prisma } from "~/db.server";
+import { prisma } from "~/db.server";
 import { env } from "~/env.server";
 import { useDashboardEditor } from "~/hooks/useDashboardEditor";
 import { useEnvironment } from "~/hooks/useEnvironment";
@@ -44,10 +45,11 @@ import { useProject } from "~/hooks/useProject";
 import { redirectWithSuccessMessage } from "~/models/message.server";
 import { findProjectBySlug } from "~/models/project.server";
 import { findEnvironmentBySlug } from "~/models/runtimeEnvironment.server";
-import { getAllTaskIdentifiers } from "~/models/task.server";
+import { getTaskIdentifiers } from "~/models/task.server";
 import { MetricDashboardPresenter } from "~/presenters/v3/MetricDashboardPresenter.server";
 import { QueryPresenter } from "~/presenters/v3/QueryPresenter.server";
-import { requireUser, requireUserId } from "~/services/session.server";
+import { removeFavoritesByUrlSubstring } from "~/services/dashboardPreferences.server";
+import { hasAdminDisplayAccess, requireUser } from "~/services/session.server";
 import {
   EnvironmentParamSchema,
   queryPath,
@@ -56,7 +58,6 @@ import {
 } from "~/utils/pathBuilder";
 import { MetricDashboard } from "../_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.dashboards.$dashboardKey/route";
 import { useCurrentPlan } from "../_app.orgs.$organizationSlug/route";
-import { Type } from "lucide-react";
 
 const ParamSchema = EnvironmentParamSchema.extend({
   dashboardId: z.string(),
@@ -93,11 +94,11 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     queryPresenter.call({
       organizationId: project.organizationId,
     }),
-    getAllTaskIdentifiers($replica, environment.id),
+    getTaskIdentifiers(environment.id),
   ]);
 
   // Admins and impersonating users can use EXPLAIN
-  const isAdmin = user.admin || user.isImpersonating;
+  const isAdmin = hasAdminDisplayAccess(user);
 
   // Compute widget count from dashboard layout
   const widgetCount = Object.keys(dashboard.layout.widgets).length;
@@ -109,18 +110,16 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     queryHistory: history,
     isAdmin,
     maxRows: env.QUERY_CLICKHOUSE_MAX_RETURNED_ROWS,
-    possibleTasks: possibleTasks
-      .map((task) => ({ slug: task.slug, triggerSource: task.triggerSource }))
-      .sort((a, b) => a.slug.localeCompare(b.slug)),
+    possibleTasks,
     widgetCount,
   });
 };
 
 export const action = async ({ request, params }: ActionFunctionArgs) => {
-  const userId = await requireUserId(request);
+  const user = await requireUser(request);
   const { projectParam, organizationSlug, envParam, dashboardId } = ParamSchema.parse(params);
 
-  const project = await findProjectBySlug(organizationSlug, projectParam, userId);
+  const project = await findProjectBySlug(organizationSlug, projectParam, user.id);
   if (!project) {
     throw new Response("Project not found", { status: 404 });
   }
@@ -144,6 +143,12 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     case "delete": {
       await prisma.metricsDashboard.delete({
         where: { id: dashboard.id },
+      });
+
+      // Drop any favorites pointing at this dashboard so the side menu doesn't keep a dead link
+      await removeFavoritesByUrlSubstring({
+        user,
+        substring: `/dashboards/custom/${dashboard.friendlyId}`,
       });
 
       return redirectWithSuccessMessage(
@@ -187,7 +192,7 @@ export default function Page() {
     isAdmin,
     maxRows,
     possibleTasks,
-    widgetCount: initialWidgetCount,
+    widgetCount: _initialWidgetCount,
   } = useTypedLoaderData<typeof loader>();
 
   const organization = useOrganization();
@@ -207,19 +212,22 @@ export default function Page() {
 
   const toast = useToast();
 
-  const handleSyncError = useCallback((error: Error, action: string) => {
-    const actionMessages: Record<string, string> = {
-      add: "Failed to add widget",
-      update: "Failed to update widget",
-      delete: "Failed to delete widget",
-      duplicate: "Failed to duplicate widget",
-      layout: "Failed to save layout",
-    };
+  const handleSyncError = useCallback(
+    (error: Error, action: string) => {
+      const actionMessages: Record<string, string> = {
+        add: "Failed to add widget",
+        update: "Failed to update widget",
+        delete: "Failed to delete widget",
+        duplicate: "Failed to duplicate widget",
+        layout: "Failed to save layout",
+      };
 
-    const message = actionMessages[action] || "Failed to save changes";
+      const message = actionMessages[action] || "Failed to save changes";
 
-    toast.error(`${message}. Your changes may not be saved.`, { title: "Sync Error" });
-  }, [toast]);
+      toast.error(`${message}. Your changes may not be saved.`, { title: "Sync Error" });
+    },
+    [toast]
+  );
 
   // Add title dialog state
   const [showAddTitleDialog, setShowAddTitleDialog] = useState(false);
@@ -351,88 +359,99 @@ export default function Page() {
       })()
     : null;
 
+  const dashboardMenu = (
+    <Popover>
+      <PopoverVerticalEllipseTrigger variant="secondary" />
+      <PopoverContent className="w-fit min-w-40 p-1" align="end">
+        <div className="flex flex-col gap-1">
+          <RenameDashboardDialog title={title} />
+          <DeleteDashboardDialog title={title} />
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+
+  const filterAccessories = (
+    <div className="flex items-center gap-x-1.5">
+      {widgetIsAtLimit ? (
+        <>
+          <Dialog>
+            <DialogTrigger asChild>
+              <Button variant="primary/small" LeadingIcon={PlusIcon} shortcut={{ key: "c" }}>
+                Add chart
+              </Button>
+            </DialogTrigger>
+            <DialogContent>
+              <DialogHeader>You've exceeded your widget limit</DialogHeader>
+              <DialogDescription>
+                You've used {widgetLimits.used}/{widgetLimits.limit} widgets on this dashboard.
+              </DialogDescription>
+              <DialogFooter>
+                {widgetCanUpgrade ? (
+                  <LinkButton variant="primary/small" to={v3BillingPath(organization)}>
+                    Upgrade
+                  </LinkButton>
+                ) : (
+                  <Feedback
+                    button={<Button variant="primary/small">Request more</Button>}
+                    defaultValue="help"
+                  />
+                )}
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+          <Button
+            variant="secondary/small"
+            LeadingIcon={Type}
+            className="pl-1.5"
+            iconSpacing="gap-x-1"
+            tooltip="Add section title"
+            shortcut={{ key: "h" }}
+            onClick={() => {
+              setNewTitleValue("");
+              setShowAddTitleDialog(true);
+            }}
+          >
+            Add title
+          </Button>
+        </>
+      ) : (
+        <>
+          <Button
+            variant="primary/small"
+            LeadingIcon={IconChartHistogram}
+            className="pl-1.5"
+            iconSpacing="gap-x-1.5"
+            shortcut={{ key: "c" }}
+            onClick={actions.openAddEditor}
+          >
+            Add chart
+          </Button>
+          <Button
+            variant="secondary/small"
+            LeadingIcon={Type}
+            className="pl-1.5"
+            iconSpacing="gap-x-1"
+            tooltip="Add section title"
+            shortcut={{ key: "h" }}
+            onClick={() => {
+              setNewTitleValue("");
+              setShowAddTitleDialog(true);
+            }}
+          >
+            Add title
+          </Button>
+        </>
+      )}
+      {dashboardMenu}
+    </div>
+  );
+
   return (
     <PageContainer>
       <NavBar>
         <PageTitle title={title} />
-        <PageAccessories>
-          {totalWidgetCount > 0 &&
-            (widgetIsAtLimit ? (
-              <>
-                <Dialog>
-                  <DialogTrigger asChild>
-                    <Button variant="primary/small" LeadingIcon={PlusIcon}>
-                      Add chart
-                    </Button>
-                  </DialogTrigger>
-                  <DialogContent>
-                    <DialogHeader>You've exceeded your widget limit</DialogHeader>
-                    <DialogDescription>
-                      You've used {widgetLimits.used}/{widgetLimits.limit} widgets on this
-                      dashboard.
-                    </DialogDescription>
-                    <DialogFooter>
-                      {widgetCanUpgrade ? (
-                        <LinkButton variant="primary/small" to={v3BillingPath(organization)}>
-                          Upgrade
-                        </LinkButton>
-                      ) : (
-                        <Feedback
-                          button={<Button variant="primary/small">Request more</Button>}
-                          defaultValue="help"
-                        />
-                      )}
-                    </DialogFooter>
-                  </DialogContent>
-                </Dialog>
-                <Button
-                  variant="secondary/small"
-                  LeadingIcon={Type}
-                  className="pl-1.5"
-                  iconSpacing="gap-x-1"
-                  onClick={() => {
-                    setNewTitleValue("");
-                    setShowAddTitleDialog(true);
-                  }}
-                >
-                  Add title
-                </Button>
-              </>
-            ) : (
-              <>
-                <Button
-                  variant="primary/small"
-                  LeadingIcon={IconChartHistogram}
-                  className="pl-1.5"
-                  iconSpacing="gap-x-1.5"
-                  onClick={actions.openAddEditor}
-                >
-                  Add chart
-                </Button>
-                <Button
-                  variant="secondary/small"
-                  LeadingIcon={Type}
-                  className="pl-1.5"
-                  iconSpacing="gap-x-1"
-                  onClick={() => {
-                    setNewTitleValue("");
-                    setShowAddTitleDialog(true);
-                  }}
-                >
-                  Add title
-                </Button>
-              </>
-            ))}
-          <Popover>
-            <PopoverVerticalEllipseTrigger variant="secondary" />
-            <PopoverContent className="w-fit min-w-[10rem] p-1" align="end">
-              <div className="flex flex-col gap-1">
-                <RenameDashboardDialog title={title} />
-                <DeleteDashboardDialog title={title} />
-              </div>
-            </PopoverContent>
-          </Popover>
-        </PageAccessories>
+        <PageAccessories>{totalWidgetCount === 0 && dashboardMenu}</PageAccessories>
       </NavBar>
       <PageBody scrollable={false}>
         <div className="flex h-full flex-col">
@@ -473,6 +492,7 @@ export default function Page() {
                 onRenameWidget={actions.renameWidget}
                 onDeleteWidget={actions.deleteWidget}
                 onDuplicateWidget={actions.duplicateWidget}
+                filterAccessories={filterAccessories}
               />
             )}
           </div>
@@ -553,8 +573,8 @@ export default function Page() {
                 editorProps.editorDefaultResultsView === "chart"
                   ? "graph"
                   : editorProps.editorDefaultResultsView === "bignumber"
-                  ? "bignumber"
-                  : "table"
+                    ? "bignumber"
+                    : "table"
               }
               defaultChartConfig={editorProps.editorDefaultChartConfig}
               defaultBigNumberConfig={editorProps.editorDefaultBigNumberConfig}

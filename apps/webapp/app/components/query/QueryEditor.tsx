@@ -1,11 +1,4 @@
-import {
-  ArrowDownTrayIcon,
-  BookmarkIcon,
-  CalendarIcon,
-  ClipboardIcon,
-  PencilIcon,
-  PencilSquareIcon,
-} from "@heroicons/react/20/solid";
+import { ArrowDownTrayIcon, CalendarIcon, PencilSquareIcon } from "@heroicons/react/20/solid";
 import type { OutputColumnMetadata } from "@internal/clickhouse";
 import { DialogClose } from "@radix-ui/react-dialog";
 import { useFetcher } from "@remix-run/react";
@@ -17,6 +10,7 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useMemo,
   useRef,
   useState,
   type ReactNode,
@@ -27,7 +21,6 @@ import simplur from "simplur";
 import { AISparkleIcon } from "~/assets/icons/AISparkleIcon";
 import { ChartConfigPanel, defaultChartConfig } from "~/components/code/ChartConfigPanel";
 import { autoFormatSQL, TSQLEditor } from "~/components/code/TSQLEditor";
-import { EnvironmentLabel } from "~/components/environments/EnvironmentLabel";
 import { PageBody, PageContainer } from "~/components/layout/AppLayout";
 import {
   QueryWidget,
@@ -37,6 +30,7 @@ import {
   type QueryWidgetData,
 } from "~/components/metrics/QueryWidget";
 import { SaveToDashboardDialog } from "~/components/metrics/SaveToDashboardDialog";
+import { ScopeFilter } from "~/components/metrics/ScopeFilter";
 import { Button, LinkButton } from "~/components/primitives/Buttons";
 import { Callout } from "~/components/primitives/Callout";
 import {
@@ -79,7 +73,8 @@ import type { action as titleAction } from "~/routes/resources.orgs.$organizatio
 import type { QueryScope } from "~/services/queryService.server";
 import { downloadFile, rowsToCSV, rowsToJSON } from "~/utils/dataExport";
 import { organizationBillingPath } from "~/utils/pathBuilder";
-import { querySchemas } from "~/v3/querySchemas";
+import { listableQuerySchemas } from "~/v3/querySchemas";
+import { useFeatures } from "~/hooks/useFeatures";
 
 /** Convert a Date or ISO string to ISO string format */
 function toISOString(value: Date | string): string {
@@ -88,12 +83,6 @@ function toISOString(value: Date | string): string {
   }
   return value.toISOString();
 }
-
-const scopeOptions = [
-  { value: "environment", label: "Environment" },
-  { value: "project", label: "Project" },
-  { value: "organization", label: "Organization" },
-] as const;
 
 // Type for the query action response
 type QueryActionResponse = {
@@ -200,6 +189,11 @@ const QueryEditorForm = forwardRef<
   ref
 ) {
   const isLoading = fetcher.state === "submitting" || fetcher.state === "loading";
+  const { queueMetricsQueryTables } = useFeatures();
+  const schemas = useMemo(
+    () => listableQuerySchemas({ includeQueueMetrics: queueMetricsQueryTables }),
+    [queueMetricsQueryTables]
+  );
   const [query, setQuery] = useState(defaultQuery);
   const [scope, setScope] = useState<QueryScope>(defaultScope);
   const formRef = useRef<HTMLFormElement>(null);
@@ -254,11 +248,11 @@ const QueryEditorForm = forwardRef<
   );
 
   return (
-    <div className="flex h-full flex-col gap-2 bg-charcoal-900 pb-2">
+    <div className="flex h-full flex-col gap-2 bg-white pb-2 dark:bg-background-deep">
       <TSQLEditor
         defaultValue={query}
         onChange={setQuery}
-        schema={querySchemas}
+        schema={schemas}
         linterEnabled={true}
         showCopyButton={true}
         showClearButton={true}
@@ -277,7 +271,7 @@ const QueryEditorForm = forwardRef<
         <input type="hidden" name="from" value={from ?? ""} />
         <input type="hidden" name="to" value={to ?? ""} />
         <QueryHistoryPopover history={history} onQuerySelected={handleHistorySelected} />
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-1.5">
           {isAdmin && (
             <Button
               type="submit"
@@ -289,24 +283,7 @@ const QueryEditorForm = forwardRef<
               Explain
             </Button>
           )}
-          <Select
-            value={scope}
-            setValue={(value) => setScope(value as QueryScope)}
-            variant="secondary/small"
-            dropdownIcon={true}
-            items={[...scopeOptions]}
-            text={(value) => {
-              return <ScopeItem scope={value as QueryScope} />;
-            }}
-          >
-            {(items) =>
-              items.map((item) => (
-                <SelectItem key={item.value} value={item.value}>
-                  <ScopeItem scope={item.value as QueryScope} />
-                </SelectItem>
-              ))
-            }
-          </Select>
+          <ScopeFilter value={scope} onValueChange={setScope} shortcut={{ key: "e" }} />
           {queryHasTriggeredAt ? (
             <SimpleTooltip
               asChild
@@ -335,6 +312,7 @@ const QueryEditorForm = forwardRef<
               period={period}
               from={from}
               to={to}
+              shortcut={{ key: "d" }}
               applyShortcut={{ key: "enter", enabledOnInputElements: true }}
               onValueChange={(values) => {
                 flushSync(() => {
@@ -356,7 +334,7 @@ const QueryEditorForm = forwardRef<
             shortcut={{ modifiers: ["mod"], key: "enter", enabledOnInputElements: true }}
             className={
               isLoading
-                ? "relative !text-transparent [&_*]:!border-transparent [&_*]:!text-transparent"
+                ? "relative text-transparent! **:border-transparent! **:text-transparent!"
                 : undefined
             }
           >
@@ -442,7 +420,7 @@ export function QueryEditor({
   const isTitleLoading = titleFetcher.state !== "idle";
   const generatedTitle = titleFetcher.data?.title;
   const [historyTitle, setHistoryTitle] = useState<string | null>(
-    history.length > 0 ? history[0].title ?? null : null
+    history.length > 0 ? (history[0].title ?? null) : null
   );
 
   // For edit mode, use the widget name as initial title
@@ -456,8 +434,8 @@ export function QueryEditor({
   const queryTitle =
     userTitle ??
     (mode.type === "dashboard-edit"
-      ? editModeTitle ?? historyTitle ?? generatedTitle ?? null
-      : historyTitle ?? generatedTitle ?? null);
+      ? (editModeTitle ?? historyTitle ?? generatedTitle ?? null)
+      : (historyTitle ?? generatedTitle ?? null));
 
   // Track if user has manually set a title (disables AI regeneration)
   const hasUserTitle = userTitle !== null;
@@ -589,8 +567,8 @@ export function QueryEditor({
       resultsView === "table"
         ? { type: "table", prettyFormatting, sorting: [] }
         : resultsView === "bignumber"
-        ? { type: "bignumber", ...bigNumberConfig }
-        : { type: "chart", ...chartConfig },
+          ? { type: "bignumber", ...bigNumberConfig }
+          : { type: "chart", ...chartConfig },
   };
 
   // Render NavBar based on mode
@@ -643,7 +621,10 @@ export function QueryEditor({
     <PageContainer>
       {renderNavBar()}
       <PageBody scrollable={false}>
-        <ResizablePanelGroup orientation="horizontal" className="h-full max-h-full bg-charcoal-800">
+        <ResizablePanelGroup
+          orientation="horizontal"
+          className="h-full max-h-full bg-background-bright"
+        >
           <ResizablePanel id="query-main" className="h-full">
             <ResizablePanelGroup orientation="vertical" className="h-full overflow-hidden">
               {/* Query editor - isolated component to prevent re-renders */}
@@ -673,7 +654,7 @@ export function QueryEditor({
               <ResizablePanel
                 id="query-results"
                 min="200px"
-                className="overflow-hidden bg-charcoal-800"
+                className="overflow-hidden bg-background-bright"
               >
                 <ClientTabs
                   value={resultsView}
@@ -766,7 +747,7 @@ export function QueryEditor({
                         {results.generatedSql && (
                           <div>
                             <Header3 className="mb-2">Generated ClickHouse SQL</Header3>
-                            <div className="overflow-auto rounded border border-grid-dimmed bg-charcoal-900 p-3">
+                            <div className="overflow-auto rounded border border-grid-dimmed bg-background-deep p-3">
                               <pre className="whitespace-pre font-mono text-xs text-text-bright">
                                 {results.generatedSql}
                               </pre>
@@ -775,7 +756,7 @@ export function QueryEditor({
                         )}
                         <div className="flex min-h-0 flex-1 flex-col">
                           <Header3 className="mb-2">Query Execution Plan</Header3>
-                          <div className="min-h-0 flex-1 overflow-auto rounded border border-grid-dimmed bg-charcoal-900 p-3">
+                          <div className="min-h-0 flex-1 overflow-auto rounded border border-grid-dimmed bg-background-deep p-3">
                             <pre className="whitespace-pre font-mono text-xs text-text-bright">
                               {results.explainOutput}
                             </pre>
@@ -833,7 +814,7 @@ export function QueryEditor({
                       </div>
                     ) : (
                       <div className="flex h-full flex-col items-center justify-center gap-3">
-                        <IconChartHistogram className="size-16 text-charcoal-650" />
+                        <IconChartHistogram className="size-16 text-secondary" />
                         <Paragraph className="max-w-48 text-center text-text-dimmed">
                           Run a query to visualize the results.
                         </Paragraph>
@@ -882,7 +863,7 @@ export function QueryEditor({
                       </>
                     ) : (
                       <div className="flex h-full flex-col items-center justify-center gap-3">
-                        <IconChartHistogram className="size-16 text-charcoal-650" />
+                        <IconChartHistogram className="size-16 text-secondary" />
                         <Paragraph className="max-w-48 text-center text-text-dimmed">
                           Run a query to visualize the results.
                         </Paragraph>
@@ -931,7 +912,7 @@ export function QueryEditor({
                       </>
                     ) : (
                       <div className="flex h-full flex-col items-center justify-center gap-3">
-                        <IconChartHistogram className="size-16 text-charcoal-650" />
+                        <IconChartHistogram className="size-16 text-secondary" />
                         <Paragraph className="max-w-48 text-center text-text-dimmed">
                           Run a query to visualize the results.
                         </Paragraph>
@@ -976,8 +957,8 @@ export function QueryEditor({
             resultsView === "table"
               ? { type: "table", prettyFormatting, sorting: [] }
               : resultsView === "bignumber"
-              ? { type: "bignumber", ...bigNumberConfig }
-              : { type: "chart", ...chartConfig }
+                ? { type: "bignumber", ...bigNumberConfig }
+                : { type: "chart", ...chartConfig }
           }
           isOpen={isSaveDialogOpen}
           onOpenChange={setIsSaveDialogOpen}
@@ -1107,7 +1088,7 @@ function ExportResultsButton({
       <PopoverArrowTrigger variant="minimal" isOpen={isOpen}>
         Export
       </PopoverArrowTrigger>
-      <PopoverContent className="min-w-[10rem] p-1" align="end">
+      <PopoverContent className="min-w-40 p-1" align="end">
         <div className="flex flex-col gap-1">
           <PopoverMenuItem
             icon={Clipboard}
@@ -1131,27 +1112,6 @@ function ExportResultsButton({
       </PopoverContent>
     </Popover>
   );
-}
-
-function ScopeItem({ scope }: { scope: QueryScope }) {
-  const organization = useOrganization();
-  const project = useProject();
-  const environment = useEnvironment();
-
-  switch (scope) {
-    case "organization":
-      return <span className="text-text-bright">{`Org: ${organization.title}`}</span>;
-    case "project":
-      return <span className="text-text-bright">{`Project: ${project.name}`}</span>;
-    case "environment":
-      return (
-        <span className="text-text-bright">
-          Env: <EnvironmentLabel environment={environment} />
-        </span>
-      );
-    default:
-      return <span className="text-text-bright">{scope}</span>;
-  }
 }
 
 function QueryResultsCallouts({

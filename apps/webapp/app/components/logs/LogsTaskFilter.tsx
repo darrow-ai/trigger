@@ -4,6 +4,8 @@ import { useMemo } from "react";
 import * as Ariakit from "@ariakit/react";
 import {
   ComboBox,
+  SelectGroup,
+  SelectGroupLabel,
   SelectItem,
   SelectList,
   SelectPopover,
@@ -12,7 +14,7 @@ import {
 } from "~/components/primitives/Select";
 import { useSearchParams } from "~/hooks/useSearchParam";
 import { TaskTriggerSourceIcon } from "~/components/runs/v3/TaskTriggerSource";
-import { TaskIcon } from "~/assets/icons/TaskIcon";
+import { TasksIcon } from "~/assets/icons/TasksIcon";
 import { appliedSummary, FilterMenuProvider } from "~/components/runs/v3/SharedFilters";
 import { AppliedFilter } from "~/components/primitives/AppliedFilter";
 
@@ -21,6 +23,7 @@ const shortcut = { key: "t" };
 type TaskOption = {
   slug: string;
   triggerSource: TaskTriggerSource;
+  isInLatestDeployment: boolean;
 };
 
 interface LogsTaskFilterProps {
@@ -28,7 +31,7 @@ interface LogsTaskFilterProps {
 }
 
 export function LogsTaskFilter({ possibleTasks }: LogsTaskFilterProps) {
-  const { values, replace, del } = useSearchParams();
+  const { values, replace: _replace, del } = useSearchParams();
   const selectedTasks = values("tasks");
 
   if (selectedTasks.length === 0 || selectedTasks.every((v) => v === "")) {
@@ -38,12 +41,13 @@ export function LogsTaskFilter({ possibleTasks }: LogsTaskFilterProps) {
           <TasksDropdown
             trigger={
               <SelectTrigger
-                icon={<TaskIcon className="size-4" />}
+                icon={<TasksIcon className="size-4" />}
                 variant="secondary/small"
                 shortcut={shortcut}
                 tooltipTitle="Filter by task"
+                className="pl-1.5"
               >
-                <span className="ml-0.5">Tasks</span>
+                <span className="ml-1">Tasks</span>
               </SelectTrigger>
             }
             searchValue={search}
@@ -63,7 +67,7 @@ export function LogsTaskFilter({ possibleTasks }: LogsTaskFilterProps) {
             <Ariakit.Select render={<div className="group cursor-pointer focus-custom" />}>
               <AppliedFilter
                 label="Task"
-                icon={<TaskIcon className="size-4" />}
+                icon={<TasksIcon className="size-4" />}
                 value={appliedSummary(
                   selectedTasks.map((v) => {
                     const task = possibleTasks.find((task) => task.slug === v);
@@ -126,17 +130,44 @@ function TasksDropdown({
       >
         <ComboBox placeholder={"Filter by task..."} value={searchValue} />
         <SelectList>
-          {filtered.map((item, index) => (
-            <SelectItem
-              key={`${item.triggerSource}-${item.slug}`}
-              value={item.slug}
-              icon={
-                <TaskTriggerSourceIcon source={item.triggerSource} className="size-4 flex-none" />
-              }
-            >
-              {item.slug}
-            </SelectItem>
-          ))}
+          {filtered
+            .filter((item) => item.isInLatestDeployment)
+            .map((item) => (
+              <SelectItem
+                key={`${item.triggerSource}-${item.slug}`}
+                value={item.slug}
+                className="text-text-bright"
+                icon={
+                  <TaskTriggerSourceIcon source={item.triggerSource} className="size-4 flex-none" />
+                }
+              >
+                {item.slug}
+              </SelectItem>
+            ))}
+          {filtered.some((item) => !item.isInLatestDeployment) && (
+            <SelectGroup>
+              <SelectGroupLabel>Archived</SelectGroupLabel>
+              {filtered
+                .filter((item) => !item.isInLatestDeployment)
+                .map((item) => (
+                  <SelectItem
+                    key={`${item.triggerSource}-${item.slug}`}
+                    value={item.slug}
+                    className="text-text-bright"
+                    icon={
+                      <span className="opacity-50">
+                        <TaskTriggerSourceIcon
+                          source={item.triggerSource}
+                          className="size-4 flex-none"
+                        />
+                      </span>
+                    }
+                  >
+                    {item.slug}
+                  </SelectItem>
+                ))}
+            </SelectGroup>
+          )}
         </SelectList>
       </SelectPopover>
     </SelectProvider>

@@ -1,6 +1,6 @@
 import { assertExhaustive } from "@trigger.dev/core";
-import { TaskRunError } from "@trigger.dev/core/v3";
-import { RuntimeEnvironmentType, TaskRunStatus } from "@trigger.dev/database";
+import type { TaskRunError } from "@trigger.dev/core/v3";
+import type { RuntimeEnvironmentType, TaskRunStatus } from "@trigger.dev/database";
 
 export function runStatusFromError(
   error: TaskRunError,
@@ -19,6 +19,7 @@ export function runStatusFromError(
     case "TASK_INPUT_ERROR":
     case "TASK_OUTPUT_ERROR":
     case "TASK_MIDDLEWARE_ERROR":
+    case "TASK_RUN_UNCAUGHT_EXCEPTION":
       return "COMPLETED_WITH_ERRORS";
     case "TASK_RUN_CANCELLED":
       return "CANCELED";
@@ -101,5 +102,29 @@ export class RunOneTimeUseTokenError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "RunOneTimeUseTokenError";
+  }
+}
+
+export class ExecutionSnapshotNotFoundError extends Error {
+  constructor(public readonly snapshotId: string) {
+    super(`No execution snapshot found for id ${snapshotId}`);
+    this.name = "ExecutionSnapshotNotFoundError";
+  }
+}
+
+export class UnclassifiableWaitpointId extends Error {
+  readonly waitpointId: string;
+  readonly waitpointIdLength: number;
+  readonly cause?: unknown;
+  constructor(waitpointId: string, options?: { cause?: unknown }) {
+    super(
+      `Unclassifiable waitpointId for completion: length ${waitpointId.length} matches neither cuid nor run-ops id — waitpointId=${JSON.stringify(
+        waitpointId
+      )}`
+    );
+    this.name = "UnclassifiableWaitpointId";
+    this.waitpointId = waitpointId;
+    this.waitpointIdLength = waitpointId.length;
+    this.cause = options?.cause;
   }
 }

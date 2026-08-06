@@ -1,9 +1,9 @@
 import { z } from "zod";
 import { RuntimeEnvironmentType } from "@trigger.dev/database";
-import { Logger, LogLevel } from "@trigger.dev/core/logger";
-import { GlobalRateLimiter } from "@trigger.dev/redis-worker";
-import { Meter, Tracer } from "@internal/tracing";
-import { RedisOptions } from "@internal/redis";
+import type { Logger, LogLevel } from "@trigger.dev/core/logger";
+import type { GlobalRateLimiter } from "@trigger.dev/redis-worker";
+import type { Meter, Tracer } from "@internal/tracing";
+import type { RedisOptions } from "@internal/redis";
 
 // ============================================================================
 // Batch Item Schemas
@@ -269,7 +269,20 @@ export type ProcessBatchItemCallback = (params: {
   /** Whether this is the final attempt (no more retries after this). */
   isFinalAttempt: boolean;
 }) => Promise<
-  { success: true; runId: string } | { success: false; error: string; errorCode?: string }
+  | { success: true; runId: string }
+  | {
+      success: false;
+      error: string;
+      errorCode?: string;
+      /**
+       * When true, the BatchQueue will skip any remaining retries for this item
+       * and record the failure immediately, regardless of the current attempt
+       * number. Use this for errors that will deterministically fail again on
+       * retry (e.g. the environment queue is at its size limit), so the batch
+       * can finalize quickly without burning through the retry ladder.
+       */
+      skipRetries?: boolean;
+    }
 >;
 
 /**

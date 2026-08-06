@@ -1,16 +1,13 @@
-import {
-  BuildManifest,
-  CreateBackgroundWorkerRequestBody,
-  serializeIndexingError,
-} from "@trigger.dev/core/v3";
-import { readFile, writeFile } from "node:fs/promises";
+import type { CreateBackgroundWorkerRequestBody } from "@trigger.dev/core/v3";
+import { BuildManifest, serializeIndexingError } from "@trigger.dev/core/v3";
+import { execOptionsForRuntime } from "@trigger.dev/core/v3/build";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { env } from "std-env";
 import { CliApiClient } from "../apiClient.js";
 import { indexWorkerManifest } from "../indexing/indexWorkerManifest.js";
-import { resolveSourceFiles } from "../utilities/sourceFiles.js";
-import { execOptionsForRuntime } from "@trigger.dev/core/v3/build";
 import { writeJSONFile } from "../utilities/fileSystem.js";
+import { resolveSourceFiles } from "../utilities/sourceFiles.js";
 
 async function loadBuildManifest() {
   const manifestContents = await readFile("./build.json", "utf-8");
@@ -104,6 +101,7 @@ async function indexDeployment({
         packageVersion: buildManifest.packageVersion,
         cliPackageVersion: buildManifest.cliPackageVersion,
         tasks: workerManifest.tasks,
+        prompts: workerManifest.prompts,
         queues: workerManifest.queues,
         sourceFiles,
         runtime: workerManifest.runtime,

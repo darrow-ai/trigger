@@ -1,6 +1,8 @@
-import { Attributes, Context, trace, Tracer } from "@opentelemetry/api";
-import { ExportResult, ExportResultCode } from "@opentelemetry/core";
-import { LogRecordProcessor, SdkLogRecord } from "@opentelemetry/sdk-logs";
+import type { Attributes, Context, Tracer } from "@opentelemetry/api";
+import { trace } from "@opentelemetry/api";
+import type { ExportResult } from "@opentelemetry/core";
+import { ExportResultCode } from "@opentelemetry/core";
+import type { LogRecordProcessor, SdkLogRecord } from "@opentelemetry/sdk-logs";
 import type {
   AggregationOption,
   AggregationTemporality,
@@ -10,7 +12,7 @@ import type {
   ResourceMetrics,
   ScopeMetrics,
 } from "@opentelemetry/sdk-metrics";
-import { Span, SpanProcessor } from "@opentelemetry/sdk-trace-base";
+import type { Span, SpanProcessor } from "@opentelemetry/sdk-trace-base";
 import { SemanticInternalAttributes } from "../semanticInternalAttributes.js";
 import { taskContext } from "../task-context-api.js";
 import { flattenAttributes } from "../utils/flattenAttributes.js";
@@ -35,6 +37,17 @@ export class TaskContextSpanProcessor implements SpanProcessor {
       // as an OTEL ArrayValue and can be extracted on the server side.
       if (!taskContext.isRunDisabled && taskContext.ctx.run.tags?.length) {
         span.setAttribute(SemanticInternalAttributes.RUN_TAGS, taskContext.ctx.run.tags);
+      }
+
+      // Stamp `gen_ai.conversation.id` (OTel GenAI semantic convention)
+      // directly on every span so it survives the OTLP ingest's `ctx.*`
+      // strip and lands in the stored attributes column without a schema
+      // migration.
+      if (taskContext.conversationId) {
+        span.setAttribute(
+          SemanticInternalAttributes.GEN_AI_CONVERSATION_ID,
+          taskContext.conversationId
+        );
       }
     }
 
@@ -178,6 +191,10 @@ export class TaskContextMetricExporter implements PushMetricExporter {
       contextAttrs[SemanticInternalAttributes.RUN_TAGS] = ctx.run.tags;
     }
 
+    if (taskContext.conversationId) {
+      contextAttrs[SemanticInternalAttributes.GEN_AI_CONVERSATION_ID] = taskContext.conversationId;
+    }
+
     const modified: ResourceMetrics = {
       resource: metrics.resource,
       scopeMetrics: metrics.scopeMetrics.map((scope) => ({
@@ -272,7 +289,10 @@ export class BufferingMetricExporter implements PushMetricExporter {
     const base = batch[0]!;
 
     // Merge all scopeMetrics by scope name, then metrics by descriptor name
-    const scopeMap = new Map<string, { scope: ScopeMetrics["scope"]; metricsMap: Map<string, MetricData> }>();
+    const scopeMap = new Map<
+      string,
+      { scope: ScopeMetrics["scope"]; metricsMap: Map<string, MetricData> }
+    >();
 
     for (const rm of batch) {
       for (const sm of rm.scopeMetrics) {

@@ -1,19 +1,19 @@
-ARG NODE_IMAGE=node:20.20-bullseye-slim@sha256:d6c3903e556d4161f63af4550e76244908b6668e1a7d2983eff4873a0c2b0413
+ARG NODE_IMAGE=node:24.18.0-bookworm-slim@sha256:39a4259b6f744868a8228742ad45aa3026f97302e5eec2fa4a38b30ca0a66e12
 
-FROM golang:1.23-alpine AS goose_builder
-RUN go install github.com/pressly/goose/v3/cmd/goose@v3.26.0
+FROM golang:1.26-alpine AS goose_builder
+RUN go install github.com/pressly/goose/v3/cmd/goose@v3.27.1
 
 FROM ${NODE_IMAGE} AS pruner
 
 WORKDIR /triggerdotdev
 
 COPY --chown=node:node . .
-RUN npx -q turbo@2.5.4 prune --scope=webapp --docker
+RUN npx -q turbo@2.10.0 prune --scope=webapp --docker
 RUN find . -name "node_modules" -type d -prune -exec rm -rf '{}' +
 
 # Base strategy to have layer caching
 FROM ${NODE_IMAGE} AS base
-RUN apt-get update && apt-get install -y openssl dumb-init
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends openssl dumb-init && rm -rf /var/lib/apt/lists/*
 WORKDIR /triggerdotdev
 COPY --chown=node:node .gitignore .gitignore
 COPY --from=pruner --chown=node:node /triggerdotdev/out/json/ .
@@ -25,28 +25,30 @@ COPY --chown=node:node patches ./patches
 FROM base AS dev-deps
 WORKDIR /triggerdotdev
 # Corepack is used to install pnpm with the exact version from packageManager
-RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
+RUN corepack enable && corepack prepare pnpm@10.33.2 --activate
 ENV NODE_ENV=development
 RUN --mount=type=cache,id=pnpm,target=/root/.local/share/pnpm/store pnpm install --no-frozen-lockfile
 # Generate Prisma client here where all deps are installed
 COPY --from=pruner --chown=node:node /triggerdotdev/internal-packages/database/prisma/schema.prisma /triggerdotdev/internal-packages/database/prisma/schema.prisma
 RUN pnpx prisma@6.14.0 generate --schema /triggerdotdev/internal-packages/database/prisma/schema.prisma
+COPY --from=pruner --chown=node:node /triggerdotdev/internal-packages/run-ops-database/prisma/schema.prisma /triggerdotdev/internal-packages/run-ops-database/prisma/schema.prisma
+RUN pnpx prisma@6.14.0 generate --schema /triggerdotdev/internal-packages/run-ops-database/prisma/schema.prisma
 
 ## Production deps
 FROM base AS production-deps
 WORKDIR /triggerdotdev
 # Corepack is used to install pnpm with the exact version from packageManager
-RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
+RUN corepack enable && corepack prepare pnpm@10.33.2 --activate
 ENV NODE_ENV=production
 RUN --mount=type=cache,id=pnpm,target=/root/.local/share/pnpm/store pnpm install --prod --no-frozen-lockfile
 
 ## Builder (builds the webapp)
 FROM base AS builder
 # This is needed for the sentry-cli binary while building the webapp
-RUN apt-get update && apt-get install -y openssl dumb-init ca-certificates
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends openssl dumb-init ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /triggerdotdev
 # Corepack is used to install pnpm with the exact version from packageManager
-RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
+RUN corepack enable && corepack prepare pnpm@10.33.2 --activate
 
 ARG SENTRY_RELEASE
 ARG SENTRY_ORG
@@ -68,6 +70,8 @@ RUN chmod +x ./scripts/wait-for-it.sh
 RUN chmod +x ./scripts/entrypoint.sh
 COPY --chown=node:node .configs/tsconfig.base.json .configs/tsconfig.base.json
 COPY --chown=node:node scripts/updateVersion.ts scripts/updateVersion.ts
+COPY --chown=node:node scripts/bundleSdkDocs.ts scripts/bundleSdkDocs.ts
+COPY --chown=node:node scripts/retry-prisma-generate.mjs scripts/retry-prisma-generate.mjs
 RUN pnpm run generate
 RUN --mount=type=secret,id=sentry_auth_token \
     SENTRY_AUTH_TOKEN=$(cat /run/secrets/sentry_auth_token) \
@@ -75,7 +79,7 @@ RUN --mount=type=secret,id=sentry_auth_token \
 
 # Runner
 FROM ${NODE_IMAGE} AS runner
-RUN apt-get update && apt-get install -y openssl netcat-openbsd ca-certificates
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends openssl netcat-openbsd ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /triggerdotdev
 ENV NODE_ENV=production
 
@@ -84,6 +88,15 @@ COPY --from=pruner --chown=node:node /triggerdotdev/out/full/ .
 COPY --from=production-deps --chown=node:node /triggerdotdev .
 # Copy generated Prisma client from dev-deps
 COPY --from=dev-deps --chown=node:node /triggerdotdev/internal-packages/database/generated ./internal-packages/database/generated
+# Run-ops Prisma client (query engine + client). Only constructed when the split is enabled,
+# but the image must carry it so a split-on deployment doesn't hit a missing query engine.
+COPY --from=dev-deps --chown=node:node /triggerdotdev/internal-packages/run-ops-database/generated ./internal-packages/run-ops-database/generated
+# These workspace packages stay external to the Vite SSR bundle, so their
+# built entry points must ship in the image (core is the sdk's runtime dep).
+COPY --from=builder --chown=node:node /triggerdotdev/internal-packages/database/dist ./internal-packages/database/dist
+COPY --from=builder --chown=node:node /triggerdotdev/internal-packages/run-ops-database/dist ./internal-packages/run-ops-database/dist
+COPY --from=builder --chown=node:node /triggerdotdev/packages/trigger-sdk/dist ./packages/trigger-sdk/dist
+COPY --from=builder --chown=node:node /triggerdotdev/packages/core/dist ./packages/core/dist
 COPY --from=builder --chown=node:node /triggerdotdev/apps/webapp/build/server.js ./apps/webapp/build/server.js
 COPY --from=builder --chown=node:node /triggerdotdev/apps/webapp/build ./apps/webapp/build
 COPY --from=builder --chown=node:node /triggerdotdev/apps/webapp/public ./apps/webapp/public
@@ -98,19 +111,25 @@ ARG BUILD_APP_VERSION
 ARG BUILD_GIT_SHA
 ARG BUILD_GIT_REF_NAME
 ARG BUILD_TIMESTAMP_SECONDS
+ARG BUILD_TIMESTAMP_RFC3339
 ENV BUILD_APP_VERSION=${BUILD_APP_VERSION} \
     BUILD_GIT_SHA=${BUILD_GIT_SHA} \
     BUILD_GIT_REF_NAME=${BUILD_GIT_REF_NAME} \
     BUILD_TIMESTAMP_SECONDS=${BUILD_TIMESTAMP_SECONDS}
 
+LABEL org.opencontainers.image.source="https://github.com/triggerdotdev/trigger.dev" \
+      org.opencontainers.image.revision="${BUILD_GIT_SHA}" \
+      org.opencontainers.image.version="${BUILD_APP_VERSION}" \
+      org.opencontainers.image.created="${BUILD_TIMESTAMP_RFC3339}"
+
 EXPOSE 3000
 
 # Add global pnpm shims and install pnpm during build (root user)
-RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
+RUN corepack enable && corepack prepare pnpm@10.33.2 --activate
 
 USER node
 
 # Ensure pnpm is installed during build and not silently downloaded at runtime (node user)
-RUN corepack prepare pnpm@10.23.0 --activate
+RUN corepack prepare pnpm@10.33.2 --activate
 
 CMD ["./scripts/entrypoint.sh"]

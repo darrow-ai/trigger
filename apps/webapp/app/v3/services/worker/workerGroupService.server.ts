@@ -1,9 +1,12 @@
-import { WorkerInstanceGroup, WorkerInstanceGroupType } from "@trigger.dev/database";
+import type { WorkerInstanceGroup, WorkloadType } from "@trigger.dev/database";
+import { WorkerInstanceGroupType } from "@trigger.dev/database";
 import { WithRunEngine } from "../baseService.server";
+import { isWorkerGroupAllowedForProject } from "./workerGroupAccess";
 import { WorkerGroupTokenService } from "./workerGroupTokenService.server";
 import { logger } from "~/services/logger.server";
 import { FEATURE_FLAG } from "~/v3/featureFlags";
 import { makeFlag, makeSetFlag } from "~/v3/featureFlags.server";
+import { isComputeRegionAccessible, resolveComputeAccess } from "~/v3/regionAccess.server";
 
 export class WorkerGroupService extends WithRunEngine {
   private readonly defaultNamePrefix = "worker_group";
@@ -13,11 +16,25 @@ export class WorkerGroupService extends WithRunEngine {
     organizationId,
     name,
     description,
+    type,
+    hidden,
+    workloadType,
+    cloudProvider,
+    location,
+    staticIPs,
+    enableFastPath,
   }: {
     projectId?: string;
     organizationId?: string;
     name?: string;
     description?: string;
+    type?: WorkerInstanceGroupType;
+    hidden?: boolean;
+    workloadType?: WorkloadType;
+    cloudProvider?: string;
+    location?: string;
+    staticIPs?: string;
+    enableFastPath?: boolean;
   }) {
     if (!name) {
       name = await this.generateWorkerName({ projectId });
@@ -29,20 +46,29 @@ export class WorkerGroupService extends WithRunEngine {
     });
     const token = await tokenService.createToken();
 
+    const resolvedType =
+      type ?? (projectId ? WorkerInstanceGroupType.UNMANAGED : WorkerInstanceGroupType.MANAGED);
+
     const workerGroup = await this._prisma.workerInstanceGroup.create({
       data: {
         projectId,
         organizationId,
-        type: projectId ? WorkerInstanceGroupType.UNMANAGED : WorkerInstanceGroupType.MANAGED,
+        type: resolvedType,
         masterQueue: this.generateMasterQueueName({ projectId, name }),
         tokenId: token.id,
         description,
         name,
+        hidden,
+        workloadType,
+        cloudProvider,
+        location,
+        staticIPs,
+        enableFastPath,
       },
     });
 
     if (workerGroup.type === WorkerInstanceGroupType.MANAGED) {
-      const managedCount = await this._prisma.workerInstanceGroup.count({
+      const _managedCount = await this._prisma.workerInstanceGroup.count({
         where: {
           type: WorkerInstanceGroupType.MANAGED,
         },
@@ -207,6 +233,7 @@ export class WorkerGroupService extends WithRunEngine {
       },
       include: {
         defaultWorkerGroup: true,
+        organization: { select: { featureFlags: true } },
       },
     });
 
@@ -226,6 +253,13 @@ export class WorkerGroupService extends WithRunEngine {
         throw new Error(`The region you specified doesn't exist ("${regionOverride}").`);
       }
 
+      // The masterQueue-only lookup above can resolve another project's
+      // UNMANAGED group, so reject groups not usable by this project
+      // (see isWorkerGroupAllowedForProject).
+      if (!isWorkerGroupAllowedForProject(workerGroup, project.id)) {
+        throw new Error(`The region you specified isn't available to you ("${regionOverride}").`);
+      }
+
       // If they're restricted, check they have access
       if (project.allowedWorkerQueues.length > 0) {
         if (project.allowedWorkerQueues.includes(workerGroup.masterQueue)) {
@@ -241,6 +275,17 @@ export class WorkerGroupService extends WithRunEngine {
 
       if (workerGroup.hidden) {
         throw new Error(`The region you specified isn't available to you ("${regionOverride}").`);
+      }
+
+      if (workerGroup.workloadType === "MICROVM") {
+        const hasComputeAccess = await resolveComputeAccess(
+          this._prisma,
+          project.organization.featureFlags
+        );
+
+        if (!isComputeRegionAccessible(workerGroup, hasComputeAccess)) {
+          throw new Error(`The region you specified isn't available to you ("${regionOverride}").`);
+        }
       }
 
       return workerGroup;

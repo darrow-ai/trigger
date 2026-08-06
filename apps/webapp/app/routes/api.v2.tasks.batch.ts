@@ -1,23 +1,24 @@
 import { json } from "@remix-run/server-runtime";
-import {
-  BatchTriggerTaskV3RequestBody,
-  BatchTriggerTaskV3Response,
-  generateJWT,
-} from "@trigger.dev/core/v3";
-import { prisma } from "~/db.server";
+import type { BatchTriggerTaskV3Response } from "@trigger.dev/core/v3";
+import { BatchTriggerTaskV3RequestBody, generateJWT } from "@trigger.dev/core/v3";
 import { env } from "~/env.server";
+import { runStore } from "~/v3/runStore.server";
 import { RunEngineBatchTriggerService } from "~/runEngine/services/batchTrigger.server";
-import { AuthenticatedEnvironment, getOneTimeUseToken } from "~/services/apiAuth.server";
+import type { AuthenticatedEnvironment } from "~/services/apiAuth.server";
+import { getOneTimeUseToken } from "~/services/apiAuth.server";
 import { logger } from "~/services/logger.server";
-import { createActionApiRoute } from "~/services/routeBuilders/apiBuilder.server";
+import { createActionApiRoute, everyResource } from "~/services/routeBuilders/apiBuilder.server";
 import {
   handleRequestIdempotency,
   saveRequestIdempotency,
 } from "~/utils/requestIdempotency.server";
+import { scopeRequestIdempotencyKey } from "~/utils/requestIdempotencyKey";
+import { canWriteParentRun } from "~/utils/parentRunAuthorization.server";
 import { ServiceValidationError } from "~/v3/services/baseService.server";
 import { BatchProcessingStrategy } from "~/v3/services/batchTriggerV3.server";
 import { OutOfEntitlementError } from "~/v3/services/triggerTask.server";
 import { sanitizeTriggerSource } from "~/utils/triggerSource";
+import { clientSafeErrorMessage } from "~/utils/prismaErrors";
 import { HeadersSchema } from "./api.v1.tasks.$taskId.trigger";
 import { determineRealtimeStreamsVersion } from "~/services/realtime/v1StreamsGlobal.server";
 import { extractJwtSigningSecretKey } from "~/services/realtime/jwtAuth.server";
@@ -32,16 +33,34 @@ const { action, loader } = createActionApiRoute(
     maxContentLength: env.BATCH_TASK_PAYLOAD_MAXIMUM_SIZE,
     authorization: {
       action: "batchTrigger",
-      resource: (_, __, ___, body) => ({
-        tasks: Array.from(new Set(body.items.map((i) => i.task))),
-      }),
-      superScopes: ["write:tasks", "admin"],
+      // Each item in the batch is a distinct task — every one must be
+      // authorized, not just any one of them. `everyResource` flips
+      // the auth check to AND semantics so a JWT scoped to taskA can't
+      // submit a batch that also includes taskB / taskC.
+      resource: (_, __, ___, body) =>
+        everyResource(
+          Array.from(new Set(body.items.map((i) => i.task))).map((id) => ({
+            type: "tasks",
+            id,
+          }))
+        ),
     },
     corsStrategy: "all",
   },
-  async ({ body, headers, params, authentication }) => {
+  async ({ body, headers, params, authentication, ability }) => {
     if (!body.items.length) {
       return json({ error: "Batch cannot be triggered with no items" }, { status: 400 });
+    }
+
+    if (
+      !(await canWriteParentRun(
+        ability,
+        authentication.environment.id,
+        authentication.environment.organizationId,
+        body.parentRunId
+      ))
+    ) {
+      return json({ error: "Unauthorized" }, { status: 403 });
     }
 
     // Check the there are fewer than MAX_BATCH_V2_TRIGGER_ITEMS items
@@ -59,7 +78,7 @@ const { action, loader } = createActionApiRoute(
       "x-trigger-span-parent-as-link": spanParentAsLink,
       "x-trigger-worker": isFromWorker,
       "x-trigger-client": triggerClient,
-      "x-trigger-engine-version": engineVersion,
+      "x-trigger-engine-version": _engineVersion,
       "batch-processing-strategy": batchProcessingStrategy,
       "x-trigger-request-idempotency-key": requestIdempotencyKey,
       "x-trigger-realtime-streams-version": realtimeStreamsVersion,
@@ -81,26 +100,23 @@ const { action, loader } = createActionApiRoute(
       requestIdempotencyKey,
     });
 
-    const cachedResponse = await handleRequestIdempotency(requestIdempotencyKey, {
+    const scopedIdempotencyKey = scopeRequestIdempotencyKey(requestIdempotencyKey, [
+      authentication.environment.id,
+      ...Array.from(new Set(body.items.map((item) => item.task))).sort(),
+    ]);
+    const cachedResponse = await handleRequestIdempotency(scopedIdempotencyKey, {
       requestType: "batch-trigger",
       findCachedEntity: async (cachedRequestId) => {
-        return await prisma.batchTaskRun.findFirst({
-          where: {
-            id: cachedRequestId,
-            runtimeEnvironmentId: authentication.environment.id,
-          },
-          select: {
-            friendlyId: true,
-            runCount: true,
-          },
-        });
+        const batch = await runStore.findBatchTaskRunById(cachedRequestId);
+        if (!batch || batch.runtimeEnvironmentId !== authentication.environment.id) return null;
+        return batch;
       },
       buildResponse: (cachedBatch) => ({
         id: cachedBatch.friendlyId,
         runCount: cachedBatch.runCount,
       }),
       buildResponseHeaders: async (responseBody, cachedEntity) => {
-        return await responseHeaders(responseBody, authentication.environment, triggerClient);
+        return await responseHeaders(responseBody, authentication.environment);
       },
     });
 
@@ -117,7 +133,7 @@ const { action, loader } = createActionApiRoute(
     const service = new RunEngineBatchTriggerService(batchProcessingStrategy ?? undefined);
 
     service.onBatchTaskRunCreated.attachOnce(async (batch) => {
-      await saveRequestIdempotency(requestIdempotencyKey, "batch-trigger", batch.id);
+      await saveRequestIdempotency(scopedIdempotencyKey, "batch-trigger", batch.id);
     });
 
     try {
@@ -129,21 +145,29 @@ const { action, loader } = createActionApiRoute(
         realtimeStreamsVersion: determineRealtimeStreamsVersion(
           realtimeStreamsVersion ?? undefined
         ),
-        triggerSource: isFromWorker ? "sdk" : sanitizeTriggerSource(triggerSourceHeader) ?? "api",
+        triggerSource: isFromWorker ? "sdk" : (sanitizeTriggerSource(triggerSourceHeader) ?? "api"),
         triggerAction: "trigger",
       });
 
-      const $responseHeaders = await responseHeaders(
-        batch,
-        authentication.environment,
-        triggerClient
-      );
+      const $responseHeaders = await responseHeaders(batch, authentication.environment);
 
       return json(batch, {
         status: 202,
         headers: $responseHeaders,
       });
     } catch (error) {
+      // Customer-facing validation/quota failures (invalid batch shape,
+      // entitlements exhausted). The handler returns 422 with the message;
+      // system handles it gracefully, no alert needed.
+      if (error instanceof ServiceValidationError) {
+        logger.warn("Batch trigger error", { error: error.message });
+        return json({ error: error.message }, { status: 422 });
+      }
+      if (error instanceof OutOfEntitlementError) {
+        logger.warn("Batch trigger error", { error: error.message });
+        return json({ error: error.message }, { status: 422 });
+      }
+
       logger.error("Batch trigger error", {
         error: {
           message: (error as Error).message,
@@ -151,13 +175,9 @@ const { action, loader } = createActionApiRoute(
         },
       });
 
-      if (error instanceof ServiceValidationError) {
-        return json({ error: error.message }, { status: 422 });
-      } else if (error instanceof OutOfEntitlementError) {
-        return json({ error: error.message }, { status: 422 });
-      } else if (error instanceof Error) {
+      if (error instanceof Error) {
         return json(
-          { error: error.message },
+          { error: clientSafeErrorMessage(error) },
           { status: 500, headers: { "x-should-retry": "false" } }
         );
       }
@@ -169,35 +189,23 @@ const { action, loader } = createActionApiRoute(
 
 async function responseHeaders(
   batch: BatchTriggerTaskV3Response,
-  environment: AuthenticatedEnvironment,
-  triggerClient?: string | null
+  environment: AuthenticatedEnvironment
 ): Promise<Record<string, string>> {
-  const claimsHeader = JSON.stringify({
+  const claims = {
     sub: environment.id,
     pub: true,
+    scopes: [`read:batch:${batch.id}`],
+  };
+
+  const jwt = await generateJWT({
+    secretKey: extractJwtSigningSecretKey(environment),
+    payload: claims,
+    expirationTime: "1h",
   });
 
-  if (triggerClient === "browser") {
-    const claims = {
-      sub: environment.id,
-      pub: true,
-      scopes: [`read:batch:${batch.id}`],
-    };
-
-    const jwt = await generateJWT({
-      secretKey: extractJwtSigningSecretKey(environment),
-      payload: claims,
-      expirationTime: "1h",
-    });
-
-    return {
-      "x-trigger-jwt-claims": claimsHeader,
-      "x-trigger-jwt": jwt,
-    };
-  }
-
   return {
-    "x-trigger-jwt-claims": claimsHeader,
+    "x-trigger-jwt-claims": JSON.stringify({ sub: environment.id, pub: true }),
+    "x-trigger-jwt": jwt,
   };
 }
 

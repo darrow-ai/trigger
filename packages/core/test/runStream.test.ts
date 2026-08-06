@@ -1,10 +1,10 @@
-import { describe, expect, it } from "vitest";
-import {
-  RunSubscription,
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type {
   SSEStreamPart,
   StreamSubscription,
   StreamSubscriptionFactory,
 } from "../src/v3/apiClient/runStream.js";
+import { RunSubscription, SSEStreamSubscription } from "../src/v3/apiClient/runStream.js";
 import type { SubscribeRunRawShape } from "../src/v3/schemas/api.js";
 
 // Test implementations
@@ -354,36 +354,19 @@ describe("RunSubscription", () => {
     // Verify we only created one stream
     expect(streamCreationCount).toBe(1);
 
-    // Verify we got all the expected events
+    // Run-shape and stream events are produced independently, so their relative
+    // ordering is not guaranteed. Preserve ordering within each source instead.
     expect(results).toHaveLength(4);
-    expect(results[0]).toMatchObject({
-      type: "run",
-      run: {
-        id: "run_123",
-        taskIdentifier: "openai-streaming",
-        status: "EXECUTING",
-        durationMs: 100,
-      },
-    });
-    expect(results[1]).toMatchObject({
-      type: "openai",
-      chunk: { id: "chunk1", content: "Hello" },
-      run: { id: "run_123", durationMs: 100 },
-    });
-    expect(results[2]).toMatchObject({
-      type: "openai",
-      chunk: { id: "chunk2", content: "World" },
-      run: { id: "run_123", durationMs: 100 },
-    });
-    expect(results[3]).toMatchObject({
-      type: "run",
-      run: {
-        id: "run_123",
-        taskIdentifier: "openai-streaming",
-        status: "EXECUTING",
-        durationMs: 200,
-      },
-    });
+
+    const runEvents = results.filter((event) => event.type === "run");
+    expect(runEvents.map((event) => event.run.durationMs)).toEqual([100, 200]);
+
+    const streamEvents = results.filter((event) => event.type === "openai");
+    expect(streamEvents.map((event) => event.chunk)).toEqual([
+      { id: "chunk1", content: "Hello" },
+      { id: "chunk2", content: "World" },
+    ]);
+    expect(streamEvents.map((event) => event.run.durationMs)).toEqual([100, 100]);
   });
 
   it("should handle multiple streams simultaneously", async () => {
@@ -467,6 +450,47 @@ describe("RunSubscription", () => {
       chunk: { id: "claude2", message: "There" },
       run: { id: "run_123" },
     });
+  });
+});
+
+describe("SSEStreamSubscription", () => {
+  let originalFetch: typeof global.fetch;
+
+  beforeEach(() => {
+    originalFetch = global.fetch;
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it("does not retry the initial fetch on 401", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 401 }));
+    global.fetch = fetchMock;
+
+    const sub = new SSEStreamSubscription("https://api.test/realtime/v1/streams/run_x/chat", {
+      headers: { Authorization: "Bearer expired" },
+    });
+
+    const stream = await sub.subscribe();
+    const reader = stream.getReader();
+    await expect(reader.read()).rejects.toMatchObject({ status: 401 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry the initial fetch on 403", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 403 }));
+    global.fetch = fetchMock;
+
+    const sub = new SSEStreamSubscription("https://api.test/realtime/v1/streams/run_x/chat", {
+      headers: { Authorization: "Bearer denied" },
+    });
+
+    const stream = await sub.subscribe();
+    const reader = stream.getReader();
+    await expect(reader.read()).rejects.toMatchObject({ status: 403 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 

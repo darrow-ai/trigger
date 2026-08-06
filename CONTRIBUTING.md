@@ -29,8 +29,8 @@ branch are tagged into a release periodically.
 
 ### Prerequisites
 
-- [Node.js](https://nodejs.org/en) version 20.20.0
-- [pnpm package manager](https://pnpm.io/installation) version 10.23.0
+- [Node.js](https://nodejs.org/en) version 24.18.0
+- [pnpm package manager](https://pnpm.io/installation) version 10.33.2
 - [Docker](https://www.docker.com/get-started/)
 - [protobuf](https://github.com/protocolbuffers/protobuf)
 
@@ -49,9 +49,9 @@ branch are tagged into a release periodically.
    ```
    cd trigger.dev
    ```
-3. Ensure you are on the correct version of Node.js (20.20.0). If you are using `nvm`, there is an `.nvmrc` file that will automatically select the correct version of Node.js when you navigate to the repository.
+3. Ensure you are on the correct version of Node.js (24.18.0). If you are using `nvm`, there is an `.nvmrc` file that will automatically select the correct version of Node.js when you navigate to the repository.
 
-4. Run `corepack enable` to use the correct version of pnpm (`10.23.0`) as specified in the root `package.json` file.
+4. Run `corepack enable` to use the correct version of pnpm (`10.33.2`) as specified in the root `package.json` file.
 
 5. Install the required packages using pnpm.
    ```
@@ -71,21 +71,27 @@ branch are tagged into a release periodically.
 
    Feel free to update `SESSION_SECRET` and `MAGIC_LINK_SECRET` as well using the same method.
 
-8. Start Docker. This starts the required services like Postgres & Redis. If this is your first time using Docker, consider going through this [guide](DOCKER_INSTALLATION.md)
+8. Start Docker. This starts the core dev services (Postgres, Redis, Electric, MinIO, ClickHouse, s2-lite) and runs the ClickHouse migrator once on first start. If this is your first time using Docker, consider going through this [guide](DOCKER_INSTALLATION.md).
 
    ```
    pnpm run docker
    ```
 
+   For the observability stack (Prometheus, Grafana, OTEL collector) and other optional tooling (Toxiproxy, nginx-h2, ch-ui, extra electric shard), use `pnpm run docker:full` instead. See `docker/docker-compose.extras.yml` for the full list.
+
 9. Migrate the database
    ```
    pnpm run db:migrate
    ```
-10. Build everything
+10. Build the webapp, CLI, and SDK
     ```
-    pnpm run build --filter webapp && pnpm run build --filter trigger.dev && pnpm run build --filter @trigger.dev/sdk
+    pnpm run build --filter webapp --filter trigger.dev --filter @trigger.dev/sdk
     ```
-11. Run the app. See the section below.
+11. Seed the database. This creates a local user, a `References` org, and the reference projects (including `hello-world`) with stable IDs.
+    ```
+    pnpm run db:seed
+    ```
+12. Run the app. See the section below.
 
 ## Running
 
@@ -101,29 +107,32 @@ branch are tagged into a release periodically.
 
 ## Manual testing using hello-world
 
-We use the `<root>/references/hello-world` subdirectory as a staging ground for testing changes to the SDK (`@trigger.dev/sdk` at `<root>/packages/trigger-sdk`), the Core package (`@trigger.dev/core` at `<root>packages/core`), the CLI (`trigger.dev` at `<root>/packages/cli-v3`) and the platform (The remix app at `<root>/apps/webapp`). The instructions below will get you started on using the `hello-world` for local development of Trigger.dev.
+The `hello-world` reference project (and the others) live in a separate repo:
+[`triggerdotdev/references`](https://github.com/triggerdotdev/references). Clone it
+alongside this repo. It's the staging ground for testing changes to the SDK
+(`@trigger.dev/sdk` at `<root>/packages/trigger-sdk`), the Core package
+(`@trigger.dev/core` at `<root>/packages/core`), the CLI (`trigger.dev` at
+`<root>/packages/cli-v3`) and the platform (the Remix app at `<root>/apps/webapp`).
+To exercise your local monorepo changes, the reference project links to your local
+build — see the references repo's README for the `pnpm run link` flow.
+
+> Paths below such as `projects/hello-world` are relative to your `references`
+> clone, not this repo.
 
 ### First-time setup
 
-First, make sure you are running the webapp according to the instructions above. Then:
+First, make sure you are running the webapp according to the instructions above. The seed step from setup already created a `hello-world` project under the `References` org with the stable ref `proj_rrkpdguyagvsoktglnod` — log in at http://localhost:3030 with any email to access it. Then:
 
-1. Visit http://localhost:3030 in your browser and create a new project called "hello-world".
-
-2. In Postgres go to the "Projects" table and for the project you create change the `externalRef` to `proj_rrkpdguyagvsoktglnod`.
-
-3. Build the CLI
+1. Build the CLI and packages (skip if you already ran the build step in setup)
 
 ```sh
-# Build the CLI
-pnpm run build --filter trigger.dev
-# Make it accessible to `pnpm exec`
-pnpm i
+pnpm run build --filter trigger.dev --filter "@trigger.dev/*"
 ```
 
-4. Change into the `<root>/references/hello-world` directory and authorize the CLI to the local server:
+2. In your `references` clone, link to your local monorepo build (see its README), then change into `projects/hello-world` and authorize the CLI to the local server:
 
 ```sh
-cd references/hello-world
+cd projects/hello-world
 cp .env.example .env
 pnpm exec trigger login -a http://localhost:3030
 ```
@@ -133,7 +142,7 @@ This will open a new browser window and authorize the CLI against your local use
 You can optionally pass a `--profile` flag to the `login` command, which will allow you to use the CLI with separate accounts/servers. We suggest using a profile called `local` for your local development:
 
 ```sh
-cd references/hello-world
+cd projects/hello-world
 pnpm exec trigger login -a http://localhost:3030 --profile local
 # later when you run the dev or deploy command:
 pnpm exec trigger dev --profile local
@@ -146,46 +155,46 @@ The following steps should be followed any time you start working on a new featu
 
 1. Make sure the webapp is running on localhost:3030
 
-2. Open a terminal window and build the CLI and packages and watch for changes
+2. In this repo, open a terminal window and build the CLI and packages and watch for changes (the reference project links against this build)
 
 ```sh
 pnpm run dev --filter trigger.dev --filter "@trigger.dev/*"
 ```
 
-3. Open another terminal window, and change into the `<root>/references/hello-world` directory.
+3. Open another terminal window, and change into `projects/hello-world` in your `references` clone.
 
 4. Run the `dev` command, which will register all the local tasks with the platform and allow you to start testing task execution:
 
 ```sh
-# in <root>/references/hello-world
+# in <references-clone>/projects/hello-world
 pnpm exec trigger dev
 ```
 
 If you want additional debug logging, you can use the `--log-level debug` flag:
 
 ```sh
-# in <root>/references/hello-world
+# in <references-clone>/projects/hello-world
 pnpm exec trigger dev --log-level debug
 ```
 
-6. If you make any changes in the CLI/Core/SDK, you'll need to `CTRL+C` to exit the `dev` command and restart it to pickup changes. Any changes to the files inside of the `hello-world/src/trigger` dir will automatically be rebuilt by the `dev` command.
+5. If you make any changes in the CLI/Core/SDK, you'll need to `CTRL+C` to exit the `dev` command and restart it to pickup changes. Any changes to the files inside the reference project's `src/trigger` dir will automatically be rebuilt by the `dev` command.
 
-7. Navigate to the `hello-world` project in your local dashboard at localhost:3030 and you should see the list of tasks.
+6. Navigate to the `hello-world` project in your local dashboard at localhost:3030 and you should see the list of tasks.
 
-8. Go to the "Test" page in the sidebar and select a task. Then enter a payload and click "Run test". You can tell what the payloads should be by looking at the relevant task file inside the `/references/hello-world/src/trigger` folder. Many of them accept an empty payload.
+7. On the Tasks page, open a task and press the "Test" button to open its test page. Then enter a payload and click "Run test". You can tell what the payloads should be by looking at the relevant task file inside the reference project's `src/trigger` folder. Many of them accept an empty payload.
 
-9. Feel free to add additional files in `hello-world/src/trigger` to test out specific aspects of the system, or add in edge cases.
+8. Feel free to add additional files in the reference project's `src/trigger` dir to test out specific aspects of the system, or add in edge cases.
 
 ## Adding and running migrations
 
-1. Modify internal-packages/database/prisma/schema.prisma file
-2. Change directory to the packages/database folder
+1. Modify `internal-packages/database/prisma/schema.prisma`.
+2. Change directory to the database package:
 
    ```sh
-   cd packages/database
+   cd internal-packages/database
    ```
 
-3. Create a migration
+3. Create a migration:
 
    ```
    pnpm run db:migrate:dev:create
@@ -193,50 +202,17 @@ pnpm exec trigger dev --log-level debug
 
    This creates a migration file. Check the migration file does only what you want. If you're adding any database indexes they must use `CONCURRENTLY`, otherwise they'll lock the table when executed.
 
-4. Run the migration.
+4. Run the migration:
 
-```
-pnpm run db:migrate:deploy
-pnpm run generate
-```
+   ```
+   pnpm run db:migrate:deploy
+   pnpm run generate
+   ```
 
-This executes the migrations against your database and applies changes to the database schema(s), and then regenerates the Prisma client.
+   This executes the migrations against your database and applies changes to the database schema(s), and then regenerates the Prisma client.
 
-4. Commit generated migrations as well as changes to the schema.prisma file
-5. If you're using VSCode you may need to restart the Typescript server in the webapp to get updated type inference. Open a TypeScript file, then open the Command Palette (View > Command Palette) and run `TypeScript: Restart TS server`.
-
-## Add sample jobs
-
-The [references/job-catalog](./references/job-catalog/) project defines simple jobs you can get started with.
-
-1. `cd` into `references/job-catalog`
-2. Create a `.env` file with the following content,
-   replacing `<TRIGGER_DEV_API_KEY>` with an actual key:
-
-```env
-TRIGGER_API_KEY=[TRIGGER_DEV_API_KEY]
-TRIGGER_API_URL=http://localhost:3030
-```
-
-`TRIGGER_API_URL` is used to configure the URL for your Trigger.dev instance,
-where the jobs will be registered.
-
-3. Run one of the the `job-catalog` files:
-
-```sh
-pnpm run events
-```
-
-This will open up a local server using `express` on port 8080. Then in a new terminal window you can run the trigger-cli dev command:
-
-```sh
-pnpm run dev:trigger
-```
-
-See the [Job Catalog](./references/job-catalog/README.md) file for more.
-
-4. Navigate to your trigger.dev instance ([http://localhost:3030](http://localhost:3030/)), to see the jobs.
-   You can use the test feature to trigger them.
+5. Commit the generated migration files as well as the changes to `schema.prisma`.
+6. If you're using VSCode you may need to restart the TypeScript server in the webapp to get updated type inference. Open a TypeScript file, then open the Command Palette (View > Command Palette) and run `TypeScript: Restart TS server`.
 
 ## Making a pull request
 
@@ -247,9 +223,15 @@ See the [Job Catalog](./references/job-catalog/README.md) file for more.
 ### PR workflow
 
 1. **Always open your PR in draft status first.** Do not mark it as "Ready for Review" until the steps below are complete.
-2. **Address all CodeRabbit code review comments.** Our CI runs an automated code review via CodeRabbit. Go through each comment and either fix the issue or resolve it with a comment explaining why no change is needed.
-3. **Wait for all CI checks to pass.** Do not mark the PR as "Ready for Review" until every check is green.
-4. **Then mark the PR as "Ready for Review"** so a maintainer can take a look.
+2. **Run format and lint locally before pushing:**
+   ```bash
+   pnpm run format      # auto-fixes formatting (oxfmt)
+   pnpm run lint:fix    # auto-fixes lint violations (oxlint)
+   ```
+   Both are enforced by CI — the `code-quality` check will fail if either produces a diff or errors.
+3. **Address all CodeRabbit code review comments.** Our CI runs an automated code review via CodeRabbit. Go through each comment and either fix the issue or resolve it with a comment explaining why no change is needed.
+4. **Wait for all CI checks to pass.** Do not mark the PR as "Ready for Review" until every check is green.
+5. **Then mark the PR as "Ready for Review"** so a maintainer can take a look.
 
 ### Cost/benefit analysis for risky changes
 
@@ -283,7 +265,7 @@ Most of the time the changes you'll make are likely to be categorized as patch r
 
 ## Adding server changes
 
-Changesets only track published npm packages. If your PR only changes server components (`apps/webapp/`, `apps/supervisor/`, `apps/coordinator/`, etc.) with no package changes, add a `.server-changes/` file so the change appears in release notes.
+Changesets only track published npm packages. If your PR only changes server components (`apps/webapp/`, `apps/supervisor/`, etc.) with no package changes, add a `.server-changes/` file so the change appears in release notes.
 
 Create a markdown file with a descriptive name:
 
@@ -299,7 +281,7 @@ EOF
 ```
 
 **Fields:**
-- `area` (required): `webapp` | `supervisor` | `coordinator` | `kubernetes-provider` | `docker-provider`
+- `area` (required): `webapp` | `supervisor`
 - `type` (required): `feature` | `fix` | `improvement` | `breaking`
 
 The body text (below the frontmatter) is a one-line description of the change. Keep it concise — it will appear in release notes.
@@ -334,3 +316,7 @@ The process running on port `3030` should be destroyed.
    ```sh
    sudo kill -9 <PID>
    ```
+
+### Running two clones side by side (worktree, branch experiment)
+
+The default `pnpm run docker` uses the project name `triggerdotdev-docker` and the standard host ports (5432, 6379, 3060, 4566, 8123, 9000, 9005, 9006). To stand up a second instance in another clone without clashing, set a different `COMPOSE_PROJECT_NAME` and the offset host ports in that clone's `.env`. The "Running multiple instances side by side" block in `.env.example` lists every overridable env var with its default for reference; uncomment the lines you need and update `DATABASE_URL` / `CLICKHOUSE_URL` / `REDIS_PORT` / `APP_ORIGIN` / `LOGIN_ORIGIN` / `ELECTRIC_ORIGIN` / `REALTIME_STREAMS_S2_ENDPOINT` to match.

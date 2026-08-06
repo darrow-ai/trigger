@@ -49,6 +49,7 @@ export type QueueProperties = {
   queueName: string;
   lockedQueueId?: string;
   taskTtl?: string | null;
+  taskKind?: string;
 };
 
 export type LockedBackgroundWorker = Pick<

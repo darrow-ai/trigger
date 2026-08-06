@@ -13,7 +13,7 @@ import {
 import { useSearchParams } from "~/hooks/useSearchParam";
 import { appliedSummary, FilterMenuProvider } from "~/components/runs/v3/SharedFilters";
 
-const shortcut = { key: "n" };
+const shortcut = { key: "o" };
 
 interface OperationsFilterProps {
   possibleOperations: string[];
@@ -31,7 +31,7 @@ function formatOperation(op: string): string {
 }
 
 export function OperationsFilter({ possibleOperations }: OperationsFilterProps) {
-  const { values, replace, del } = useSearchParams();
+  const { values, replace: _replace, del } = useSearchParams();
   const selectedOperations = values("operations");
 
   if (selectedOperations.length === 0 || selectedOperations.every((v) => v === "")) {
@@ -45,8 +45,9 @@ export function OperationsFilter({ possibleOperations }: OperationsFilterProps) 
                 variant="secondary/small"
                 shortcut={shortcut}
                 tooltipTitle="Filter by operation"
+                className="pl-1.5"
               >
-                <span className="ml-0.5">Operations</span>
+                <span className="ml-1">Operations</span>
               </SelectTrigger>
             }
             searchValue={search}
@@ -125,7 +126,12 @@ function OperationsDropdown({
         <ComboBox placeholder="Filter by operation..." value={searchValue} />
         <SelectList>
           {filtered.map((op) => (
-            <SelectItem key={op} value={op} icon={<CommandLineIcon className="size-4" />}>
+            <SelectItem
+              key={op}
+              value={op}
+              className="text-text-bright"
+              icon={<CommandLineIcon className="size-4 text-text-dimmed" />}
+            >
               {formatOperation(op)}
             </SelectItem>
           ))}

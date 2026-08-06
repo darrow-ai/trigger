@@ -4,12 +4,11 @@ import {
   ClickHouseLogLevel,
   type ClickHouseSettings,
   createClient,
-  type ResultSet,
-  type Row,
   type BaseQueryParams,
   type InsertResult,
 } from "@clickhouse/client";
-import { recordSpanError, Span, startSpan, trace, Tracer } from "@internal/tracing";
+import type { Span, Tracer } from "@internal/tracing";
+import { recordSpanError, startSpan, trace } from "@internal/tracing";
 import { flattenAttributes, tryCatch, type Result } from "@trigger.dev/core/v3";
 import { z } from "zod";
 import { InsertError, QueryError } from "./errors.js";
@@ -18,6 +17,7 @@ import type {
   ClickhouseQueryBuilderFastFunction,
   ClickhouseQueryBuilderFunction,
   ClickhouseQueryFunction,
+  ClickhouseQueryStreamFunction,
   ClickhouseQueryWithStatsFunction,
   ClickhouseReader,
   ClickhouseWriter,
@@ -171,13 +171,15 @@ export class ClickhouseClient implements ClickhouseReader, ClickhouseWriter {
         );
 
         if (clickhouseError) {
-          this.logger.error("Error querying clickhouse", {
+          const errorLogFields = {
             name: req.name,
             error: clickhouseError,
             query: req.query,
             params,
             queryId,
-          });
+          };
+
+          this.logger.error("Error querying clickhouse", errorLogFields);
 
           recordClickhouseError(span, clickhouseError);
 
@@ -260,6 +262,16 @@ export class ClickhouseClient implements ClickhouseReader, ClickhouseWriter {
      * These will be merged with the default settings.
      */
     settings?: ClickHouseSettings;
+    /**
+     * Extra fields to attach to the error log if the query fails. Use this to
+     * record what produced the SQL, e.g. the TSQL a caller actually wrote.
+     */
+    logFields?: Record<string, unknown>;
+    /**
+     * Set when the SQL originates from whoever made the request rather than
+     * from us. Invalid-SQL rejections are then their mistake, not a bug.
+     */
+    userAuthoredQuery?: boolean;
   }): ClickhouseQueryWithStatsFunction<z.input<TIn>, z.output<TOut>> {
     return async (params, options) => {
       const queryId = randomUUID();
@@ -320,13 +332,25 @@ export class ClickhouseClient implements ClickhouseReader, ClickhouseWriter {
         );
 
         if (clickhouseError) {
-          this.logger.error("Error querying clickhouse", {
+          const errorLogFields = {
+            ...req.logFields,
             name: req.name,
             error: clickhouseError,
             query: req.query,
             params,
             queryId,
-          });
+          };
+
+          switch (classifyClickhouseError(clickhouseError, req.userAuthoredQuery)) {
+            case "quota":
+              this.logger.warn("Query exceeded a ClickHouse limit", errorLogFields);
+              break;
+            case "invalid-sql":
+              this.logger.warn("ClickHouse rejected an invalid query", errorLogFields);
+              break;
+            default:
+              this.logger.error("Error querying clickhouse", errorLogFields);
+          }
 
           recordClickhouseError(span, clickhouseError);
 
@@ -453,13 +477,15 @@ export class ClickhouseClient implements ClickhouseReader, ClickhouseWriter {
         );
 
         if (clickhouseError) {
-          this.logger.error("Error querying clickhouse", {
+          const errorLogFields = {
             name: req.name,
             error: clickhouseError,
             query: req.query,
             params,
             queryId,
-          });
+          };
+
+          this.logger.error("Error querying clickhouse", errorLogFields);
 
           recordClickhouseError(span, clickhouseError);
 
@@ -492,7 +518,7 @@ export class ClickhouseClient implements ClickhouseReader, ClickhouseWriter {
           }
 
           for (const row of rows) {
-            const rowData = row.json();
+            const rowData = row.json() as any[];
 
             const hydratedRow: Record<string, any> = {};
             for (let i = 0; i < req.columns.length; i++) {
@@ -514,6 +540,109 @@ export class ClickhouseClient implements ClickhouseReader, ClickhouseWriter {
 
         return [null, resultRows];
       });
+    };
+  }
+
+  public queryFastStream<
+    TOut extends Record<string, any>,
+    TParams extends Record<string, any>,
+  >(req: {
+    name: string;
+    query: string;
+    columns: Array<string | ColumnExpression>;
+    settings?: ClickHouseSettings;
+  }): ClickhouseQueryStreamFunction<TParams, TOut> {
+    // eslint-disable-next-line no-this-alias
+    const self = this;
+
+    return async function* (params, options) {
+      const queryId = randomUUID();
+
+      // A generator yields across the await boundary, so we can't use the
+      // callback-style `startSpan` helper here. We start the span manually and
+      // end it in `finally` so the span covers the whole stream lifetime and is
+      // closed even if the consumer abandons the generator early. Errors are
+      // re-thrown (no Result tuple) since they can surface mid-stream after the
+      // response headers have already been sent, but they're still recorded on
+      // the span and logged for parity with `queryFast`.
+      const span = self.tracer.startSpan("queryFastStream");
+      span.setAttributes({
+        "clickhouse.clientName": self.name,
+        "clickhouse.operationName": req.name,
+        "clickhouse.queryId": queryId,
+        ...flattenAttributes(req.settings, "clickhouse.settings"),
+        ...flattenAttributes(options?.attributes),
+      });
+
+      self.logger.debug("Streaming clickhouse fast", {
+        name: req.name,
+        query: req.query.replace(/\s+/g, " "),
+        params,
+        settings: req.settings,
+        queryId,
+      });
+
+      try {
+        const resultSet = await self.client.query({
+          query: req.query,
+          query_params: params,
+          format: "JSONCompactEachRow",
+          query_id: queryId,
+          ...options?.params,
+          clickhouse_settings: {
+            ...req.settings,
+            ...options?.params?.clickhouse_settings,
+          },
+        });
+
+        span.setAttributes({
+          "clickhouse.query_id": resultSet.query_id,
+          ...flattenAttributes(resultSet.response_headers, "clickhouse.response_headers"),
+        });
+
+        // Stream rows off the socket and hydrate each one on the fly. The full
+        // result set is never materialised into an array — bounded memory for
+        // arbitrarily large queries.
+        let rowCount = 0;
+        for await (const rows of resultSet.stream()) {
+          for (const row of rows) {
+            const rowData = row.json() as any[];
+
+            const hydratedRow: Record<string, any> = {};
+            for (let i = 0; i < req.columns.length; i++) {
+              const column = req.columns[i];
+              if (typeof column === "string") {
+                hydratedRow[column] = rowData[i];
+              } else {
+                hydratedRow[column.name] = rowData[i];
+              }
+            }
+
+            rowCount++;
+            yield hydratedRow as TOut;
+          }
+        }
+
+        span.setAttributes({ "clickhouse.rows": rowCount });
+      } catch (error) {
+        const errorLogFields = {
+          name: req.name,
+          error,
+          query: req.query,
+          params,
+          queryId,
+        };
+
+        self.logger.error("Error streaming clickhouse", errorLogFields);
+
+        if (error instanceof Error) {
+          recordClickhouseError(span, error);
+        }
+
+        throw error;
+      } finally {
+        span.end();
+      }
     };
   }
 
@@ -618,7 +747,7 @@ export class ClickhouseClient implements ClickhouseReader, ClickhouseWriter {
 
           recordClickhouseError(span, clickhouseError);
 
-          return [new InsertError(clickhouseError.message), null];
+          return [toInsertError(clickhouseError), null];
         }
 
         this.logger.debug("Inserted into clickhouse", {
@@ -709,7 +838,7 @@ export class ClickhouseClient implements ClickhouseReader, ClickhouseWriter {
           });
 
           recordClickhouseError(span, clickhouseError);
-          return [new InsertError(clickhouseError.message), null];
+          return [toInsertError(clickhouseError), null];
         }
 
         return [null, result];
@@ -771,7 +900,7 @@ export class ClickhouseClient implements ClickhouseReader, ClickhouseWriter {
 
           recordClickhouseError(span, clickhouseError);
 
-          return [new InsertError(clickhouseError.message), null];
+          return [toInsertError(clickhouseError), null];
         }
 
         this.logger.debug("Inserted into clickhouse", {
@@ -870,7 +999,7 @@ export class ClickhouseClient implements ClickhouseReader, ClickhouseWriter {
           });
 
           recordClickhouseError(span, clickhouseError);
-          return [new InsertError(clickhouseError.message), null];
+          return [toInsertError(clickhouseError), null];
         }
 
         this.logger.debug("Inserted into clickhouse", {
@@ -898,6 +1027,70 @@ export class ClickhouseClient implements ClickhouseReader, ClickhouseWriter {
       });
     };
   }
+}
+
+/**
+ * ClickHouse error types raised by a query that is valid but asks for more than
+ * it is allowed to spend. Only downgraded for SQL the caller wrote: a runaway
+ * query we generated is our bug and still has to alert.
+ */
+const CLICKHOUSE_QUOTA_ERROR_TYPES = new Set([
+  "MEMORY_LIMIT_EXCEEDED",
+  "TIMEOUT_EXCEEDED",
+  "TOO_SLOW",
+  "TOO_MANY_ROWS",
+  "TOO_MANY_BYTES",
+  "TOO_MANY_ROWS_OR_BYTES",
+]);
+
+/**
+ * ClickHouse error types that mean the SQL itself is wrong. Only treated as the
+ * caller's fault when the query was written by the caller — the same error on a
+ * query we generated is our bug and has to keep alerting.
+ */
+const CLICKHOUSE_INVALID_SQL_ERROR_TYPES = new Set([
+  "NOT_AN_AGGREGATE",
+  "ILLEGAL_AGGREGATION",
+  "UNKNOWN_IDENTIFIER",
+  "UNKNOWN_FUNCTION",
+  "UNKNOWN_TABLE",
+  "AMBIGUOUS_COLUMN_NAME",
+  "MULTIPLE_EXPRESSIONS_FOR_ALIAS",
+  "SYNTAX_ERROR",
+  "BAD_ARGUMENTS",
+  "TYPE_MISMATCH",
+  "NO_COMMON_TYPE",
+  "ILLEGAL_TYPE_OF_ARGUMENT",
+  "ILLEGAL_COLUMN",
+  "CANNOT_CONVERT_TYPE",
+  "CANNOT_PARSE_TEXT",
+  "CANNOT_PARSE_NUMBER",
+  "CANNOT_PARSE_DATE",
+  "CANNOT_PARSE_DATETIME",
+  "CANNOT_PARSE_INPUT_ASSERTION_FAILED",
+]);
+
+type ClickhouseErrorCategory = "quota" | "invalid-sql" | "fault";
+
+function classifyClickhouseError(
+  error: Error,
+  userAuthoredQuery: boolean | undefined
+): ClickhouseErrorCategory {
+  if (!userAuthoredQuery || !(error instanceof ClickHouseError) || error.type === undefined) {
+    return "fault";
+  }
+  if (CLICKHOUSE_QUOTA_ERROR_TYPES.has(error.type)) {
+    return "quota";
+  }
+  if (CLICKHOUSE_INVALID_SQL_ERROR_TYPES.has(error.type)) {
+    return "invalid-sql";
+  }
+  return "fault";
+}
+
+function toInsertError(error: Error): InsertError {
+  const rawMessage = error instanceof ClickHouseError ? error.rawMessage : undefined;
+  return new InsertError(error.message, { rawMessage });
 }
 
 function recordClickhouseError(span: Span, error: Error): void {

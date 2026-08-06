@@ -1,7 +1,8 @@
-import { ActionFunctionArgs, json } from "@remix-run/server-runtime";
+import type { ActionFunctionArgs } from "@remix-run/server-runtime";
+import { json } from "@remix-run/server-runtime";
 import { FinalizeDeploymentRequestBody } from "@trigger.dev/core/v3";
 import { z } from "zod";
-import { authenticateApiRequest } from "~/services/apiAuth.server";
+import { authenticateApiKeyWithScope } from "~/services/apiAuth.server";
 import { logger } from "~/services/logger.server";
 import { ServiceValidationError } from "~/v3/services/baseService.server";
 import { FinalizeDeploymentV2Service } from "~/v3/services/finalizeDeploymentV2.server";
@@ -23,12 +24,17 @@ export async function action({ request, params }: ActionFunctionArgs) {
   }
 
   // Next authenticate the request
-  const authenticationResult = await authenticateApiRequest(request);
+  const authResult = await authenticateApiKeyWithScope(request, {
+    action: "write",
+    resource: { type: "deployments" },
+  });
 
-  if (!authenticationResult) {
+  if (!authResult.ok) {
     logger.info("Invalid or missing api key", { url: request.url });
-    return json({ error: "Invalid or Missing API key" }, { status: 401 });
+    return json({ error: authResult.error }, { status: authResult.status });
   }
+
+  const authenticationResult = authResult.authentication;
 
   const authenticatedEnv = authenticationResult.environment;
 
@@ -75,11 +81,8 @@ export async function action({ request, params }: ActionFunctionArgs) {
 
         if (error instanceof ServiceValidationError) {
           errorMessage = { error: error.message };
-        } else if (error instanceof Error) {
-          logger.error("Error finalizing deployment", { error: error.message });
-          errorMessage = { error: `Internal server error: ${error.message}` };
         } else {
-          logger.error("Error finalizing deployment", { error: String(error) });
+          logger.error("Error finalizing deployment", { error });
           errorMessage = { error: "Internal server error" };
         }
 
@@ -93,12 +96,9 @@ export async function action({ request, params }: ActionFunctionArgs) {
   } catch (error) {
     if (error instanceof ServiceValidationError) {
       return json({ error: error.message }, { status: 400 });
-    } else if (error instanceof Error) {
-      logger.error("Error finalizing deployment", { error: error.message });
-      return json({ error: `Internal server error: ${error.message}` }, { status: 500 });
-    } else {
-      logger.error("Error finalizing deployment", { error: String(error) });
-      return json({ error: "Internal server error" }, { status: 500 });
     }
+
+    logger.error("Error finalizing deployment", { error });
+    return json({ error: "Internal server error" }, { status: 500 });
   }
 }

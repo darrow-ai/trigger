@@ -1,9 +1,13 @@
-import { Attributes } from "@opentelemetry/api";
+import type { Attributes } from "@opentelemetry/api";
 
 export const NULL_SENTINEL = "$@null((";
 export const CIRCULAR_REFERENCE_SENTINEL = "$@circular((";
 
 const DEFAULT_MAX_DEPTH = 128;
+
+// This property name would let a crafted key walk into Object.prototype during
+// reconstruction and pollute the shared process.
+const PROTOTYPE_POLLUTION_KEY = "__proto__";
 
 export function flattenAttributes(
   obj: unknown,
@@ -244,11 +248,6 @@ class AttributeFlattener {
     }
   }
 }
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
 export function unflattenAttributes(
   obj: Attributes,
   filteredKeys?: string[],
@@ -302,6 +301,11 @@ export function unflattenAttributes(
       continue;
     }
 
+    // Skip any key whose path could walk into Object.prototype.
+    if (parts.includes(PROTOTYPE_POLLUTION_KEY)) {
+      continue;
+    }
+
     let current: any = result;
     for (let i = 0; i < parts.length - 1; i++) {
       const part = parts[i];
@@ -312,10 +316,16 @@ export function unflattenAttributes(
       }
 
       if (typeof nextPart === "number") {
-        // Ensure we create an array for numeric indices
-        current[part] = Array.isArray(current[part]) ? current[part] : [];
-      } else if (current[part] === undefined) {
-        // Create an object for non-numeric paths
+        if (!Array.isArray(current[part])) {
+          current[part] = [];
+        }
+      } else if (
+        current[part] === null ||
+        typeof current[part] !== "object" ||
+        Array.isArray(current[part])
+      ) {
+        // Last-write-wins when a prior key wrote a primitive, null, or array
+        // at this slot — keeps unflatten total for conflicting OTLP inputs.
         current[part] = {};
       }
 
@@ -329,8 +339,10 @@ export function unflattenAttributes(
     }
   }
 
-  // Convert the result to an array if all top-level keys are numeric indices
-  if (Object.keys(result).every((k) => /^\d+$/.test(k))) {
+  // Convert the result to an array if all top-level keys are numeric indices.
+  // Guard against an empty result (e.g. every key was skipped as unsafe), which
+  // would otherwise produce Array(-Infinity) and throw.
+  if (Object.keys(result).length > 0 && Object.keys(result).every((k) => /^\d+$/.test(k))) {
     const maxIndex = Math.max(...Object.keys(result).map((k) => parseInt(k)));
     const arrayResult = Array(maxIndex + 1);
     for (const key in result) {

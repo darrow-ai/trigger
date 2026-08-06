@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { InitializeDeploymentRequestBody } from "./api.js";
+import { BatchItemNDJSON, InitializeDeploymentRequestBody, TriggerTaskRequestBody } from "./api.js";
 import type { InitializeDeploymentRequestBody as InitializeDeploymentRequestBodyType } from "./api.js";
 
 describe("InitializeDeploymentRequestBody", () => {
@@ -137,5 +137,86 @@ describe("InitializeDeploymentRequestBody", () => {
         expect(narrowed.contentHash).toBe("abc123");
       }
     });
+  });
+});
+
+describe("TriggerTaskRequestBody", () => {
+  it("accepts application/store payload as a non-empty string", () => {
+    const result = TriggerTaskRequestBody.safeParse({
+      payload: "packets/payloads/file.json",
+      context: {},
+      options: {
+        payloadType: "application/store",
+      },
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects application/store payload when payload is not a string", () => {
+    const result = TriggerTaskRequestBody.safeParse({
+      payload: { foo: "bar" },
+      context: {},
+      options: {
+        payloadType: "application/store",
+      },
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects application/store payload when payload is an empty string", () => {
+    const result = TriggerTaskRequestBody.safeParse({
+      payload: "",
+      context: {},
+      options: {
+        payloadType: "application/store",
+      },
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  it("accepts an optional payloadSize on the options", () => {
+    const result = TriggerTaskRequestBody.safeParse({
+      payload: "packets/payloads/file.json",
+      context: {},
+      options: {
+        payloadType: "application/store",
+        payloadSize: 512 * 1024,
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.success && result.data.options?.payloadSize).toBe(512 * 1024);
+  });
+
+  it("rejects a negative payloadSize", () => {
+    const result = TriggerTaskRequestBody.safeParse({
+      payload: { foo: "bar" },
+      context: {},
+      options: {
+        payloadSize: -1,
+      },
+    });
+
+    expect(result.success).toBe(false);
+  });
+});
+
+describe("BatchItemNDJSON", () => {
+  it("accepts an optional payloadSize on a batch item's options", () => {
+    const result = BatchItemNDJSON.safeParse({
+      index: 0,
+      task: "my-task",
+      payload: "packets/payloads/file.json",
+      options: {
+        payloadType: "application/store",
+        payloadSize: 256 * 1024,
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.success && result.data.options?.payloadSize).toBe(256 * 1024);
   });
 });

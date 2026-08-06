@@ -1,5 +1,16 @@
-import { PromptManifest, QueueManifest, TaskManifest, WorkerManifest } from "../schemas/index.js";
-import { PromptMetadataWithFunctions, TaskMetadataWithFunctions, TaskSchema } from "../types/index.js";
+import type {
+  PromptManifest,
+  QueueManifest,
+  SkillManifest,
+  SkillMetadata,
+  TaskManifest,
+  WorkerManifest,
+} from "../schemas/index.js";
+import type {
+  PromptMetadataWithFunctions,
+  TaskMetadataWithFunctions,
+  TaskSchema,
+} from "../types/index.js";
 
 export interface ResourceCatalog {
   setCurrentFileContext(filePath: string, entryPoint: string): void;
@@ -7,6 +18,7 @@ export interface ResourceCatalog {
   registerTaskMetadata(task: TaskMetadataWithFunctions): void;
   updateTaskMetadata(id: string, task: Partial<TaskMetadataWithFunctions>): void;
   listTaskManifests(): Array<TaskManifest>;
+  listTaskIdCollisions(): Array<{ id: string; filePaths: string[] }>;
   getTaskManifest(id: string): TaskManifest | undefined;
   getTask(id: string): TaskMetadataWithFunctions | undefined;
   taskExists(id: string): boolean;
@@ -18,4 +30,7 @@ export interface ResourceCatalog {
   listPromptManifests(): Array<PromptManifest>;
   getPrompt(id: string): PromptMetadataWithFunctions | undefined;
   getPromptSchema(id: string): TaskSchema | undefined;
+  registerSkillMetadata(skill: SkillMetadata): void;
+  listSkillManifests(): Array<SkillManifest>;
+  getSkillManifest(id: string): SkillManifest | undefined;
 }

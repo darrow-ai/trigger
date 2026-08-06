@@ -30,6 +30,15 @@ We deploy your tasks and scale them up and down when they are triggered. So any 
   locally.
 </Note>
 
+### Secret environment variables
+
+When creating an environment variable, you can mark it as a **Secret**. Secret values are hidden in the dashboard and cannot be viewed after creation.
+
+<Warning>
+  Marking a variable as a Secret is irreversible and can only be done when creating the variable. To
+  change this setting, you must delete the variable and create a new one.
+</Warning>
+
 ### Editing environment variables
 
 You can edit an environment variable's values. You cannot edit the key name, you must delete and create a new one.
@@ -221,7 +230,7 @@ To sync environment variables from your Vercel projects to Trigger.dev, you can 
 
 #### Deploy
 
-When you run the [CLI deploy command](/cli-deploy) directly or using [GitHub Actions](/github-actions) it will sync the environment variables from [Infisical](https://infisical.com) to Trigger.dev. This means they'll appear on the Environment Variables page so you can confirm that it's worked.
+When you run the [CLI deploy command](/cli-deploy-commands) directly or using [GitHub Actions](/github-actions) it will sync the environment variables from [Infisical](https://infisical.com) to Trigger.dev. This means they'll appear on the Environment Variables page so you can confirm that it's worked.
 
 This means that you need to redeploy your Trigger.dev tasks if you change the environment variables in [Infisical](https://infisical.com).
 

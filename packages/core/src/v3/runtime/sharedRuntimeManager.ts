@@ -1,8 +1,8 @@
 import { assertExhaustive } from "../../utils.js";
 import { clock } from "../clock-api.js";
 import { lifecycleHooks } from "../lifecycle-hooks-api.js";
-import { DebugLogPropertiesInput } from "../runEngineWorker/index.js";
-import {
+import type { DebugLogPropertiesInput } from "../runEngineWorker/index.js";
+import type {
   BatchTaskRunExecutionResult,
   CompletedWaitpoint,
   TaskRunContext,
@@ -12,8 +12,8 @@ import {
   WaitpointTokenResult,
 } from "../schemas/index.js";
 import { tryCatch } from "../tryCatch.js";
-import { ExecutorToWorkerProcessConnection } from "../zodIpc.js";
-import { RuntimeManager } from "./manager.js";
+import type { ExecutorToWorkerProcessConnection } from "../zodIpc.js";
+import type { RuntimeManager } from "./manager.js";
 import { preventMultipleWaits } from "./preventMultipleWaits.js";
 
 /** A function that resolves a waitpoint */
@@ -219,7 +219,7 @@ export class SharedRuntimeManager implements RuntimeManager {
 
   private resolveWaitpoint(waitpoint: CompletedWaitpoint, resolverId?: ResolverId | null): void {
     // This is spammy, don't make this a debug log
-    this.log("resolveWaitpoint", waitpoint);
+    this.log("resolveWaitpoint", { id: waitpoint.id, type: waitpoint.type });
 
     if (waitpoint.type === "BATCH") {
       // We currently ignore these, they're not required to resume after a batch completes

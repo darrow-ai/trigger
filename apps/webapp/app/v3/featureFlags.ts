@@ -6,8 +6,28 @@ export const FEATURE_FLAG = {
   hasQueryAccess: "hasQueryAccess",
   hasLogsPageAccess: "hasLogsPageAccess",
   hasAiAccess: "hasAiAccess",
+  hasDashboardAgentAccess: "hasDashboardAgentAccess",
   hasComputeAccess: "hasComputeAccess",
   hasPrivateConnections: "hasPrivateConnections",
+  hasSso: "hasSso",
+  hasThemeSwitcher: "hasThemeSwitcher",
+  mollifierEnabled: "mollifierEnabled",
+  workerQueueScheduledSplitEnabled: "workerQueueScheduledSplitEnabled",
+  internalApiOriginEnabled: "internalApiOriginEnabled",
+  realtimeBackend: "realtimeBackend",
+  computeMigrationEnabled: "computeMigrationEnabled",
+  computeMigrationFreePercentage: "computeMigrationFreePercentage",
+  computeMigrationPaidPercentage: "computeMigrationPaidPercentage",
+  computeMigrationRequireTemplate: "computeMigrationRequireTemplate",
+  devBranchesEnabled: "devBranchesEnabled",
+  runOpsMintKind: "runOpsMintKind",
+  // Grace-linger stamp carried alongside runOpsMintKind on flip. See mintFlipGrace.ts.
+  runOpsMintKindPrev: "runOpsMintKindPrev",
+  runOpsMintKindFlippedAt: "runOpsMintKindFlippedAt",
+  queueMetricsUiEnabled: "queueMetricsUiEnabled",
+  // System-wide kill switch for additional (scoped) environment API-key lookup.
+  // Defaults off; enable during rollout once the new lookup path is trusted.
+  additionalApiKeyLookupEnabled: "additionalApiKeyLookupEnabled",
 } as const;
 
 export const FeatureFlagCatalog = {
@@ -16,8 +36,52 @@ export const FeatureFlagCatalog = {
   [FEATURE_FLAG.hasQueryAccess]: z.coerce.boolean(),
   [FEATURE_FLAG.hasLogsPageAccess]: z.coerce.boolean(),
   [FEATURE_FLAG.hasAiAccess]: z.coerce.boolean(),
+  // Gates the in-dashboard AI agent panel. Controllable globally and per-org
+  // (org wins). Defaults off via DASHBOARD_AGENT_ENABLED.
+  [FEATURE_FLAG.hasDashboardAgentAccess]: z.coerce.boolean(),
   [FEATURE_FLAG.hasComputeAccess]: z.coerce.boolean(),
   [FEATURE_FLAG.hasPrivateConnections]: z.coerce.boolean(),
+  [FEATURE_FLAG.hasSso]: z.coerce.boolean(),
+  // Gates the Interface theme setting in /account. Off by default.
+  [FEATURE_FLAG.hasThemeSwitcher]: z.coerce.boolean(),
+  [FEATURE_FLAG.mollifierEnabled]: z.coerce.boolean(),
+  [FEATURE_FLAG.workerQueueScheduledSplitEnabled]: z.coerce.boolean(),
+  // Routes deployed runs' TRIGGER_API_URL to INTERNAL_API_ORIGIN. Per-org, with
+  // INTERNAL_API_ORIGIN_ENABLED as the global default (org wins). No-op unless
+  // INTERNAL_API_ORIGIN is set.
+  // Strict z.boolean(): coercion turns the string "false" into true, which
+  // would silently enable the wrong orgs if written as a string.
+  [FEATURE_FLAG.internalApiOriginEnabled]: z.boolean(),
+  // Which backend serves the realtime run feed. Controllable
+  // globally and per-org (org wins). Defaults to "electric" when unset.
+  // "shadow" serves Electric but diffs the native path in the background.
+  [FEATURE_FLAG.realtimeBackend]: z.enum(["electric", "native", "shadow"]),
+  // Strict z.boolean() (not z.coerce.boolean()): coercion turns the string "false"
+  // into true, which would silently flip this kill switch / per-org exclude the wrong
+  // way if written as a string via the admin PAT route. The admin toggle sends a real
+  // boolean, so this only rejects the dangerous stringified case.
+  [FEATURE_FLAG.computeMigrationEnabled]: z.boolean(),
+  [FEATURE_FLAG.computeMigrationFreePercentage]: z.coerce.number().int().min(0).max(100),
+  [FEATURE_FLAG.computeMigrationPaidPercentage]: z.coerce.number().int().min(0).max(100),
+  // When on, migrated orgs build their compute template in required mode at deploy
+  // (fails the deploy on error) instead of shadow. Strict boolean (see above).
+  [FEATURE_FLAG.computeMigrationRequireTemplate]: z.boolean(),
+  // Per-org access to development branches. Off unless enabled for the org.
+  [FEATURE_FLAG.devBranchesEnabled]: z.coerce.boolean(),
+  // Per-org run-ops-id mint cutover. Defaults to "cuid"; only honored when
+  // RUN_OPS_MINT_ENABLED is on AND isSplitEnabled() is true.
+  [FEATURE_FLAG.runOpsMintKind]: z.enum(["cuid", "runOpsId"]),
+  // Grace-linger stamp: the previously-effective kind and the flip timestamp, written
+  // by stampMintKindFlip on a genuine flip. Display-only (see ORG_LOCKED_FLAGS).
+  [FEATURE_FLAG.runOpsMintKindPrev]: z.enum(["cuid", "runOpsId"]),
+  [FEATURE_FLAG.runOpsMintKindFlippedAt]: z.string().datetime(),
+  // Per-org access to the Queue Metrics dashboard UI (view only; emission is global and
+  // separate). Off unless enabled for the org.
+  [FEATURE_FLAG.queueMetricsUiEnabled]: z.coerce.boolean(),
+  // Strict z.boolean() (not z.coerce.boolean()): coercion turns the string
+  // "false" into true, which would silently enable this kill switch the wrong
+  // way if written as a string. Cold/absent resolves to the safe `false`.
+  [FEATURE_FLAG.additionalApiKeyLookupEnabled]: z.boolean(),
 };
 
 export type FeatureFlagKey = keyof typeof FeatureFlagCatalog;
@@ -34,6 +98,10 @@ export const GLOBAL_LOCKED_FLAGS: FeatureFlagKey[] = [
 export const ORG_LOCKED_FLAGS: FeatureFlagKey[] = [
   FEATURE_FLAG.defaultWorkerInstanceGroupId,
   FEATURE_FLAG.taskEventRepository,
+  FEATURE_FLAG.runOpsMintKindPrev,
+  FEATURE_FLAG.runOpsMintKindFlippedAt,
+  // System-wide only — an org must not be able to override the rollout switch.
+  FEATURE_FLAG.additionalApiKeyLookupEnabled,
 ];
 
 // Create a Zod schema from the existing catalog
@@ -59,9 +127,39 @@ export function validatePartialFeatureFlags(values: Record<string, unknown>) {
 }
 
 // Utility types for catalog-driven UI rendering
+/**
+ * Resolve whether deployed runs should use the internal API origin, from the
+ * org's feature-flags JSON. Precedence: a per-org override wins in BOTH
+ * directions; the global default applies only when the org has not set the
+ * flag (or set it to something invalid).
+ */
+export function resolveInternalApiOriginEnabled({
+  orgFeatureFlags,
+  globalDefault,
+}: {
+  orgFeatureFlags: unknown;
+  globalDefault: boolean;
+}): boolean {
+  const override =
+    orgFeatureFlags && typeof orgFeatureFlags === "object" && !Array.isArray(orgFeatureFlags)
+      ? (orgFeatureFlags as Record<string, unknown>)[FEATURE_FLAG.internalApiOriginEnabled]
+      : undefined;
+
+  if (override !== undefined) {
+    const parsed = FeatureFlagCatalog[FEATURE_FLAG.internalApiOriginEnabled].safeParse(override);
+
+    if (parsed.success) {
+      return parsed.data;
+    }
+  }
+
+  return globalDefault;
+}
+
 export type FlagControlType =
   | { type: "boolean" }
   | { type: "enum"; options: string[] }
+  | { type: "number"; min?: number; max?: number }
   | { type: "string" };
 
 export function getFlagControlType(schema: z.ZodTypeAny): FlagControlType {
@@ -73,6 +171,15 @@ export function getFlagControlType(schema: z.ZodTypeAny): FlagControlType {
 
   if (typeName === "ZodEnum") {
     return { type: "enum", options: schema._def.values as string[] };
+  }
+
+  // z.coerce.number() reports as ZodNumber; pull min/max out of its checks
+  // so the UI can render a constrained number input instead of free text.
+  if (typeName === "ZodNumber") {
+    const checks = (schema._def.checks ?? []) as Array<{ kind: string; value?: number }>;
+    const min = checks.find((c) => c.kind === "min")?.value;
+    const max = checks.find((c) => c.kind === "max")?.value;
+    return { type: "number", min, max };
   }
 
   return { type: "string" };

@@ -1,18 +1,16 @@
-import { conform, list, requestIntent, useFieldList, useForm } from "@conform-to/react";
-import { parse } from "@conform-to/zod";
+import { getFormProps, getInputProps, useForm } from "@conform-to/react";
+import { parseWithZod } from "@conform-to/zod";
 import {
   ArrowUpCircleIcon,
   EnvelopeIcon,
   LockOpenIcon,
   UserPlusIcon,
 } from "@heroicons/react/20/solid";
-import type { ActionFunction, LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
 import { Form, useActionData } from "@remix-run/react";
 import { Fragment, useRef, useState } from "react";
 import { typedjson, useTypedLoaderData } from "remix-typedjson";
 import simplur from "simplur";
-import invariant from "tiny-invariant";
 import { z } from "zod";
 import { MainCenteredContainer } from "~/components/layout/AppLayout";
 import { Button, LinkButton } from "~/components/primitives/Buttons";
@@ -25,46 +23,92 @@ import { Input } from "~/components/primitives/Input";
 import { InputGroup } from "~/components/primitives/InputGroup";
 import { Label } from "~/components/primitives/Label";
 import { Paragraph } from "~/components/primitives/Paragraph";
+import { Select, SelectItem } from "~/components/primitives/Select";
 import { $replica } from "~/db.server";
 import { env } from "~/env.server";
 import { useOrganization } from "~/hooks/useOrganizations";
 import { inviteMembers } from "~/models/member.server";
-import { redirectWithSuccessMessage } from "~/models/message.server";
+import { redirectWithErrorMessage, redirectWithSuccessMessage } from "~/models/message.server";
+import { resolveOrgIdFromSlug } from "~/models/organization.server";
 import { TeamPresenter } from "~/presenters/TeamPresenter.server";
-import { scheduleEmail } from "~/services/email.server";
-import { requireUserId } from "~/services/session.server";
+import { scheduleEmail } from "~/services/scheduleEmail.server";
+import { rbac } from "~/services/rbac.server";
+import { ssoController } from "~/services/sso.server";
+import { dashboardAction, dashboardLoader } from "~/services/routeBuilders/dashboardBuilder";
 import { acceptInvitePath, organizationTeamPath, v3BillingPath } from "~/utils/pathBuilder";
+import { isAtOrBelow } from "~/utils/inviteRoleLadder";
 import { PurchaseSeatsModal } from "../_app.orgs.$organizationSlug.settings.team/route";
 
 const Params = z.object({
   organizationSlug: z.string(),
 });
 
-export const loader = async ({ request, params }: LoaderFunctionArgs) => {
-  const userId = await requireUserId(request);
-  const { organizationSlug } = Params.parse(params);
+export const loader = dashboardLoader(
+  {
+    params: Params,
+    context: async (params) => {
+      const organizationId = await resolveOrgIdFromSlug(params.organizationSlug);
+      return organizationId ? { organizationId } : {};
+    },
+    authorization: {
+      action: "manage",
+      resource: { type: "members" },
+      message: "With your current role, you can't invite team members.",
+    },
+  },
+  async ({ user, context, ability }) => {
+    const organizationId = context.organizationId;
+    if (!organizationId) {
+      throw new Response("Not Found", { status: 404 });
+    }
+    const userId = user.id;
 
-  const organization = await $replica.organization.findFirst({
-    where: { slug: organizationSlug },
-    select: { id: true },
-  });
+    const presenter = new TeamPresenter();
+    const result = await presenter.call({
+      userId,
+      organizationId,
+    });
 
-  if (!organization) {
-    throw new Response("Not Found", { status: 404 });
+    if (!result) {
+      throw new Response("Not Found", { status: 404 });
+    }
+
+    // Inviter's own role drives the "below their level" filter on the
+    // dropdown. Plus assignable role IDs already encode the org's plan
+    // tier — the intersection is what we offer.
+    const [inviterRole, assignableRoleIds, systemRoles] = await Promise.all([
+      rbac.getUserRole({ userId, organizationId }),
+      rbac.getAssignableRoleIds(organizationId),
+      rbac.systemRoles(organizationId),
+    ]);
+
+    // Build the dropdown's offerable set server-side: roles that are
+    // (a) assignable on the current plan AND (b) at or below the
+    // inviter's own level. The client just renders these — it doesn't
+    // need to know about the system-role catalogue or the ladder.
+    const assignableSet = new Set(assignableRoleIds);
+    const offerableRoleIds = systemRoles
+      ? result.roles
+          .filter(
+            (r) =>
+              assignableSet.has(r.id) && isAtOrBelow(systemRoles, inviterRole?.id ?? null, r.id)
+          )
+          .map((r) => r.id)
+      : [];
+
+    // Buying seats is a billing operation: surface whether this user can, so
+    // the purchase modal disables its trigger (the team action enforces it).
+    const canManageBilling = ability.can("manage", { type: "billing" });
+
+    return typedjson({ ...result, offerableRoleIds, canManageBilling });
   }
+);
 
-  const presenter = new TeamPresenter();
-  const result = await presenter.call({
-    userId,
-    organizationId: organization.id,
-  });
-
-  if (!result) {
-    throw new Response("Not Found", { status: 404 });
-  }
-
-  return typedjson(result);
-};
+// Sentinel for "no RBAC role attached to invite" — the runtime
+// fallback will derive a role from the legacy OrgMember.role write at
+// accept time. Used when the org has no RBAC plugin installed (the
+// dropdown is hidden) or as a defensive default.
+const NO_RBAC_ROLE = "__no_rbac_role__";
 
 const schema = z.object({
   emails: z.preprocess((i) => {
@@ -80,77 +124,191 @@ const schema = z.object({
 
     return [""];
   }, z.string().email().array().nonempty("At least one email is required")),
+  rbacRoleId: z.string().optional(),
 });
 
-export const action: ActionFunction = async ({ request, params }) => {
-  const userId = await requireUserId(request);
-  const { organizationSlug } = params;
-  invariant(organizationSlug, "organizationSlug is required");
+function describeSkippedInvites(alreadyMembers: string[], alreadyInvited: string[]) {
+  const parts: string[] = [];
 
-  const formData = await request.formData();
-  const submission = parse(formData, { schema });
-
-  if (!submission.value || submission.intent !== "submit") {
-    return json(submission);
+  if (alreadyMembers.length > 0) {
+    parts.push(simplur`${alreadyMembers.length} already [a member|members] of this organization`);
   }
 
-  try {
-    const invites = await inviteMembers({
-      slug: organizationSlug,
-      emails: submission.value.emails,
-      userId,
-    });
+  if (alreadyInvited.length > 0) {
+    parts.push(simplur`${alreadyInvited.length} already invited`);
+  }
 
-    for (const invite of invites) {
-      try {
-        await scheduleEmail({
-          email: "invite",
-          to: invite.email,
-          orgName: invite.organization.title,
-          inviterName: invite.inviter.name ?? undefined,
-          inviterEmail: invite.inviter.email,
-          inviteLink: `${env.LOGIN_ORIGIN}${acceptInvitePath(invite.token)}`,
-        });
-      } catch (error) {
-        console.error("Failed to send invite email");
-        console.error(error);
+  return parts.join(" and ");
+}
+
+export const action = dashboardAction(
+  {
+    params: Params,
+    context: async (params) => {
+      const organizationId = await resolveOrgIdFromSlug(params.organizationSlug);
+      return organizationId ? { organizationId } : {};
+    },
+    authorization: { action: "manage", resource: { type: "members" } },
+  },
+  async ({ request, params, user, context }) => {
+    const userId = user.id;
+    const { organizationSlug } = params;
+
+    const formData = await request.formData();
+    const submission = parseWithZod(formData, { schema });
+
+    if (submission.status !== "success") {
+      return json(submission.reply());
+    }
+
+    // Directory-managed membership: inviting is disabled (the directory is the
+    // authority). Enforced here; the Team page also hides the invite button.
+    if (context.organizationId) {
+      const policy = await ssoController.getMembershipPolicy(context.organizationId);
+      if (policy.isOk() && !policy.value.manualMembershipAllowed) {
+        return json(
+          { errors: { body: "Membership is managed by Directory Sync" } },
+          { status: 403 }
+        );
       }
     }
 
-    return redirectWithSuccessMessage(
-      organizationTeamPath(invites[0].organization),
-      request,
-      simplur`${submission.value.emails.length} member[|s] invited`
-    );
-  } catch (error: any) {
-    return json({ errors: { body: error.message } }, { status: 400 });
+    // Resolve the RBAC role choice. NO_RBAC_ROLE / undefined / unknown
+    // role → don't pass one through; the runtime fallback handles it.
+    // Validation: the chosen role must be in the org's assignable set
+    // (plan-tier) and at or below the inviter's own level.
+    let resolvedRbacRoleId: string | null = null;
+    const submittedRbacRoleId = submission.value.rbacRoleId;
+    if (submittedRbacRoleId && submittedRbacRoleId !== NO_RBAC_ROLE) {
+      const org = await $replica.organization.findFirst({
+        where: { slug: organizationSlug },
+        select: { id: true },
+      });
+      if (!org) {
+        return json({ errors: { body: "Organization not found" } }, { status: 404 });
+      }
+      const [inviterRole, assignableRoleIds, systemRoles] = await Promise.all([
+        rbac.getUserRole({ userId, organizationId: org.id }),
+        rbac.getAssignableRoleIds(org.id),
+        rbac.systemRoles(org.id),
+      ]);
+      if (!systemRoles) {
+        // No plugin installed but the form somehow submitted a role id —
+        // ignore it (fall through to legacy behaviour rather than 400).
+        resolvedRbacRoleId = null;
+      } else {
+        const assignable = new Set(assignableRoleIds);
+        if (!assignable.has(submittedRbacRoleId)) {
+          return json(
+            { errors: { body: "You can't invite someone with this role on your current plan" } },
+            { status: 400 }
+          );
+        }
+        if (!isAtOrBelow(systemRoles, inviterRole?.id ?? null, submittedRbacRoleId)) {
+          return json(
+            { errors: { body: "You can only invite members at or below your own role" } },
+            { status: 403 }
+          );
+        }
+        resolvedRbacRoleId = submittedRbacRoleId;
+      }
+    }
+
+    try {
+      const {
+        created: invites,
+        alreadyMembers,
+        alreadyInvited,
+      } = await inviteMembers({
+        slug: organizationSlug,
+        emails: submission.value.emails,
+        userId,
+        rbacRoleId: resolvedRbacRoleId,
+      });
+
+      for (const invite of invites) {
+        try {
+          await scheduleEmail({
+            email: "invite",
+            to: invite.email,
+            orgName: invite.organization.title,
+            inviterName: invite.inviter.name ?? undefined,
+            inviterEmail: invite.inviter.email,
+            inviteLink: `${env.LOGIN_ORIGIN}${acceptInvitePath(invite.token)}`,
+          });
+        } catch (error) {
+          console.error("Failed to send invite email");
+          console.error(error);
+        }
+      }
+
+      const teamPath = organizationTeamPath({ slug: organizationSlug });
+      const skipped = describeSkippedInvites(alreadyMembers, alreadyInvited);
+
+      if (invites.length === 0) {
+        return redirectWithErrorMessage(teamPath, request, `No invitations sent: ${skipped}.`);
+      }
+
+      return redirectWithSuccessMessage(
+        teamPath,
+        request,
+        skipped
+          ? simplur`${invites.length} member[|s] invited. Skipped ${skipped}.`
+          : simplur`${invites.length} member[|s] invited`
+      );
+    } catch (error: any) {
+      return json({ errors: { body: error.message } }, { status: 400 });
+    }
   }
-};
+);
 
 export default function Page() {
-  const { limits, canPurchaseSeats, seatPricing, extraSeats, maxSeatQuota, planSeatLimit } =
-    useTypedLoaderData<typeof loader>();
+  const {
+    limits,
+    canPurchaseSeats,
+    seatPricing,
+    extraSeats,
+    maxSeatQuota,
+    planSeatLimit,
+    roles,
+    offerableRoleIds,
+    canManageBilling,
+  } = useTypedLoaderData<typeof loader>();
   const [total, setTotal] = useState(limits.used);
   const organization = useOrganization();
   const lastSubmission = useActionData();
 
-  const [form, { emails }] = useForm({
+  // The loader filtered the catalogue to roles this inviter can
+  // actually assign (plan tier × strict-below-my-level). With no plugin
+  // installed, offerableRoleIds is [] and the picker hides entirely.
+  const offerableSet = new Set(offerableRoleIds);
+  const offerable = roles.filter((r) => offerableSet.has(r.id));
+  const showRolePicker = offerable.length > 0;
+
+  // Default to the lowest-tier offered role (the loader returns roles
+  // in its allRoles order, which the plugin emits Owner→Member; the
+  // last entry is the most restrictive).
+  const defaultRoleId = showRolePicker ? offerable[offerable.length - 1].id : NO_RBAC_ROLE;
+  const [selectedRoleId, setSelectedRoleId] = useState(defaultRoleId);
+
+  const [form, fields] = useForm<z.infer<typeof schema>>({
     id: "invite-members",
     // TODO: type this
-    lastSubmission: lastSubmission as any,
+    lastResult: lastSubmission as any,
     onValidate({ formData }) {
-      return parse(formData, { schema });
+      return parseWithZod(formData, { schema });
     },
     defaultValue: {
       emails: [""],
     },
   });
+  const { emails } = fields;
 
   const fieldValues = useRef<string[]>([""]);
-  const emailFields = useFieldList(form.ref, emails);
+  const emailFields = emails.getFieldList();
 
   return (
-    <MainCenteredContainer className="max-w-[26rem] rounded-lg border border-grid-bright bg-background-dimmed p-5 shadow-lg">
+    <MainCenteredContainer className="max-w-104 rounded-lg border border-grid-bright bg-background-dimmed p-5 shadow-lg">
       <div>
         <FormTitle
           LeadingIcon={<UserPlusIcon className="size-6 text-indigo-500" />}
@@ -171,6 +329,7 @@ export default function Page() {
                   usedSeats={limits.used}
                   maxQuota={maxSeatQuota}
                   planSeatLimit={planSeatLimit}
+                  canManageBilling={canManageBilling}
                   triggerButton={<Button variant="primary/small">Purchase more seats…</Button>}
                 />
               }
@@ -205,14 +364,14 @@ export default function Page() {
               </Paragraph>
             </InfoPanel>
           ))}
-        <Form method="post" {...form.props}>
+        <Form method="post" {...getFormProps(form)}>
           <Fieldset>
             <InputGroup>
               <Label htmlFor={emails.id}>Email addresses</Label>
               {emailFields.map((email, index) => (
                 <Fragment key={email.key}>
                   <Input
-                    {...conform.input(email, { type: "email" })}
+                    {...getInputProps(email, { type: "email" })}
                     placeholder={index === 0 ? "Enter an email address" : "Add another email"}
                     icon={EnvelopeIcon}
                     autoFocus={index === 0}
@@ -224,14 +383,41 @@ export default function Page() {
                         emailFields.length === fieldValues.current.length &&
                         fieldValues.current.every((v) => v !== "")
                       ) {
-                        requestIntent(form.ref.current ?? undefined, list.append(emails.name));
+                        form.insert({ name: emails.name });
                       }
                     }}
                   />
-                  <FormError id={email.errorId}>{email.error}</FormError>
+                  <FormError id={email.errorId}>{email.errors}</FormError>
                 </Fragment>
               ))}
             </InputGroup>
+            {showRolePicker ? (
+              <InputGroup>
+                <Label htmlFor="rbacRoleId">Role</Label>
+                <input type="hidden" name="rbacRoleId" value={selectedRoleId} />
+                <Select<string, (typeof offerable)[number]>
+                  defaultValue={defaultRoleId}
+                  items={offerable}
+                  variant="tertiary/medium"
+                  dropdownIcon
+                  text={(v) => offerable.find((r) => r.id === v)?.name ?? "Pick a role"}
+                  setValue={(next) => {
+                    if (typeof next === "string") setSelectedRoleId(next);
+                  }}
+                >
+                  {(items) =>
+                    items.map((role) => (
+                      <SelectItem key={role.id} value={role.id}>
+                        {role.name}
+                      </SelectItem>
+                    ))
+                  }
+                </Select>
+                <Paragraph variant="extra-small" className="text-text-dimmed">
+                  Invitees join with this role. They can be promoted later from the Team page.
+                </Paragraph>
+              </InputGroup>
+            ) : null}
             <FormButtons
               confirmButton={
                 <Button type="submit" variant={"primary/small"} disabled={total > limits.limit}>

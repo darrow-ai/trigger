@@ -1,9 +1,12 @@
-import { ActionFunctionArgs, json, LoaderFunctionArgs } from "@remix-run/server-runtime";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/server-runtime";
+import { json } from "@remix-run/server-runtime";
 import { z } from "zod";
 import { prisma } from "~/db.server";
-import { authenticateApiRequestWithPersonalAccessToken } from "~/services/personalAccessToken.server";
+import { requireAdminApiRequest } from "~/services/personalAccessToken.server";
+import { controlPlaneResolver } from "~/v3/runOpsMigration/controlPlaneResolver.server";
 import { engine } from "~/v3/runEngine.server";
 import { updateEnvConcurrencyLimits } from "~/v3/runQueue.server";
+import { concurrencySystem } from "~/v3/services/concurrencySystemInstance.server";
 
 const ParamsSchema = z.object({
   environmentId: z.string(),
@@ -15,26 +18,7 @@ const RequestBodySchema = z.object({
 });
 
 export async function action({ request, params }: ActionFunctionArgs) {
-  // Next authenticate the request
-  const authenticationResult = await authenticateApiRequestWithPersonalAccessToken(request);
-
-  if (!authenticationResult) {
-    return json({ error: "Invalid or Missing API key" }, { status: 401 });
-  }
-
-  const user = await prisma.user.findUnique({
-    where: {
-      id: authenticationResult.userId,
-    },
-  });
-
-  if (!user) {
-    return json({ error: "Invalid or Missing API key" }, { status: 401 });
-  }
-
-  if (!user.admin) {
-    return json({ error: "You must be an admin to perform this action" }, { status: 403 });
-  }
+  await requireAdminApiRequest(request);
 
   const parsedParams = ParamsSchema.parse(params);
 
@@ -63,6 +47,13 @@ export async function action({ request, params }: ActionFunctionArgs) {
 
   await updateEnvConcurrencyLimits(environment);
 
+  // Percent-based queue overrides follow the environment limit automatically.
+  await concurrencySystem.queues.recalculatePercentLimits(environment);
+
+  // Org max-concurrency changed too, which is embedded in every env of the org; invalidating
+  // the org drops the env/authEnv rows for all of them (including this env).
+  controlPlaneResolver.invalidateOrganization(environment.organizationId);
+
   return json({ success: true });
 }
 
@@ -71,26 +62,7 @@ const SearchParamsSchema = z.object({
 });
 
 export async function loader({ request, params }: LoaderFunctionArgs) {
-  // Next authenticate the request
-  const authenticationResult = await authenticateApiRequestWithPersonalAccessToken(request);
-
-  if (!authenticationResult) {
-    return json({ error: "Invalid or Missing API key" }, { status: 401 });
-  }
-
-  const user = await prisma.user.findUnique({
-    where: {
-      id: authenticationResult.userId,
-    },
-  });
-
-  if (!user) {
-    return json({ error: "Invalid or Missing API key" }, { status: 401 });
-  }
-
-  if (!user.admin) {
-    return json({ error: "You must be an admin to get this endpoint" }, { status: 403 });
-  }
+  await requireAdminApiRequest(request);
 
   const parsedParams = ParamsSchema.parse(params);
 

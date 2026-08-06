@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { ConfigManifest } from "./config.js";
-import { PromptManifest, QueueManifest, TaskFile, TaskManifest } from "./schemas.js";
+import { PromptManifest, QueueManifest, SkillManifest, TaskFile, TaskManifest } from "./schemas.js";
 
 export const BuildExternal = z.object({
   name: z.string(),
@@ -13,7 +13,20 @@ export const BuildTarget = z.enum(["dev", "deploy", "unmanaged"]);
 
 export type BuildTarget = z.infer<typeof BuildTarget>;
 
-export const BuildRuntime = z.enum(["node", "node-22", "bun"]);
+export const ConfigRuntime = z.enum([
+  "node",
+  "node-22",
+  "node-24",
+  "node-26",
+  // Deprecated aliases, kept for backwards compatibility. Use "node-24"/"node-26" instead.
+  "experimental-node-24",
+  "experimental-node-26",
+  "bun",
+]);
+
+export type ConfigRuntime = z.infer<typeof ConfigRuntime>;
+
+export const BuildRuntime = z.enum(["node", "node-22", "node-24", "node-26", "bun"]);
 
 export type BuildRuntime = z.infer<typeof BuildRuntime>;
 
@@ -53,6 +66,8 @@ export const BuildManifest = z.object({
       .object({
         env: z.record(z.string()).optional(),
         parentEnv: z.record(z.string()).optional(),
+        secretEnv: z.record(z.string()).optional(),
+        secretParentEnv: z.record(z.string()).optional(),
       })
       .optional(),
   }),
@@ -70,6 +85,8 @@ export const BuildManifest = z.object({
     .optional(),
   /** Maps output file paths to their content hashes for deduplication during dev */
   outputHashes: z.record(z.string()).optional(),
+  /** Skills discovered and bundled into `.trigger/skills/{id}/` under `outputPath`. */
+  skills: SkillManifest.array().optional(),
 });
 
 export type BuildManifest = z.infer<typeof BuildManifest>;
@@ -87,6 +104,7 @@ export const WorkerManifest = z.object({
   configPath: z.string(),
   tasks: TaskManifest.array(),
   prompts: PromptManifest.array().optional(),
+  skills: SkillManifest.array().optional(),
   queues: QueueManifest.array().optional(),
   workerEntryPoint: z.string(),
   controllerEntryPoint: z.string().optional(),

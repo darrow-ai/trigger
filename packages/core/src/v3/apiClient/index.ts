@@ -1,111 +1,131 @@
+import { nanoid } from "nanoid";
 import { z } from "zod";
 import { VERSION } from "../../version.js";
+import { isAdditionalApiKey } from "../apiKeys.js";
+import type { ApiClientConfiguration } from "../apiClientManager-api.js";
 import { generateJWT } from "../jwt.js";
 import {
-  AddTagsRequestBody,
-  ApiDeploymentListOptions,
+  type AddTagsRequestBody,
+  type ApiDeploymentListOptions,
+  type BatchItemNDJSON,
+  type BatchTriggerTaskV3RequestBody,
+  type CloseSessionRequestBody,
+  type CompleteWaitpointTokenRequestBody,
+  type CreateBatchRequestBody,
+  type CreateEnvironmentVariableRequestBody,
+  type CreateInputStreamWaitpointRequestBody,
+  type CreatePromptOverrideRequestBody,
+  type CreateScheduleOptions,
+  type CreateSessionRequestBody,
+  type CreateSessionStreamWaitpointRequestBody,
+  type CreateWaitpointTokenRequestBody,
+  type EndAndContinueSessionRequestBody,
+  type ListQueueOptions,
+  type ListScheduleOptions,
+  type ListSessionsOptions,
+  type PromotePromptVersionRequestBody,
+  type QueueTypeName,
+  type ReactivatePromptOverrideRequestBody,
+  type RescheduleRunRequestBody,
+  type ResolvePromptRequestBody,
+  type RetrieveQueueParam,
+  type RetryOptions,
+  type TriggerTaskRequestBody,
+  type UpdateEnvironmentVariableRequestBody,
+  type UpdateMetadataRequestBody,
+  type UpdatePromptOverrideRequestBody,
+  type UpdateScheduleOptions,
+  type UpdateSessionRequestBody,
+  type WaitForDurationRequestBody,
+  AbortBulkActionResponseBody,
   ApiDeploymentListResponseItem,
-  ApiDeploymentListSearchParams,
+  BulkActionObject,
+  CreateBulkActionResponseBody,
   AppendToStreamResponseBody,
-  BatchItemNDJSON,
   BatchTaskRunExecutionResult,
-  BatchTriggerTaskV3RequestBody,
   BatchTriggerTaskV3Response,
   CanceledRunResponse,
-  CompleteWaitpointTokenRequestBody,
   CompleteWaitpointTokenResponseBody,
-  CreateBatchRequestBody,
   CreateBatchResponse,
-  CreateEnvironmentVariableRequestBody,
-  CreateInputStreamWaitpointRequestBody,
   CreateInputStreamWaitpointResponseBody,
-  CreateScheduleOptions,
+  CreateSessionStreamWaitpointResponseBody,
   CreateStreamResponseBody,
   CreateUploadPayloadUrlResponseBody,
-  CreateWaitpointTokenRequestBody,
   CreateWaitpointTokenResponseBody,
+  CreatedSessionResponseBody,
   DeletedScheduleObject,
+  EndAndContinueSessionResponseBody,
   EnvironmentVariableResponseBody,
   EnvironmentVariableWithSecret,
-  ListQueueOptions,
-  ListRunResponseItem,
-  ListScheduleOptions,
-  QueueItem,
-  QueueTypeName,
-  QueryExecuteRequestBody,
-  QueryExecuteResponseBody,
-  QueryExecuteCSVResponseBody,
-  QuerySchemaResponseBody,
   ListDashboardsResponseBody,
-  ReplayRunResponse,
-  RescheduleRunRequestBody,
-  ResetIdempotencyKeyResponse,
-  RetrieveBatchV2Response,
-  RetrieveQueueParam,
-  ResolvePromptRequestBody,
-  ResolvePromptResponseBody,
-  ListPromptsResponseBody,
   ListPromptVersionsResponseBody,
-  PromotePromptVersionRequestBody,
-  CreatePromptOverrideRequestBody,
-  UpdatePromptOverrideRequestBody,
-  ReactivatePromptOverrideRequestBody,
+  ListPromptsResponseBody,
+  ListRunResponseItem,
+  ListedSessionItem,
   PromptOkResponseBody,
   PromptOverrideCreatedResponseBody,
+  QueryExecuteResponseBody,
+  QuerySchemaResponseBody,
+  QueueItem,
+  ReadSessionStreamRecordsResponseBody,
+  ReplayRunResponse,
+  ResetIdempotencyKeyResponse,
+  ResolvePromptResponseBody,
+  RetrieveBatchV2Response,
+  RetrieveCurrentDeploymentResponseBody,
   RetrieveRunResponse,
   RetrieveRunTraceResponseBody,
+  RetrieveSessionResponseBody,
   RetrieveSpanDetailResponseBody,
   ScheduleObject,
   SendInputStreamResponseBody,
   StreamBatchItemsResponse,
   TaskRunExecutionResult,
-  TriggerTaskRequestBody,
   TriggerTaskResponse,
-  UpdateEnvironmentVariableRequestBody,
-  UpdateMetadataRequestBody,
   UpdateMetadataResponseBody,
-  UpdateScheduleOptions,
-  WaitForDurationRequestBody,
   WaitForDurationResponseBody,
   WaitForWaitpointTokenResponseBody,
   WaitpointRetrieveTokenResponse,
   WaitpointTokenItem,
 } from "../schemas/index.js";
-import { AsyncIterableStream } from "../streams/asyncIterableStream.js";
+import { controlSubtype, type ControlEvent } from "../sessionStreams/wireProtocol.js";
+import type { AsyncIterableStream } from "../streams/asyncIterableStream.js";
 import { taskContext } from "../task-context-api.js";
-import { AnyRunTypes, TriggerJwtOptions } from "../types/tasks.js";
-import { Prettify } from "../types/utils.js";
+import type { AnyRunTypes, TriggerJwtOptions } from "../types/tasks.js";
+import type { Prettify } from "../types/utils.js";
+import { getEnvVar } from "../utils/getEnv.js";
+import { calculateNextRetryDelay } from "../utils/retries.js";
 import {
-  AnyZodFetchOptions,
-  ApiPromise,
-  ApiRequestOptions,
-  CursorPagePromise,
-  ZodFetchOptions,
+  type AnyZodFetchOptions,
+  type ApiPromise,
+  type ApiRequestOptions,
+  type CursorPagePromise,
+  type ZodFetchOptions,
   isRequestOptions,
   zodfetch,
   zodfetchCursorPage,
   zodfetchOffsetLimitPage,
 } from "./core.js";
 import { ApiConnectionError, ApiError, BatchNotSealedError } from "./errors.js";
-import { calculateNextRetryDelay } from "../utils/retries.js";
-import { RetryOptions } from "../schemas/index.js";
 import {
-  AnyRealtimeRun,
-  AnyRunShape,
-  RealtimeRun,
-  RunShape,
-  RunStreamCallback,
-  RunSubscription,
-  SSEStreamSubscriptionFactory,
+  type AnyRealtimeRun,
+  type AnyRunShape,
+  type RealtimeRun,
+  type RealtimeRunSkipColumns,
+  type RunShape,
+  type RunStreamCallback,
+  type RunSubscription,
+  type TaskRunShape,
   SSEStreamSubscription,
-  TaskRunShape,
+  SSEStreamSubscriptionFactory,
   runShapeStream,
-  RealtimeRunSkipColumns,
   type SSEStreamPart,
 } from "./runStream.js";
-import {
+import type {
+  CreateBulkActionOptions,
   CreateEnvironmentVariableParams,
   ImportEnvironmentVariablesParams,
+  ListBulkActionsQueryParams,
   ListProjectRunsQueryParams,
   ListRunsQueryParams,
   ListWaitpointTokensQueryParams,
@@ -113,8 +133,6 @@ import {
   UpdateEnvironmentVariableParams,
 } from "./types.js";
 import { API_VERSION, API_VERSION_HEADER_NAME } from "./version.js";
-import { ApiClientConfiguration } from "../apiClientManager-api.js";
-import { getEnvVar } from "../utils/getEnv.js";
 
 export type CreateWaitpointTokenResponse = Prettify<
   CreateWaitpointTokenResponseBody & {
@@ -129,11 +147,13 @@ export type CreateBatchApiResponse = Prettify<
 >;
 
 export type {
+  CreateBulkActionOptions,
   CreateEnvironmentVariableParams,
   ImportEnvironmentVariablesParams,
+  RealtimeRunSkipColumns,
+  ListBulkActionsQueryParams,
   SubscribeToRunsQueryParams,
   UpdateEnvironmentVariableParams,
-  RealtimeRunSkipColumns,
 };
 
 export type ClientTriggerOptions = {
@@ -167,7 +187,7 @@ export type ApiClientFutureFlags = {
   v2RealtimeStreams?: boolean;
 };
 
-export { isRequestOptions, SSEStreamSubscription };
+export { SSEStreamSubscription, isRequestOptions };
 export type {
   AnyRealtimeRun,
   AnyRunShape,
@@ -176,11 +196,20 @@ export type {
   RunShape,
   RunStreamCallback,
   RunSubscription,
-  TaskRunShape,
   SSEStreamPart,
+  TaskRunShape,
 };
 
 export * from "./getBranch.js";
+
+export type CreatePublicTokenRequestBody = {
+  scopes: string[];
+  expirationTime?: string | number;
+  oneTimeUse?: boolean;
+  realtime?: { skipColumns?: string[] };
+};
+
+const CreatePublicTokenResponseBody = z.object({ token: z.string() });
 
 /**
  * Trigger.dev v3 API client
@@ -196,6 +225,8 @@ export class ApiClient {
   constructor(
     baseUrl: string,
     accessToken: string,
+    // Carries the branch for any branchable env (preview or dev) — both ride the
+    // x-trigger-branch header, and the server disambiguates by the token's env.
     previewBranch?: string,
     requestOptions: ApiRequestOptions = {},
     futureFlags: ApiClientFutureFlags = {}
@@ -207,6 +238,21 @@ export class ApiClient {
     this.additionalHeaders = additionalHeaders;
     this.defaultRequestOptions = mergeRequestOptions(DEFAULT_ZOD_FETCH_OPTIONS, restRequestOptions);
     this.futureFlags = futureFlags;
+  }
+
+  /**
+   * Key for signing a public access token locally. Only root keys can do this —
+   * an additional key isn't the environment's signing material, so a token
+   * signed with one would never verify. Throw rather than return a dead token.
+   */
+  get #selfSigningKey(): string {
+    if (isAdditionalApiKey(this.accessToken)) {
+      throw new Error(
+        "This additional API key cannot self-sign public tokens, and the server did not return one. Upgrade the server or use the root API key."
+      );
+    }
+
+    return this.accessToken;
   }
 
   get fetchClient(): typeof fetch {
@@ -304,7 +350,7 @@ export class ApiClient {
         const claims = claimsHeader ? JSON.parse(claimsHeader) : undefined;
 
         const jwt = await generateJWT({
-          secretKey: this.accessToken,
+          secretKey: this.#selfSigningKey,
           payload: {
             ...claims,
             scopes: [`read:runs:${data.id}`],
@@ -338,11 +384,20 @@ export class ApiClient {
     )
       .withResponse()
       .then(async ({ data, response }) => {
+        const jwtHeader = response.headers.get("x-trigger-jwt");
+
+        if (typeof jwtHeader === "string") {
+          return {
+            ...data,
+            publicAccessToken: jwtHeader,
+          };
+        }
+
         const claimsHeader = response.headers.get("x-trigger-jwt-claims");
         const claims = claimsHeader ? JSON.parse(claimsHeader) : undefined;
 
         const jwt = await generateJWT({
-          secretKey: this.accessToken,
+          secretKey: this.#selfSigningKey,
           payload: {
             ...claims,
             scopes: [`read:batch:${data.id}`],
@@ -386,11 +441,20 @@ export class ApiClient {
     )
       .withResponse()
       .then(async ({ data, response }) => {
+        const jwtHeader = response.headers.get("x-trigger-jwt");
+
+        if (typeof jwtHeader === "string") {
+          return {
+            ...data,
+            publicAccessToken: jwtHeader,
+          };
+        }
+
         const claimsHeader = response.headers.get("x-trigger-jwt-claims");
         const claims = claimsHeader ? JSON.parse(claimsHeader) : undefined;
 
         const jwt = await generateJWT({
-          secretKey: this.accessToken,
+          secretKey: this.#selfSigningKey,
           payload: {
             ...claims,
             scopes: [`read:batch:${data.id}`],
@@ -476,9 +540,9 @@ export class ApiClient {
         await safeStreamCancel(forRetry);
 
         const errText = await response.text().catch((e) => (e as Error).message);
-        let errJSON: Object | undefined;
+        let errJSON: object | undefined;
         try {
-          errJSON = JSON.parse(errText) as Object;
+          errJSON = JSON.parse(errText) as object;
         } catch {
           // ignore
         }
@@ -576,6 +640,32 @@ export class ApiClient {
     return zodfetch(
       CreateUploadPayloadUrlResponseBody,
       `${this.baseUrl}/api/v1/packets/${encoded}`,
+      {
+        method: "GET",
+        headers: this.#getHeaders(false),
+      },
+      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+    );
+  }
+
+  /** Presigned PUT URL for a `chat.agent` session snapshot. */
+  createChatSnapshotUploadUrl(sessionId: string, requestOptions?: ZodFetchOptions) {
+    return zodfetch(
+      CreateUploadPayloadUrlResponseBody,
+      `${this.baseUrl}/api/v1/sessions/${encodeURIComponent(sessionId)}/snapshot-url`,
+      {
+        method: "PUT",
+        headers: this.#getHeaders(false),
+      },
+      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+    );
+  }
+
+  /** Presigned GET URL for a `chat.agent` session snapshot. */
+  getChatSnapshotUrl(sessionId: string, requestOptions?: ZodFetchOptions) {
+    return zodfetch(
+      CreateUploadPayloadUrlResponseBody,
+      `${this.baseUrl}/api/v1/sessions/${encodeURIComponent(sessionId)}/snapshot-url`,
       {
         method: "GET",
         headers: this.#getHeaders(false),
@@ -690,6 +780,64 @@ export class ApiClient {
     return zodfetch(
       CanceledRunResponse,
       `${this.baseUrl}/api/v2/runs/${runId}/cancel`,
+      {
+        method: "POST",
+        headers: this.#getHeaders(false),
+      },
+      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+    );
+  }
+
+  createBulkAction(options: CreateBulkActionOptions, requestOptions?: ZodFetchOptions) {
+    return zodfetch(
+      CreateBulkActionResponseBody,
+      `${this.baseUrl}/api/v1/bulk-actions`,
+      {
+        method: "POST",
+        headers: this.#getHeaders(false),
+        body: JSON.stringify(options),
+      },
+      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+    );
+  }
+
+  listBulkActions(
+    query?: ListBulkActionsQueryParams,
+    requestOptions?: ZodFetchOptions
+  ): CursorPagePromise<typeof BulkActionObject> {
+    return zodfetchCursorPage(
+      BulkActionObject,
+      `${this.baseUrl}/api/v1/bulk-actions`,
+      {
+        query: new URLSearchParams(),
+        limit: query?.limit,
+        after: query?.after,
+        before: query?.before,
+      },
+      {
+        method: "GET",
+        headers: this.#getHeaders(false),
+      },
+      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+    );
+  }
+
+  retrieveBulkAction(bulkActionId: string, requestOptions?: ZodFetchOptions) {
+    return zodfetch(
+      BulkActionObject,
+      `${this.baseUrl}/api/v1/bulk-actions/${bulkActionId}`,
+      {
+        method: "GET",
+        headers: this.#getHeaders(false),
+      },
+      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+    );
+  }
+
+  abortBulkAction(bulkActionId: string, requestOptions?: ZodFetchOptions) {
+    return zodfetch(
+      AbortBulkActionResponseBody,
+      `${this.baseUrl}/api/v1/bulk-actions/${bulkActionId}/abort`,
       {
         method: "POST",
         headers: this.#getHeaders(false),
@@ -1002,7 +1150,7 @@ export class ApiClient {
           const claims = claimsHeader ? JSON.parse(claimsHeader) : undefined;
 
           const jwt = await generateJWT({
-            secretKey: this.accessToken,
+            secretKey: this.#selfSigningKey,
             payload: {
               ...claims,
               scopes: [`write:waitpoints:${data.id}`],
@@ -1091,6 +1239,271 @@ export class ApiClient {
         headers: this.#getHeaders(false),
       },
       mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+    );
+  }
+
+  // ========================================================================
+  // Sessions
+  // ========================================================================
+
+  createSession(body: CreateSessionRequestBody, requestOptions?: ZodFetchOptions) {
+    return zodfetch(
+      CreatedSessionResponseBody,
+      `${this.baseUrl}/api/v1/sessions`,
+      {
+        method: "POST",
+        headers: this.#getHeaders(false),
+        body: JSON.stringify(body),
+      },
+      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+    );
+  }
+
+  retrieveSession(sessionIdOrExternalId: string, requestOptions?: ZodFetchOptions) {
+    return zodfetch(
+      RetrieveSessionResponseBody,
+      `${this.baseUrl}/api/v1/sessions/${encodeURIComponent(sessionIdOrExternalId)}`,
+      {
+        method: "GET",
+        headers: this.#getHeaders(false),
+      },
+      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+    );
+  }
+
+  updateSession(
+    sessionIdOrExternalId: string,
+    body: UpdateSessionRequestBody,
+    requestOptions?: ZodFetchOptions
+  ) {
+    return zodfetch(
+      RetrieveSessionResponseBody,
+      `${this.baseUrl}/api/v1/sessions/${encodeURIComponent(sessionIdOrExternalId)}`,
+      {
+        method: "PATCH",
+        headers: this.#getHeaders(false),
+        body: JSON.stringify(body),
+      },
+      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+    );
+  }
+
+  closeSession(
+    sessionIdOrExternalId: string,
+    body?: CloseSessionRequestBody,
+    requestOptions?: ZodFetchOptions
+  ) {
+    return zodfetch(
+      RetrieveSessionResponseBody,
+      `${this.baseUrl}/api/v1/sessions/${encodeURIComponent(sessionIdOrExternalId)}/close`,
+      {
+        method: "POST",
+        headers: this.#getHeaders(false),
+        body: JSON.stringify(body ?? {}),
+      },
+      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+    );
+  }
+
+  endAndContinueSession(
+    sessionIdOrExternalId: string,
+    body: EndAndContinueSessionRequestBody,
+    requestOptions?: ZodFetchOptions
+  ) {
+    return zodfetch(
+      EndAndContinueSessionResponseBody,
+      `${this.baseUrl}/api/v1/sessions/${encodeURIComponent(sessionIdOrExternalId)}/end-and-continue`,
+      {
+        method: "POST",
+        headers: this.#getHeaders(false),
+        body: JSON.stringify(body),
+      },
+      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+    );
+  }
+
+  listSessions(
+    options?: ListSessionsOptions,
+    requestOptions?: ZodFetchOptions
+  ): CursorPagePromise<typeof ListedSessionItem> {
+    const searchParams = createSearchQueryForListSessions(options);
+
+    return zodfetchCursorPage(
+      ListedSessionItem,
+      `${this.baseUrl}/api/v1/sessions`,
+      {
+        query: searchParams,
+        limit: options?.limit,
+        after: options?.after,
+        before: options?.before,
+      },
+      {
+        method: "GET",
+        headers: this.#getHeaders(false),
+      },
+      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+    );
+  }
+
+  // ========================================================================
+  // Session realtime channels
+  // ========================================================================
+
+  async initializeSessionStream(
+    sessionIdOrExternalId: string,
+    io: "out" | "in",
+    requestOptions?: ZodFetchOptions
+  ) {
+    // The server returns S2 credentials in response headers alongside a tiny
+    // JSON body with the realtime version. Follow the same shape as
+    // `createStream` so downstream clients can feed them into
+    // `StreamsWriterV2`.
+    return zodfetch(
+      CreateStreamResponseBody,
+      `${this.baseUrl}/realtime/v1/sessions/${encodeURIComponent(sessionIdOrExternalId)}/${io}`,
+      {
+        method: "PUT",
+        headers: this.#getHeaders(false),
+      },
+      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+    )
+      .withResponse()
+      .then(({ data, response }) => ({
+        ...data,
+        headers: Object.fromEntries(response.headers.entries()),
+      }));
+  }
+
+  async appendToSessionStream<TBody extends BodyInit>(
+    sessionIdOrExternalId: string,
+    io: "out" | "in",
+    part: TBody,
+    requestOptions?: ZodFetchOptions
+  ) {
+    // Generated once per logical append, outside zodfetch, so its internal
+    // retries reuse the same part id and the server-side dedupe collapses a
+    // retried POST whose first attempt actually committed. Full-length nanoid
+    // (~126 bits) to match the browser transport's randomUUID entropy.
+    const partId = nanoid();
+    return zodfetch(
+      AppendToStreamResponseBody,
+      `${this.baseUrl}/realtime/v1/sessions/${encodeURIComponent(sessionIdOrExternalId)}/${io}/append`,
+      {
+        method: "POST",
+        headers: { ...this.#getHeaders(false), "X-Part-Id": partId },
+        body: part,
+      },
+      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+    );
+  }
+
+  /**
+   * Non-SSE drain of a Session channel's tail. Returns whatever records
+   * exist after `afterEventId` (or from the head of the stream) and closes
+   * — `wait=0` semantics, no long-poll. Used by `replaySessionOutTail` at
+   * run boot, where the SSE long-poll's ~1s tax on empty streams is the
+   * dominant cost on every fresh chat.
+   *
+   * `afterEventId` is the same cursor format as the SSE Last-Event-ID
+   * (the S2 sequence number, stringified) — pass `lastOutEventId` from a
+   * persisted snapshot to resume.
+   */
+  async readSessionStreamRecords(
+    sessionIdOrExternalId: string,
+    io: "out" | "in",
+    options?: { afterEventId?: string; baseUrl?: string }
+  ) {
+    const qs = new URLSearchParams();
+    if (options?.afterEventId !== undefined) {
+      qs.set("afterEventId", options.afterEventId);
+    }
+    const url = `${options?.baseUrl ?? this.baseUrl}/realtime/v1/sessions/${encodeURIComponent(
+      sessionIdOrExternalId
+    )}/${io}/records${qs.toString() ? `?${qs.toString()}` : ""}`;
+    return zodfetch(
+      ReadSessionStreamRecordsResponseBody,
+      url,
+      {
+        method: "GET",
+        headers: this.#getHeaders(false),
+      },
+      mergeRequestOptions(this.defaultRequestOptions, undefined)
+    );
+  }
+
+  /**
+   * Subscribe to SSE records on a Session channel. Reuses the same
+   * {@link SSEStreamSubscription} plumbing as `readStream` for run-scoped
+   * realtime streams — auto-retry, Last-Event-ID resume, abort-on-cancel.
+   */
+  async subscribeToSessionStream<T = unknown>(
+    sessionIdOrExternalId: string,
+    io: "out" | "in",
+    options?: {
+      signal?: AbortSignal;
+      baseUrl?: string;
+      timeoutInSeconds?: number;
+      onComplete?: () => void;
+      onError?: (error: Error) => void;
+      lastEventId?: string;
+      onPart?: (part: SSEStreamPart<T>) => void;
+      /**
+       * Fires when a `trigger-control` record arrives on the stream (e.g.
+       * `turn-complete`, `upgrade-required`). The control record is never
+       * enqueued into the consumer stream — handle the event here.
+       */
+      onControl?: (event: ControlEvent) => void;
+    }
+  ): Promise<AsyncIterableStream<T>> {
+    const url = `${options?.baseUrl ?? this.baseUrl}/realtime/v1/sessions/${encodeURIComponent(sessionIdOrExternalId)}/${io}`;
+
+    const subscription = new SSEStreamSubscription(url, {
+      headers: this.getHeaders(),
+      signal: options?.signal,
+      onComplete: options?.onComplete,
+      onError: options?.onError,
+      timeoutInSeconds: options?.timeoutInSeconds,
+      lastEventId: options?.lastEventId,
+    });
+
+    const stream = await subscription.subscribe();
+    const onPart = options?.onPart;
+    const onControl = options?.onControl;
+
+    return stream.pipeThrough(
+      new TransformStream<SSEStreamPart, T>({
+        transform(part, controller) {
+          // Always surface the raw part via onPart so cursor tracking
+          // (lastSeqNum, lastEventId) stays correct for both data and
+          // control records.
+          onPart?.(part as SSEStreamPart<T>);
+
+          // Trigger control record — route to onControl, never enqueue.
+          const subtype = controlSubtype(part.headers);
+          if (subtype) {
+            // `part.id` is the S2 seq_num in decimal string form.
+            // `parseInt` returns NaN if S2 ever surfaces a non-numeric
+            // id (shouldn't happen, but `|| 0` would mask it as a real
+            // seq 0). Drop the malformed event rather than fire
+            // `onControl` with a misleading cursor — callers like
+            // `findLatestSessionInCursor` and the dashboard rely on the
+            // seqNum being meaningful for resume.
+            const parsedSeqNum = Number.parseInt(part.id, 10);
+            if (!Number.isFinite(parsedSeqNum)) {
+              return;
+            }
+            onControl?.({
+              subtype,
+              headers: part.headers ?? [],
+              seqNum: parsedSeqNum,
+              timestamp: part.timestamp,
+            });
+            return;
+          }
+
+          controller.enqueue(part.chunk as T);
+        },
+      })
     );
   }
 
@@ -1340,6 +1753,18 @@ export class ApiClient {
     );
   }
 
+  retrieveCurrentDeployment(requestOptions?: ZodFetchOptions) {
+    return zodfetch(
+      RetrieveCurrentDeploymentResponseBody,
+      `${this.baseUrl}/api/v1/deployments/current`,
+      {
+        method: "GET",
+        headers: this.#getHeaders(false),
+      },
+      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+    );
+  }
+
   async fetchStream<T>(
     runId: string,
     streamKey: string,
@@ -1459,6 +1884,23 @@ export class ApiClient {
     );
   }
 
+  async createSessionStreamWaitpoint(
+    runFriendlyId: string,
+    body: CreateSessionStreamWaitpointRequestBody,
+    requestOptions?: ZodFetchOptions
+  ) {
+    return zodfetch(
+      CreateSessionStreamWaitpointResponseBody,
+      `${this.baseUrl}/api/v1/runs/${runFriendlyId}/session-streams/wait`,
+      {
+        method: "POST",
+        headers: this.#getHeaders(false),
+        body: JSON.stringify(body),
+      },
+      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+    );
+  }
+
   async generateJWTClaims(requestOptions?: ZodFetchOptions): Promise<Record<string, any>> {
     return zodfetch(
       z.record(z.any()),
@@ -1466,6 +1908,22 @@ export class ApiClient {
       {
         method: "POST",
         headers: this.#getHeaders(false),
+      },
+      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+    );
+  }
+
+  async createPublicToken(
+    body: CreatePublicTokenRequestBody,
+    requestOptions?: ZodFetchOptions
+  ): Promise<{ token: string }> {
+    return zodfetch(
+      CreatePublicTokenResponseBody,
+      `${this.baseUrl}/api/v1/auth/public-tokens`,
+      {
+        method: "POST",
+        headers: this.#getHeaders(false),
+        body: JSON.stringify(body),
       },
       mergeRequestOptions(this.defaultRequestOptions, requestOptions)
     );
@@ -1527,9 +1985,7 @@ export class ApiClient {
     );
   }
 
-  async listDashboards(
-    requestOptions?: ZodFetchOptions
-  ): Promise<ListDashboardsResponseBody> {
+  async listDashboards(requestOptions?: ZodFetchOptions): Promise<ListDashboardsResponseBody> {
     return zodfetch(
       ListDashboardsResponseBody,
       `${this.baseUrl}/api/v1/query/dashboards`,
@@ -1539,6 +1995,39 @@ export class ApiClient {
       },
       mergeRequestOptions(this.defaultRequestOptions, requestOptions)
     );
+  }
+
+  /**
+   * Fetch a server-rendered report (text + sparkline). Thin pass-through — the string
+   * is ready to display. `format`: "markdown" (default, agents/chat) or "ansi" (terminal).
+   */
+  async getReport(
+    key: string,
+    options?: { period?: string; format?: "markdown" | "ansi" }
+  ): Promise<string> {
+    const searchParams = new URLSearchParams({ format: options?.format ?? "markdown" });
+    if (options?.period) {
+      searchParams.set("period", options.period);
+    }
+
+    const response = await fetch(
+      `${this.baseUrl}/api/v1/reports/${encodeURIComponent(key)}?${searchParams.toString()}`,
+      {
+        method: "GET",
+        headers: this.#getHeaders(false),
+      }
+    );
+
+    if (!response.ok) {
+      const bodySnippet = await readBodySnippet(response);
+      throw new Error(
+        `Failed to fetch report "${key}": ${response.status} ${response.statusText}${
+          bodySnippet ? ` — ${bodySnippet}` : ""
+        }`
+      );
+    }
+
+    return response.text();
   }
 
   #getHeaders(spanParentAsLink: boolean, additionalHeaders?: Record<string, string | undefined>) {
@@ -1608,11 +2097,7 @@ export class ApiClient {
     return headers;
   }
 
-  resolvePrompt(
-    slug: string,
-    body: ResolvePromptRequestBody,
-    requestOptions?: ZodFetchOptions
-  ) {
+  resolvePrompt(slug: string, body: ResolvePromptRequestBody, requestOptions?: ZodFetchOptions) {
     return zodfetch(
       ResolvePromptResponseBody,
       `${this.baseUrl}/api/v1/prompts/${slug}`,
@@ -1643,7 +2128,11 @@ export class ApiClient {
     );
   }
 
-  promotePromptVersion(slug: string, body: PromotePromptVersionRequestBody, requestOptions?: ZodFetchOptions) {
+  promotePromptVersion(
+    slug: string,
+    body: PromotePromptVersionRequestBody,
+    requestOptions?: ZodFetchOptions
+  ) {
     return zodfetch(
       PromptOkResponseBody,
       `${this.baseUrl}/api/v1/prompts/${slug}/promote`,
@@ -1652,7 +2141,11 @@ export class ApiClient {
     );
   }
 
-  createPromptOverride(slug: string, body: CreatePromptOverrideRequestBody, requestOptions?: ZodFetchOptions) {
+  createPromptOverride(
+    slug: string,
+    body: CreatePromptOverrideRequestBody,
+    requestOptions?: ZodFetchOptions
+  ) {
     return zodfetch(
       PromptOverrideCreatedResponseBody,
       `${this.baseUrl}/api/v1/prompts/${slug}/override`,
@@ -1661,7 +2154,11 @@ export class ApiClient {
     );
   }
 
-  updatePromptOverride(slug: string, body: UpdatePromptOverrideRequestBody, requestOptions?: ZodFetchOptions) {
+  updatePromptOverride(
+    slug: string,
+    body: UpdatePromptOverrideRequestBody,
+    requestOptions?: ZodFetchOptions
+  ) {
     return zodfetch(
       PromptOkResponseBody,
       `${this.baseUrl}/api/v1/prompts/${slug}/override`,
@@ -1679,7 +2176,11 @@ export class ApiClient {
     );
   }
 
-  reactivatePromptOverride(slug: string, body: ReactivatePromptOverrideRequestBody, requestOptions?: ZodFetchOptions) {
+  reactivatePromptOverride(
+    slug: string,
+    body: ReactivatePromptOverrideRequestBody,
+    requestOptions?: ZodFetchOptions
+  ) {
     return zodfetch(
       PromptOkResponseBody,
       `${this.baseUrl}/api/v1/prompts/${slug}/override/reactivate`,
@@ -1810,6 +2311,13 @@ function createSearchQueryForListRuns(query?: ListRunsQueryParams): URLSearchPar
         Array.isArray(query.machine) ? query.machine.join(",") : query.machine
       );
     }
+
+    if (query.region) {
+      searchParams.append(
+        "filter[region]",
+        Array.isArray(query.region) ? query.region.join(",") : query.region
+      );
+    }
   }
 
   return searchParams;
@@ -1821,6 +2329,47 @@ function queueNameFromQueueTypeName(queue: QueueTypeName): string {
   }
 
   return queue.name;
+}
+
+function createSearchQueryForListSessions(options?: ListSessionsOptions): URLSearchParams {
+  const searchParams = new URLSearchParams();
+
+  if (!options) return searchParams;
+
+  const appendMany = (name: string, value: string | string[] | undefined) => {
+    if (value === undefined) return;
+    searchParams.append(name, Array.isArray(value) ? value.join(",") : value);
+  };
+
+  appendMany("filter[type]", options.type);
+  appendMany("filter[tags]", options.tag);
+  appendMany("filter[taskIdentifier]", options.taskIdentifier);
+
+  if (options.externalId) {
+    searchParams.append("filter[externalId]", options.externalId);
+  }
+
+  appendMany("filter[status]", options.status as string | string[] | undefined);
+
+  if (options.period) {
+    searchParams.append("filter[createdAt][period]", options.period);
+  }
+
+  if (options.from !== undefined) {
+    searchParams.append(
+      "filter[createdAt][from]",
+      options.from instanceof Date ? options.from.getTime().toString() : options.from.toString()
+    );
+  }
+
+  if (options.to !== undefined) {
+    searchParams.append(
+      "filter[createdAt][to]",
+      options.to instanceof Date ? options.to.getTime().toString() : options.to.toString()
+    );
+  }
+
+  return searchParams;
 }
 
 function createSearchQueryForListWaitpointTokens(
@@ -1956,6 +2505,22 @@ function shouldRetryStreamBatchItems(
  */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Best-effort read of a (likely error) response body for inclusion in a thrown Error.
+ * Never throws, and truncates so we don't dump a huge HTML page into an error message.
+ */
+async function readBodySnippet(response: Response, maxLength = 500): Promise<string> {
+  try {
+    const text = (await response.text()).trim();
+    if (!text) {
+      return "";
+    }
+    return text.length > maxLength ? `${text.slice(0, maxLength)}…` : text;
+  } catch {
+    return "";
+  }
 }
 
 /**

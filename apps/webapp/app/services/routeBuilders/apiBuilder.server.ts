@@ -1,38 +1,230 @@
-import { z } from "zod";
-import {
-  ApiAuthenticationResultSuccess,
-  authenticateApiRequestWithFailure,
-} from "../apiAuth.server";
-import { ActionFunctionArgs, json, LoaderFunctionArgs } from "@remix-run/server-runtime";
+import type { z } from "zod";
+import type { ApiAuthenticationResultSuccess } from "../apiAuth.server";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/server-runtime";
+import { json } from "@remix-run/server-runtime";
 import { fromZodError } from "zod-validation-error";
 import { apiCors } from "~/utils/apiCors";
-import {
-  AuthorizationAction,
-  AuthorizationResources,
-  checkAuthorization,
-} from "../authorization.server";
 import { logger } from "../logger.server";
-import {
-  authenticateApiRequestWithPersonalAccessToken,
-  PersonalAccessTokenAuthenticationResult,
-} from "../personalAccessToken.server";
+import { rbac } from "../rbac.server";
+import { authenticateBearerWithTelemetry } from "~/services/authTelemetry.server";
+import type { RbacAbility, RbacResource } from "@trigger.dev/rbac";
+import { isUserActorToken } from "@trigger.dev/rbac";
+import type { PersonalAccessTokenAuthenticationResult } from "../personalAccessToken.server";
+import { updateLastAccessedAtIfStale } from "../personalAccessToken.server";
 import { safeJsonParse } from "~/utils/json";
-import {
-  AuthenticatedWorkerInstance,
-  WorkerGroupTokenService,
-} from "~/v3/services/worker/workerGroupTokenService.server";
-import { API_VERSIONS, getApiVersion } from "~/api/versions";
+import type { AuthenticatedWorkerInstance } from "~/v3/services/worker/workerGroupTokenService.server";
+import { WorkerGroupTokenService } from "~/v3/services/worker/workerGroupTokenService.server";
+import type { API_VERSIONS } from "~/api/versions";
+import { getApiVersion } from "~/api/versions";
 import { WORKER_HEADERS } from "@trigger.dev/core/v3/runEngineWorker";
 import { ServiceValidationError } from "~/v3/services/common.server";
 import { EngineServiceValidationError } from "@internal/run-engine";
+import { tenantContext, tenantContextFromAuthEnvironment } from "~/services/tenantContext.server";
+
+// Client aborts and service-level validation errors aren't bugs — they're
+// expected at API boundaries. Log them at `warn` so they stay in stdout
+// without flowing to Sentry via Logger.onError.
+function logBoundaryError(
+  message: "Error in loader" | "Error in action",
+  error: unknown,
+  url: string
+) {
+  const formatted =
+    error instanceof Error
+      ? { name: error.name, message: error.message, stack: error.stack }
+      : String(error);
+  const isExpected =
+    error instanceof Error &&
+    (error.name === "AbortError" ||
+      error instanceof ServiceValidationError ||
+      error instanceof EngineServiceValidationError);
+  if (isExpected) {
+    logger.warn(message, { error: formatted, url });
+  } else {
+    logger.error(message, { error: formatted, url });
+  }
+}
+
+// Bridges the RBAC plugin (source of truth for auth + abilities) to the legacy
+// ApiAuthenticationResultSuccess shape route handlers still expect. All three
+// apiBuilder call sites funnel through this helper — no handler-level changes
+// needed.
+async function authenticateRequestForApiBuilder(
+  request: Request,
+  { allowJWT }: { allowJWT: boolean }
+): Promise<
+  | { ok: false; status: 401 | 403; error: string }
+  | {
+      ok: true;
+      authentication: ApiAuthenticationResultSuccess;
+      ability: RbacAbility;
+      restrictedApiKey: boolean;
+    }
+> {
+  const result = await authenticateBearerWithTelemetry(request, { allowJWT });
+  if (!result.ok) {
+    // Plugin auth distinguishes 401 (who are you?) from 403 (you're not
+    // allowed) — e.g. a suspended account or IP block returns 403.
+    // Forwarding the status preserves that semantic for client retry logic.
+    return { ok: false, status: result.status, error: result.error };
+  }
+
+  // Plugins return the full AuthenticatedEnvironment shape directly — no
+  // follow-up DB lookup. The fallback fetches via Prisma, the cloud plugin
+  // via Drizzle; both produce the same slim contract type.
+  const authentication: ApiAuthenticationResultSuccess = {
+    ok: true,
+    apiKey: result.environment.apiKey,
+    type: result.subject.type === "publicJWT" ? "PUBLIC_JWT" : "PRIVATE",
+    environment: result.environment,
+    realtime: result.jwt?.realtime,
+    oneTimeUse: result.jwt?.oneTimeUse,
+    // Surface the delegation actor (PAT/UAT-exchanged JWT) so handlers can
+    // attribute writes to the acting user.
+    actor: result.jwt?.act,
+  };
+
+  return {
+    ok: true,
+    authentication,
+    ability: result.ability,
+    restrictedApiKey: result.subject.type === "apiKey" && result.subject.restricted,
+  };
+}
+
+export function shouldRejectRestrictedKeyWithoutAuthorization(
+  restrictedApiKey: boolean,
+  hasAuthorization: boolean
+): boolean {
+  return restrictedApiKey && !hasAuthorization;
+}
+
+async function rejectRestrictedKeyWithoutAuthorization({
+  request,
+  restrictedApiKey,
+  hasAuthorization,
+  useCors,
+}: {
+  request: Request;
+  restrictedApiKey: boolean;
+  hasAuthorization: boolean;
+  useCors: boolean;
+}): Promise<Response | undefined> {
+  if (!shouldRejectRestrictedKeyWithoutAuthorization(restrictedApiKey, hasAuthorization)) return;
+
+  return wrapResponse(
+    request,
+    json(
+      {
+        error: "Unauthorized",
+        code: "unauthorized",
+        param: "access_token",
+        type: "authorization",
+      },
+      { status: 403 }
+    ),
+    useCors
+  );
+}
 
 type AnyZodSchema = z.ZodFirstPartySchemaTypes | z.ZodDiscriminatedUnion<any, any>;
+
+// A multi-resource auth check has two possible directions, and route authors
+// have to pick one explicitly:
+//
+//  - `anyResource(...)` — succeed if *any* element passes. Used when a single
+//    record carries multiple identifiers (a run is addressable by friendlyId /
+//    batch / tags / task) so a JWT scoped to *any* of them grants access.
+//
+//  - `everyResource(...)` — succeed only if *every* element passes. Used for
+//    batch operations where each element is a *distinct* resource and a JWT
+//    scoped to one element must not authorize the others.
+//
+// Bare `RbacResource[]` is intentionally *not* part of `AuthResource` — the
+// type system forces every multi-resource site to disambiguate. The original
+// pre-RBAC apiBuilder had a separate `superScopes: [...]` whitelist for
+// "broader-than-this-resource" access; post-RBAC that's expressed via the JWT
+// ability's wildcard branches (`*:all` and `admin*` — see
+// `internal-packages/rbac/src/ability.ts`) plus a collection-level shape
+// `{ type: "<subject>" }` (no id) in the `anyResource` array so a
+// `<action>:<subject>` JWT matches it. No code knob needed.
+//
+// Markers are Symbols so they can't collide with arbitrary RbacResource fields.
+const ANY_RESOURCE_MARKER = Symbol.for("@trigger.dev/rbac.anyResource");
+const EVERY_RESOURCE_MARKER = Symbol.for("@trigger.dev/rbac.everyResource");
+
+type AnyResourceAuth = {
+  readonly [ANY_RESOURCE_MARKER]: true;
+  readonly resources: readonly RbacResource[];
+};
+
+type EveryResourceAuth = {
+  readonly [EVERY_RESOURCE_MARKER]: true;
+  readonly resources: readonly RbacResource[];
+  readonly orResources: readonly RbacResource[];
+};
+
+export function anyResource(resources: RbacResource[]): AnyResourceAuth {
+  return { [ANY_RESOURCE_MARKER]: true, resources };
+}
+
+export function everyResource(
+  resources: RbacResource[],
+  orResources: RbacResource[] = []
+): EveryResourceAuth {
+  return { [EVERY_RESOURCE_MARKER]: true, resources, orResources };
+}
+
+function isAnyResource(value: unknown): value is AnyResourceAuth {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as Record<symbol, unknown>)[ANY_RESOURCE_MARKER] === true
+  );
+}
+
+function isEveryResource(value: unknown): value is EveryResourceAuth {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as Record<symbol, unknown>)[EVERY_RESOURCE_MARKER] === true
+  );
+}
+
+type AuthResource = RbacResource | AnyResourceAuth | EveryResourceAuth;
+
+export function checkAuth(ability: RbacAbility, action: string, resource: AuthResource): boolean {
+  if (isEveryResource(resource)) {
+    // A broad collection grant may be supplied as an alternative to all
+    // instance checks. This preserves scopes such as read:runs while making
+    // mixed selected-task filters require access to every requested task.
+    if (resource.orResources.length > 0 && ability.can(action, [...resource.orResources])) {
+      return true;
+    }
+
+    // Empty array via [].every() is vacuously true — would let any token
+    // pass auth. Routes building everyResource() from request bodies
+    // (e.g. batch trigger items) should never produce zero elements
+    // because body validation rejects empty arrays first, but defending
+    // here anyway since the auth layer should never grant on no input.
+    if (resource.resources.length === 0) return false;
+    return resource.resources.every((r) => ability.can(action, r));
+  }
+  if (isAnyResource(resource)) {
+    // Symmetric guard: anyResource([]) is benign for most abilities
+    // (.some() is false on empty), but the permissive ability would
+    // still grant. Treat empty as "no resource declared" → deny.
+    if (resource.resources.length === 0) return false;
+    return ability.can(action, [...resource.resources]);
+  }
+  return ability.can(action, resource);
+}
 
 type ApiKeyRouteBuilderOptions<
   TParamsSchema extends AnyZodSchema | undefined = undefined,
   TSearchParamsSchema extends AnyZodSchema | undefined = undefined,
   THeadersSchema extends AnyZodSchema | undefined = undefined,
-  TResource = never
+  TResource = never,
 > = {
   params?: TParamsSchema;
   searchParams?: TSearchParamsSchema;
@@ -52,7 +244,7 @@ type ApiKeyRouteBuilderOptions<
   ) => Promise<TResource | undefined>;
   shouldRetryNotFound?: boolean;
   authorization?: {
-    action: AuthorizationAction;
+    action: string;
     resource: (
       resource: NonNullable<TResource>,
       params: TParamsSchema extends z.ZodFirstPartySchemaTypes | z.ZodDiscriminatedUnion<any, any>
@@ -66,8 +258,7 @@ type ApiKeyRouteBuilderOptions<
       headers: THeadersSchema extends z.ZodFirstPartySchemaTypes | z.ZodDiscriminatedUnion<any, any>
         ? z.infer<THeadersSchema>
         : undefined
-    ) => AuthorizationResources;
-    superScopes?: string[];
+    ) => AuthResource;
   };
 };
 
@@ -75,7 +266,7 @@ type ApiKeyHandlerFunction<
   TParamsSchema extends AnyZodSchema | undefined,
   TSearchParamsSchema extends AnyZodSchema | undefined,
   THeadersSchema extends AnyZodSchema | undefined = undefined,
-  TResource = never
+  TResource = never,
 > = (args: {
   params: TParamsSchema extends z.ZodFirstPartySchemaTypes | z.ZodDiscriminatedUnion<any, any>
     ? z.infer<TParamsSchema>
@@ -89,6 +280,7 @@ type ApiKeyHandlerFunction<
     ? z.infer<THeadersSchema>
     : undefined;
   authentication: ApiAuthenticationResultSuccess;
+  ability: RbacAbility;
   request: Request;
   resource: NonNullable<TResource>;
   apiVersion: API_VERSIONS;
@@ -98,7 +290,7 @@ export function createLoaderApiRoute<
   TParamsSchema extends AnyZodSchema | undefined = undefined,
   TSearchParamsSchema extends AnyZodSchema | undefined = undefined,
   THeadersSchema extends AnyZodSchema | undefined = undefined,
-  TResource = never
+  TResource = never,
 >(
   options: ApiKeyRouteBuilderOptions<TParamsSchema, TSearchParamsSchema, THeadersSchema, TResource>,
   handler: ApiKeyHandlerFunction<TParamsSchema, TSearchParamsSchema, THeadersSchema, TResource>
@@ -120,23 +312,22 @@ export function createLoaderApiRoute<
     }
 
     try {
-      const authenticationResult = await authenticateApiRequestWithFailure(request, { allowJWT });
-
-      if (!authenticationResult) {
+      const authResult = await authenticateRequestForApiBuilder(request, { allowJWT });
+      if (!authResult.ok) {
         return await wrapResponse(
           request,
-          json({ error: "Invalid or Missing API key" }, { status: 401 }),
+          json({ error: authResult.error }, { status: authResult.status }),
           corsStrategy !== "none"
         );
       }
-
-      if (!authenticationResult.ok) {
-        return await wrapResponse(
-          request,
-          json({ error: authenticationResult.error }, { status: 401 }),
-          corsStrategy !== "none"
-        );
-      }
+      const { authentication: authenticationResult, ability } = authResult;
+      const restrictedKeyRejection = await rejectRestrictedKeyWithoutAuthorization({
+        request,
+        restrictedApiKey: authResult.restrictedApiKey,
+        hasAuthorization: authorization !== undefined,
+        useCors: corsStrategy !== "none",
+      });
+      if (restrictedKeyRejection) return restrictedKeyRejection;
 
       let parsedParams: any = undefined;
       if (paramsSchema) {
@@ -203,7 +394,7 @@ export function createLoaderApiRoute<
       }
 
       if (authorization) {
-        const { action, resource: authResource, superScopes } = authorization;
+        const { action, resource: authResource } = authorization;
         const $authResource = authResource(
           resource,
           parsedParams,
@@ -211,26 +402,12 @@ export function createLoaderApiRoute<
           parsedHeaders
         );
 
-        logger.debug("Checking authorization", {
-          action,
-          resource: $authResource,
-          superScopes,
-          scopes: authenticationResult.scopes,
-        });
-
-        const authorizationResult = checkAuthorization(
-          authenticationResult,
-          action,
-          $authResource,
-          superScopes
-        );
-
-        if (!authorizationResult.authorized) {
+        if (!checkAuth(ability, action, $authResource)) {
           return await wrapResponse(
             request,
             json(
               {
-                error: `Unauthorized: ${authorizationResult.reason}`,
+                error: "Unauthorized",
                 code: "unauthorized",
                 param: "access_token",
                 type: "authorization",
@@ -244,15 +421,20 @@ export function createLoaderApiRoute<
 
       const apiVersion = getApiVersion(request);
 
-      const result = await handler({
-        params: parsedParams,
-        searchParams: parsedSearchParams,
-        headers: parsedHeaders,
-        authentication: authenticationResult,
-        request,
-        resource,
-        apiVersion,
-      });
+      const result = await tenantContext.run(
+        tenantContextFromAuthEnvironment(authenticationResult.environment),
+        () =>
+          handler({
+            params: parsedParams,
+            searchParams: parsedSearchParams,
+            headers: parsedHeaders,
+            authentication: authenticationResult,
+            ability,
+            request,
+            resource,
+            apiVersion,
+          })
+      );
       return await wrapResponse(request, result, corsStrategy !== "none");
     } catch (error) {
       try {
@@ -260,17 +442,7 @@ export function createLoaderApiRoute<
           return await wrapResponse(request, error, corsStrategy !== "none");
         }
 
-        logger.error("Error in loader", {
-          error:
-            error instanceof Error
-              ? {
-                  name: error.name,
-                  message: error.message,
-                  stack: error.stack,
-                }
-              : String(error),
-          url: request.url,
-        });
+        logBoundaryError("Error in loader", error, request.url);
 
         return await wrapResponse(
           request,
@@ -289,18 +461,49 @@ export function createLoaderApiRoute<
 type PATRouteBuilderOptions<
   TParamsSchema extends AnyZodSchema | undefined = undefined,
   TSearchParamsSchema extends AnyZodSchema | undefined = undefined,
-  THeadersSchema extends AnyZodSchema | undefined = undefined
+  THeadersSchema extends AnyZodSchema | undefined = undefined,
 > = {
   params?: TParamsSchema;
   searchParams?: TSearchParamsSchema;
   headers?: THeadersSchema;
   corsStrategy?: "all" | "none";
+  // Resolves the target org/project for the request. Fed to
+  // `rbac.authenticatePat` so the plugin can compute the user's role
+  // floor (their authority in that org) for the cap intersection.
+  // When omitted, the PAT runs in identity-only mode — no role floor,
+  // no per-route ability gating beyond what authorization (if any)
+  // declares against a permissive baseline. Routes added before TRI-9087
+  // run in this mode by default.
+  context?: (
+    params: TParamsSchema extends z.ZodFirstPartySchemaTypes | z.ZodDiscriminatedUnion<any, any>
+      ? z.infer<TParamsSchema>
+      : undefined,
+    request: Request
+  ) =>
+    | { organizationId?: string; projectId?: string }
+    | Promise<{ organizationId?: string; projectId?: string }>;
+  authorization?: {
+    action: string;
+    resource: (
+      params: TParamsSchema extends z.ZodFirstPartySchemaTypes | z.ZodDiscriminatedUnion<any, any>
+        ? z.infer<TParamsSchema>
+        : undefined,
+      searchParams: TSearchParamsSchema extends
+        | z.ZodFirstPartySchemaTypes
+        | z.ZodDiscriminatedUnion<any, any>
+        ? z.infer<TSearchParamsSchema>
+        : undefined,
+      headers: THeadersSchema extends z.ZodFirstPartySchemaTypes | z.ZodDiscriminatedUnion<any, any>
+        ? z.infer<THeadersSchema>
+        : undefined
+    ) => AuthResource;
+  };
 };
 
 type PATHandlerFunction<
   TParamsSchema extends AnyZodSchema | undefined,
   TSearchParamsSchema extends AnyZodSchema | undefined,
-  THeadersSchema extends AnyZodSchema | undefined = undefined
+  THeadersSchema extends AnyZodSchema | undefined = undefined,
 > = (args: {
   params: TParamsSchema extends z.ZodFirstPartySchemaTypes | z.ZodDiscriminatedUnion<any, any>
     ? z.infer<TParamsSchema>
@@ -314,6 +517,7 @@ type PATHandlerFunction<
     ? z.infer<THeadersSchema>
     : undefined;
   authentication: PersonalAccessTokenAuthenticationResult;
+  ability: RbacAbility;
   request: Request;
   apiVersion: API_VERSIONS;
 }) => Promise<Response>;
@@ -321,7 +525,7 @@ type PATHandlerFunction<
 export function createLoaderPATApiRoute<
   TParamsSchema extends AnyZodSchema | undefined = undefined,
   TSearchParamsSchema extends AnyZodSchema | undefined = undefined,
-  THeadersSchema extends AnyZodSchema | undefined = undefined
+  THeadersSchema extends AnyZodSchema | undefined = undefined,
 >(
   options: PATRouteBuilderOptions<TParamsSchema, TSearchParamsSchema, THeadersSchema>,
   handler: PATHandlerFunction<TParamsSchema, TSearchParamsSchema, THeadersSchema>
@@ -332,6 +536,8 @@ export function createLoaderPATApiRoute<
       searchParams: searchParamsSchema,
       headers: headersSchema,
       corsStrategy = "none",
+      context: contextFn,
+      authorization,
     } = options;
 
     if (corsStrategy !== "none" && request.method.toUpperCase() === "OPTIONS") {
@@ -339,16 +545,6 @@ export function createLoaderPATApiRoute<
     }
 
     try {
-      const authenticationResult = await authenticateApiRequestWithPersonalAccessToken(request);
-
-      if (!authenticationResult) {
-        return await wrapResponse(
-          request,
-          json({ error: "Invalid or Missing API key" }, { status: 401 }),
-          corsStrategy !== "none"
-        );
-      }
-
       let parsedParams: any = undefined;
       if (paramsSchema) {
         const parsed = paramsSchema.safeParse(params);
@@ -401,11 +597,89 @@ export function createLoaderPATApiRoute<
 
       const apiVersion = getApiVersion(request);
 
+      // Single PAT auth roundtrip. `rbac.authenticatePat` validates the
+      // token AND computes the cap-and-floor ability in one DB query
+      // (the OSS fallback does the validation only and returns a
+      // permissive ability; the cloud plugin returns the joined
+      // cap/floor result). We previously called
+      // `authenticateApiRequestWithPersonalAccessToken` here first as
+      // belt-and-braces, but that meant two PAT lookups per request
+      // for routes with `context`/`authorization` declared. Routes
+      // without those still get a working `authentication` object —
+      // we pass an empty ctx and the fallback validates fine.
+      //
+      // `lastAccessedAt` is plumbed through the plugin result so the
+      // host can decide whether to fire the update (smart-skip in
+      // `updateLastAccessedAtIfStale` — no DB roundtrip when the
+      // cached timestamp is fresher than the throttle window).
+      const ctx = contextFn ? await contextFn(parsedParams, request) : {};
+
+      let authenticationResult: PersonalAccessTokenAuthenticationResult;
+      let ability: RbacAbility;
+
+      const bearer = request.headers
+        .get("Authorization")
+        ?.replace(/^Bearer /, "")
+        .trim();
+      if (bearer && isUserActorToken(bearer)) {
+        // A user-actor token validates + computes the cap-and-floor ability
+        // in one call, same shape as a PAT.
+        const uatAuth = await rbac.authenticateUserActor(request, ctx);
+        if (!uatAuth.ok) {
+          return await wrapResponse(
+            request,
+            json({ error: uatAuth.error }, { status: uatAuth.status }),
+            corsStrategy !== "none"
+          );
+        }
+        authenticationResult = { userId: uatAuth.userId };
+        ability = uatAuth.ability;
+      } else {
+        // PAT: validate + compute the cap-and-floor ability in one query.
+        const patAuth = await rbac.authenticatePat(request, ctx);
+        if (!patAuth.ok) {
+          return await wrapResponse(
+            request,
+            json({ error: patAuth.error }, { status: patAuth.status }),
+            corsStrategy !== "none"
+          );
+        }
+        authenticationResult = { userId: patAuth.userId };
+        ability = patAuth.ability;
+        // Throttled in the helper (no DB write when the cached value is fresh).
+        await updateLastAccessedAtIfStale(patAuth.tokenId, patAuth.lastAccessedAt);
+      }
+
+      if (authorization) {
+        const $resource = authorization.resource(parsedParams, parsedSearchParams, parsedHeaders);
+        if (!checkAuth(ability, authorization.action, $resource)) {
+          return await wrapResponse(
+            request,
+            json(
+              {
+                error: "Unauthorized",
+                code: "unauthorized",
+                param: "access_token",
+                type: "authorization",
+              },
+              { status: 403 }
+            ),
+            corsStrategy !== "none"
+          );
+        }
+      }
+
+      // PAT auth carries `userId` but no environment — enrich the scope
+      // the Express middleware established with the authenticated user so
+      // Sentry events from this handler get user-level attribution.
+      tenantContext.enrich({ userId: authenticationResult.userId });
+
       const result = await handler({
         params: parsedParams,
         searchParams: parsedSearchParams,
         headers: parsedHeaders,
         authentication: authenticationResult,
+        ability,
         request,
         apiVersion,
       });
@@ -429,12 +703,286 @@ export function createLoaderPATApiRoute<
   };
 }
 
+// The mutation counterpart to `createLoaderPATApiRoute`. Same PAT/user-actor
+// auth + `context` role-floor + `authorization` gating + `tenantContext`
+// user attribution, plus a method guard, body parsing, and — unlike the
+// loader — `ServiceValidationError` is mapped to its `.status` so services
+// can raise typed 4xx errors instead of the route string-matching messages.
+// Deliberately self-contained (not sharing internals with the loader) so
+// existing PAT loader routes are untouched.
+type PATActionMethod = "POST" | "PUT" | "DELETE" | "PATCH";
+
+type PATActionRouteBuilderOptions<
+  TParamsSchema extends AnyZodSchema | undefined = undefined,
+  TSearchParamsSchema extends AnyZodSchema | undefined = undefined,
+  THeadersSchema extends AnyZodSchema | undefined = undefined,
+  TBodySchema extends AnyZodSchema | undefined = undefined,
+> = PATRouteBuilderOptions<TParamsSchema, TSearchParamsSchema, THeadersSchema> & {
+  // A single verb, or a list for multi-method routes (e.g. ["PATCH", "DELETE"]).
+  method?: PATActionMethod | PATActionMethod[];
+  body?: TBodySchema;
+};
+
+type PATActionHandlerFunction<
+  TParamsSchema extends AnyZodSchema | undefined,
+  TSearchParamsSchema extends AnyZodSchema | undefined,
+  THeadersSchema extends AnyZodSchema | undefined = undefined,
+  TBodySchema extends AnyZodSchema | undefined = undefined,
+> = (args: {
+  params: TParamsSchema extends z.ZodFirstPartySchemaTypes | z.ZodDiscriminatedUnion<any, any>
+    ? z.infer<TParamsSchema>
+    : undefined;
+  searchParams: TSearchParamsSchema extends
+    | z.ZodFirstPartySchemaTypes
+    | z.ZodDiscriminatedUnion<any, any>
+    ? z.infer<TSearchParamsSchema>
+    : undefined;
+  headers: THeadersSchema extends z.ZodFirstPartySchemaTypes | z.ZodDiscriminatedUnion<any, any>
+    ? z.infer<THeadersSchema>
+    : undefined;
+  body: TBodySchema extends z.ZodFirstPartySchemaTypes | z.ZodDiscriminatedUnion<any, any>
+    ? z.infer<TBodySchema>
+    : undefined;
+  authentication: PersonalAccessTokenAuthenticationResult;
+  ability: RbacAbility;
+  request: Request;
+  apiVersion: API_VERSIONS;
+}) => Promise<Response>;
+
+export function createActionPATApiRoute<
+  TParamsSchema extends AnyZodSchema | undefined = undefined,
+  TSearchParamsSchema extends AnyZodSchema | undefined = undefined,
+  THeadersSchema extends AnyZodSchema | undefined = undefined,
+  TBodySchema extends AnyZodSchema | undefined = undefined,
+>(
+  options: PATActionRouteBuilderOptions<
+    TParamsSchema,
+    TSearchParamsSchema,
+    THeadersSchema,
+    TBodySchema
+  >,
+  handler: PATActionHandlerFunction<TParamsSchema, TSearchParamsSchema, THeadersSchema, TBodySchema>
+) {
+  return async function action({ request, params }: ActionFunctionArgs) {
+    const {
+      params: paramsSchema,
+      searchParams: searchParamsSchema,
+      headers: headersSchema,
+      body: bodySchema,
+      corsStrategy = "none",
+      context: contextFn,
+      authorization,
+      method,
+    } = options;
+
+    if (corsStrategy !== "none" && request.method.toUpperCase() === "OPTIONS") {
+      return apiCors(request, json({}));
+    }
+
+    const allowedMethods = method ? (Array.isArray(method) ? method : [method]) : undefined;
+    if (allowedMethods && !(allowedMethods as string[]).includes(request.method.toUpperCase())) {
+      return await wrapResponse(
+        request,
+        json(
+          { error: "Method not allowed" },
+          { status: 405, headers: { Allow: allowedMethods.join(", ") } }
+        ),
+        corsStrategy !== "none"
+      );
+    }
+
+    try {
+      let parsedParams: any = undefined;
+      if (paramsSchema) {
+        const parsed = paramsSchema.safeParse(params);
+        if (!parsed.success) {
+          return await wrapResponse(
+            request,
+            json(
+              { error: "Params Error", details: fromZodError(parsed.error).details },
+              { status: 400 }
+            ),
+            corsStrategy !== "none"
+          );
+        }
+        parsedParams = parsed.data;
+      }
+
+      let parsedSearchParams: any = undefined;
+      if (searchParamsSchema) {
+        const searchParams = Object.fromEntries(new URL(request.url).searchParams);
+        const parsed = searchParamsSchema.safeParse(searchParams);
+        if (!parsed.success) {
+          return await wrapResponse(
+            request,
+            json(
+              { error: "Query Error", details: fromZodError(parsed.error).details },
+              { status: 400 }
+            ),
+            corsStrategy !== "none"
+          );
+        }
+        parsedSearchParams = parsed.data;
+      }
+
+      let parsedHeaders: any = undefined;
+      if (headersSchema) {
+        const rawHeaders = Object.fromEntries(request.headers);
+        const headers = headersSchema.safeParse(rawHeaders);
+        if (!headers.success) {
+          return await wrapResponse(
+            request,
+            json(
+              { error: "Headers Error", details: fromZodError(headers.error).details },
+              { status: 400 }
+            ),
+            corsStrategy !== "none"
+          );
+        }
+        parsedHeaders = headers.data;
+      }
+
+      let parsedBody: any = undefined;
+      if (bodySchema) {
+        const rawBody = await request.text();
+        if (rawBody.length === 0) {
+          return await wrapResponse(
+            request,
+            json({ error: "Request body is empty" }, { status: 400 }),
+            corsStrategy !== "none"
+          );
+        }
+
+        const rawParsedJson = safeJsonParse(rawBody);
+        if (!rawParsedJson) {
+          return await wrapResponse(
+            request,
+            json({ error: "Invalid JSON" }, { status: 400 }),
+            corsStrategy !== "none"
+          );
+        }
+
+        const body = bodySchema.safeParse(rawParsedJson);
+        if (!body.success) {
+          return await wrapResponse(
+            request,
+            json({ error: fromZodError(body.error).toString() }, { status: 400 }),
+            corsStrategy !== "none"
+          );
+        }
+        parsedBody = body.data;
+      }
+
+      const apiVersion = getApiVersion(request);
+
+      // `context` resolves the target org/project so the plugin can compute the
+      // caller's role floor for the cap intersection (see the loader builder).
+      const ctx = contextFn ? await contextFn(parsedParams, request) : {};
+
+      let authenticationResult: PersonalAccessTokenAuthenticationResult;
+      let ability: RbacAbility;
+
+      const bearer = request.headers
+        .get("Authorization")
+        ?.replace(/^Bearer /, "")
+        .trim();
+      if (bearer && isUserActorToken(bearer)) {
+        const uatAuth = await rbac.authenticateUserActor(request, ctx);
+        if (!uatAuth.ok) {
+          return await wrapResponse(
+            request,
+            json({ error: uatAuth.error }, { status: uatAuth.status }),
+            corsStrategy !== "none"
+          );
+        }
+        authenticationResult = { userId: uatAuth.userId };
+        ability = uatAuth.ability;
+      } else {
+        const patAuth = await rbac.authenticatePat(request, ctx);
+        if (!patAuth.ok) {
+          return await wrapResponse(
+            request,
+            json({ error: patAuth.error }, { status: patAuth.status }),
+            corsStrategy !== "none"
+          );
+        }
+        authenticationResult = { userId: patAuth.userId };
+        ability = patAuth.ability;
+        await updateLastAccessedAtIfStale(patAuth.tokenId, patAuth.lastAccessedAt);
+      }
+
+      if (authorization) {
+        const $resource = authorization.resource(parsedParams, parsedSearchParams, parsedHeaders);
+        if (!checkAuth(ability, authorization.action, $resource)) {
+          return await wrapResponse(
+            request,
+            json(
+              {
+                error: "Unauthorized",
+                code: "unauthorized",
+                param: "access_token",
+                type: "authorization",
+              },
+              { status: 403 }
+            ),
+            corsStrategy !== "none"
+          );
+        }
+      }
+
+      // PAT auth carries `userId` but no environment — enrich the scope the
+      // Express middleware established so Sentry events get user attribution.
+      tenantContext.enrich({ userId: authenticationResult.userId });
+
+      const result = await handler({
+        params: parsedParams,
+        searchParams: parsedSearchParams,
+        headers: parsedHeaders,
+        body: parsedBody,
+        authentication: authenticationResult,
+        ability,
+        request,
+        apiVersion,
+      });
+      return await wrapResponse(request, result, corsStrategy !== "none");
+    } catch (error) {
+      try {
+        if (error instanceof Response) {
+          return await wrapResponse(request, error, corsStrategy !== "none");
+        }
+
+        logBoundaryError("Error in action", error, request.url);
+
+        // Typed validation errors map to their own status (default 400);
+        // logBoundaryError already classified them as expected (no Sentry).
+        if (error instanceof ServiceValidationError) {
+          return await wrapResponse(
+            request,
+            json({ error: error.message }, { status: error.status ?? 400 }),
+            corsStrategy !== "none"
+          );
+        }
+
+        return await wrapResponse(
+          request,
+          json({ error: "Internal Server Error" }, { status: 500 }),
+          corsStrategy !== "none"
+        );
+      } catch (innerError) {
+        logger.error("[apiBuilder] Failed to handle error", { error, innerError });
+
+        return json({ error: "Internal Server Error" }, { status: 500 });
+      }
+    }
+  };
+}
+
 type ApiKeyActionRouteBuilderOptions<
   TParamsSchema extends AnyZodSchema | undefined = undefined,
   TSearchParamsSchema extends AnyZodSchema | undefined = undefined,
   THeadersSchema extends AnyZodSchema | undefined = undefined,
   TBodySchema extends AnyZodSchema | undefined = undefined,
-  TResource = never
+  TResource = never,
 > = {
   params?: TParamsSchema;
   searchParams?: TSearchParamsSchema;
@@ -454,7 +1002,7 @@ type ApiKeyActionRouteBuilderOptions<
       : undefined
   ) => Promise<TResource | undefined>;
   authorization?: {
-    action: AuthorizationAction;
+    action: string;
     resource: (
       params: TParamsSchema extends z.ZodFirstPartySchemaTypes | z.ZodDiscriminatedUnion<any, any>
         ? z.infer<TParamsSchema>
@@ -469,9 +1017,14 @@ type ApiKeyActionRouteBuilderOptions<
         : undefined,
       body: TBodySchema extends z.ZodFirstPartySchemaTypes | z.ZodDiscriminatedUnion<any, any>
         ? z.infer<TBodySchema>
-        : undefined
-    ) => AuthorizationResources;
-    superScopes?: string[];
+        : undefined,
+      // The resolved resource from `findResource`. `undefined` when the route
+      // doesn't declare `findResource`. Routes that need to expand the auth
+      // scope to alternate identifiers of the same row (e.g. friendlyId +
+      // externalId for sessions) read it here so a JWT minted for either form
+      // authorizes both URL forms.
+      resource: TResource | undefined
+    ) => AuthResource;
   };
   maxContentLength?: number;
   body?: TBodySchema;
@@ -482,7 +1035,7 @@ type ApiKeyActionHandlerFunction<
   TSearchParamsSchema extends AnyZodSchema | undefined,
   THeadersSchema extends AnyZodSchema | undefined = undefined,
   TBodySchema extends AnyZodSchema | undefined = undefined,
-  TResource = never
+  TResource = never,
 > = (args: {
   params: TParamsSchema extends z.ZodFirstPartySchemaTypes | z.ZodDiscriminatedUnion<any, any>
     ? z.infer<TParamsSchema>
@@ -499,6 +1052,7 @@ type ApiKeyActionHandlerFunction<
     ? z.infer<TBodySchema>
     : undefined;
   authentication: ApiAuthenticationResultSuccess;
+  ability: RbacAbility;
   request: Request;
   resource?: TResource;
 }) => Promise<Response>;
@@ -508,7 +1062,7 @@ export function createActionApiRoute<
   TSearchParamsSchema extends AnyZodSchema | undefined = undefined,
   THeadersSchema extends AnyZodSchema | undefined = undefined,
   TBodySchema extends AnyZodSchema | undefined = undefined,
-  TResource = never
+  TResource = never,
 >(
   options: ApiKeyActionRouteBuilderOptions<
     TParamsSchema,
@@ -559,29 +1113,32 @@ export function createActionApiRoute<
     }
 
     try {
-      const authenticationResult = await authenticateApiRequestWithFailure(request, { allowJWT });
-
-      if (!authenticationResult) {
+      const authResult = await authenticateRequestForApiBuilder(request, { allowJWT });
+      if (!authResult.ok) {
         return await wrapResponse(
           request,
-          json({ error: "Invalid or Missing API key" }, { status: 401 }),
+          json({ error: authResult.error }, { status: authResult.status }),
           corsStrategy !== "none"
         );
       }
-
-      if (!authenticationResult.ok) {
-        return await wrapResponse(
-          request,
-          json({ error: authenticationResult.error }, { status: 401 }),
-          corsStrategy !== "none"
-        );
-      }
+      const { authentication: authenticationResult, ability } = authResult;
+      const restrictedKeyRejection = await rejectRestrictedKeyWithoutAuthorization({
+        request,
+        restrictedApiKey: authResult.restrictedApiKey,
+        hasAuthorization: authorization !== undefined,
+        useCors: corsStrategy !== "none",
+      });
+      if (restrictedKeyRejection) return restrictedKeyRejection;
 
       if (maxContentLength) {
         const contentLength = request.headers.get("content-length");
 
         if (!contentLength || parseInt(contentLength) > maxContentLength) {
-          return json({ error: "Request body too large" }, { status: 413 });
+          return await wrapResponse(
+            request,
+            json({ error: "Request body too large" }, { status: 413 }),
+            corsStrategy !== "none"
+          );
         }
       }
 
@@ -667,30 +1224,40 @@ export function createActionApiRoute<
         parsedBody = body.data;
       }
 
+      // Resolve the resource before authorization so the auth scope check
+      // can expand to alternate identifiers of the same row (e.g. a Session
+      // is addressable by both `friendlyId` and `externalId` and a JWT minted
+      // for either form should authorize both URL forms). Mirrors the
+      // ordering in `createLoaderApiRoute`.
+      const resource = options.findResource
+        ? await options.findResource(parsedParams, authenticationResult, parsedSearchParams)
+        : undefined;
+
+      // Run authorization first — but with the resolved resource available
+      // as the 5th arg so the auth scope check can expand to alternate
+      // identifiers of the same row (e.g. a Session is addressable by both
+      // `friendlyId` and `externalId`). Resource-null is checked AFTER auth
+      // so:
+      //   - underscoped JWT + missing resource → 403 (no info leak)
+      //   - underscoped JWT + existing resource → 403 (existing behavior)
+      //   - PRIVATE key + missing resource → auth passes → 404 (correct)
+      //   - PRIVATE key + existing resource → auth passes → handler runs
       if (authorization) {
-        const { action, resource, superScopes } = authorization;
-        const $resource = resource(parsedParams, parsedSearchParams, parsedHeaders, parsedBody);
-
-        logger.debug("Checking authorization", {
-          action,
-          resource: $resource,
-          superScopes,
-          scopes: authenticationResult.scopes,
-        });
-
-        const authorizationResult = checkAuthorization(
-          authenticationResult,
-          action,
-          $resource,
-          superScopes
+        const { action, resource: authResource } = authorization;
+        const $resource = authResource(
+          parsedParams,
+          parsedSearchParams,
+          parsedHeaders,
+          parsedBody,
+          resource
         );
 
-        if (!authorizationResult.authorized) {
+        if (!checkAuth(ability, action, $resource)) {
           return await wrapResponse(
             request,
             json(
               {
-                error: `Unauthorized: ${authorizationResult.reason}`,
+                error: "Unauthorized",
                 code: "unauthorized",
                 param: "access_token",
                 type: "authorization",
@@ -702,10 +1269,6 @@ export function createActionApiRoute<
         }
       }
 
-      const resource = options.findResource
-        ? await options.findResource(parsedParams, authenticationResult, parsedSearchParams)
-        : undefined;
-
       if (options.findResource && !resource) {
         return await wrapResponse(
           request,
@@ -714,15 +1277,20 @@ export function createActionApiRoute<
         );
       }
 
-      const result = await handler({
-        params: parsedParams,
-        searchParams: parsedSearchParams,
-        headers: parsedHeaders,
-        body: parsedBody,
-        authentication: authenticationResult,
-        request,
-        resource,
-      });
+      const result = await tenantContext.run(
+        tenantContextFromAuthEnvironment(authenticationResult.environment),
+        () =>
+          handler({
+            params: parsedParams,
+            searchParams: parsedSearchParams,
+            headers: parsedHeaders,
+            body: parsedBody,
+            authentication: authenticationResult,
+            ability,
+            request,
+            resource,
+          })
+      );
       return await wrapResponse(request, result, corsStrategy !== "none");
     } catch (error) {
       try {
@@ -730,17 +1298,7 @@ export function createActionApiRoute<
           return await wrapResponse(request, error, corsStrategy !== "none");
         }
 
-        logger.error("Error in action", {
-          error:
-            error instanceof Error
-              ? {
-                  name: error.name,
-                  message: error.message,
-                  stack: error.stack,
-                }
-              : String(error),
-          url: request.url,
-        });
+        logBoundaryError("Error in action", error, request.url);
 
         return await wrapResponse(
           request,
@@ -787,7 +1345,7 @@ type MethodConfig<TParamsSchema, TSearchParamsSchema, THeadersSchema> = {
 type MultiMethodApiRouteOptions<
   TParamsSchema extends AnyZodSchema | undefined = undefined,
   TSearchParamsSchema extends AnyZodSchema | undefined = undefined,
-  THeadersSchema extends AnyZodSchema | undefined = undefined
+  THeadersSchema extends AnyZodSchema | undefined = undefined,
 > = {
   params?: TParamsSchema;
   searchParams?: TSearchParamsSchema;
@@ -795,9 +1353,8 @@ type MultiMethodApiRouteOptions<
   allowJWT?: boolean;
   corsStrategy?: "all" | "none";
   authorization?: {
-    action: AuthorizationAction;
-    resource: (params: InferZod<TParamsSchema>) => AuthorizationResources;
-    superScopes?: string[];
+    action: string;
+    resource: (params: InferZod<TParamsSchema>) => AuthResource;
   };
   maxContentLength?: number;
   methods: Partial<
@@ -813,7 +1370,7 @@ type MultiMethodApiRouteOptions<
 export function createMultiMethodApiRoute<
   TParamsSchema extends AnyZodSchema | undefined = undefined,
   TSearchParamsSchema extends AnyZodSchema | undefined = undefined,
-  THeadersSchema extends AnyZodSchema | undefined = undefined
+  THeadersSchema extends AnyZodSchema | undefined = undefined,
 >(options: MultiMethodApiRouteOptions<TParamsSchema, TSearchParamsSchema, THeadersSchema>) {
   const {
     params: paramsSchema,
@@ -842,33 +1399,29 @@ export function createMultiMethodApiRoute<
     if (!methodConfig) {
       return await wrapResponse(
         request,
-        json(
-          { error: "Method not allowed" },
-          { status: 405, headers: { Allow: allowedMethods } }
-        ),
+        json({ error: "Method not allowed" }, { status: 405, headers: { Allow: allowedMethods } }),
         corsStrategy !== "none"
       );
     }
 
     try {
       // Authenticate
-      const authenticationResult = await authenticateApiRequestWithFailure(request, { allowJWT });
-
-      if (!authenticationResult) {
+      const authResult = await authenticateRequestForApiBuilder(request, { allowJWT });
+      if (!authResult.ok) {
         return await wrapResponse(
           request,
-          json({ error: "Invalid or Missing API key" }, { status: 401 }),
+          json({ error: authResult.error }, { status: authResult.status }),
           corsStrategy !== "none"
         );
       }
-
-      if (!authenticationResult.ok) {
-        return await wrapResponse(
-          request,
-          json({ error: authenticationResult.error }, { status: 401 }),
-          corsStrategy !== "none"
-        );
-      }
+      const { authentication: authenticationResult, ability } = authResult;
+      const restrictedKeyRejection = await rejectRestrictedKeyWithoutAuthorization({
+        request,
+        restrictedApiKey: authResult.restrictedApiKey,
+        hasAuthorization: authorization !== undefined,
+        useCors: corsStrategy !== "none",
+      });
+      if (restrictedKeyRejection) return restrictedKeyRejection;
 
       if (maxContentLength) {
         const contentLength = request.headers.get("content-length");
@@ -936,29 +1489,15 @@ export function createMultiMethodApiRoute<
 
       // Authorize
       if (authorization) {
-        const { action, resource, superScopes } = authorization;
+        const { action, resource } = authorization;
         const $resource = resource(parsedParams);
 
-        logger.debug("Checking authorization", {
-          action,
-          resource: $resource,
-          superScopes,
-          scopes: authenticationResult.scopes,
-        });
-
-        const authorizationResult = checkAuthorization(
-          authenticationResult,
-          action,
-          $resource,
-          superScopes
-        );
-
-        if (!authorizationResult.authorized) {
+        if (!checkAuth(ability, action, $resource)) {
           return await wrapResponse(
             request,
             json(
               {
-                error: `Unauthorized: ${authorizationResult.reason}`,
+                error: "Unauthorized",
                 code: "unauthorized",
                 param: "access_token",
                 type: "authorization",
@@ -1003,14 +1542,18 @@ export function createMultiMethodApiRoute<
       }
 
       // Dispatch to method handler
-      const result = await methodConfig.handler({
-        params: parsedParams,
-        searchParams: parsedSearchParams,
-        headers: parsedHeaders,
-        body: parsedBody,
-        authentication: authenticationResult,
-        request,
-      });
+      const result = await tenantContext.run(
+        tenantContextFromAuthEnvironment(authenticationResult.environment),
+        () =>
+          methodConfig.handler({
+            params: parsedParams,
+            searchParams: parsedSearchParams,
+            headers: parsedHeaders,
+            body: parsedBody,
+            authentication: authenticationResult,
+            request,
+          })
+      );
       return await wrapResponse(request, result, corsStrategy !== "none");
     } catch (error) {
       try {
@@ -1018,13 +1561,7 @@ export function createMultiMethodApiRoute<
           return await wrapResponse(request, error, corsStrategy !== "none");
         }
 
-        logger.error("Error in action", {
-          error:
-            error instanceof Error
-              ? { name: error.name, message: error.message, stack: error.stack }
-              : String(error),
-          url: request.url,
-        });
+        logBoundaryError("Error in action", error, request.url);
 
         return await wrapResponse(
           request,
@@ -1056,7 +1593,7 @@ async function wrapResponse(
 type WorkerLoaderRouteBuilderOptions<
   TParamsSchema extends AnyZodSchema | undefined = undefined,
   TSearchParamsSchema extends AnyZodSchema | undefined = undefined,
-  THeadersSchema extends AnyZodSchema | undefined = undefined
+  THeadersSchema extends AnyZodSchema | undefined = undefined,
 > = {
   params?: TParamsSchema;
   searchParams?: TSearchParamsSchema;
@@ -1066,7 +1603,7 @@ type WorkerLoaderRouteBuilderOptions<
 type WorkerLoaderHandlerFunction<
   TParamsSchema extends AnyZodSchema | undefined,
   TSearchParamsSchema extends AnyZodSchema | undefined,
-  THeadersSchema extends AnyZodSchema | undefined = undefined
+  THeadersSchema extends AnyZodSchema | undefined = undefined,
 > = (args: {
   params: TParamsSchema extends z.ZodFirstPartySchemaTypes | z.ZodDiscriminatedUnion<any, any>
     ? z.infer<TParamsSchema>
@@ -1082,12 +1619,13 @@ type WorkerLoaderHandlerFunction<
     ? z.infer<THeadersSchema>
     : undefined;
   runnerId?: string;
+  environmentId?: string;
 }) => Promise<Response>;
 
 export function createLoaderWorkerApiRoute<
   TParamsSchema extends AnyZodSchema | undefined = undefined,
   TSearchParamsSchema extends AnyZodSchema | undefined = undefined,
-  THeadersSchema extends AnyZodSchema | undefined = undefined
+  THeadersSchema extends AnyZodSchema | undefined = undefined,
 >(
   options: WorkerLoaderRouteBuilderOptions<TParamsSchema, TSearchParamsSchema, THeadersSchema>,
   handler: WorkerLoaderHandlerFunction<TParamsSchema, TSearchParamsSchema, THeadersSchema>
@@ -1146,6 +1684,8 @@ export function createLoaderWorkerApiRoute<
       }
 
       const runnerId = request.headers.get(WORKER_HEADERS.RUNNER_ID) ?? undefined;
+      // `|| undefined` so a blank header can't become a zero-match snapshot filter (→ false reject).
+      const environmentId = request.headers.get(WORKER_HEADERS.ENVIRONMENT_ID) || undefined;
 
       const result = await handler({
         params: parsedParams,
@@ -1154,6 +1694,7 @@ export function createLoaderWorkerApiRoute<
         request,
         headers: parsedHeaders,
         runnerId,
+        environmentId,
       });
       return result;
     } catch (error) {
@@ -1162,17 +1703,7 @@ export function createLoaderWorkerApiRoute<
         return error;
       }
 
-      logger.error("Error in loader", {
-        error:
-          error instanceof Error
-            ? {
-                name: error.name,
-                message: error.message,
-                stack: error.stack,
-              }
-            : String(error),
-        url: request.url,
-      });
+      logBoundaryError("Error in loader", error, request.url);
 
       return json({ error: "Internal Server Error" }, { status: 500 });
     }
@@ -1183,7 +1714,7 @@ type WorkerActionRouteBuilderOptions<
   TParamsSchema extends AnyZodSchema | undefined = undefined,
   TSearchParamsSchema extends AnyZodSchema | undefined = undefined,
   THeadersSchema extends AnyZodSchema | undefined = undefined,
-  TBodySchema extends AnyZodSchema | undefined = undefined
+  TBodySchema extends AnyZodSchema | undefined = undefined,
 > = {
   params?: TParamsSchema;
   searchParams?: TSearchParamsSchema;
@@ -1196,7 +1727,7 @@ type WorkerActionHandlerFunction<
   TParamsSchema extends AnyZodSchema | undefined,
   TSearchParamsSchema extends AnyZodSchema | undefined,
   THeadersSchema extends AnyZodSchema | undefined = undefined,
-  TBodySchema extends AnyZodSchema | undefined = undefined
+  TBodySchema extends AnyZodSchema | undefined = undefined,
 > = (args: {
   params: TParamsSchema extends z.ZodFirstPartySchemaTypes | z.ZodDiscriminatedUnion<any, any>
     ? z.infer<TParamsSchema>
@@ -1215,13 +1746,14 @@ type WorkerActionHandlerFunction<
     ? z.infer<TBodySchema>
     : undefined;
   runnerId?: string;
+  environmentId?: string;
 }) => Promise<Response>;
 
 export function createActionWorkerApiRoute<
   TParamsSchema extends AnyZodSchema | undefined = undefined,
   TSearchParamsSchema extends AnyZodSchema | undefined = undefined,
   THeadersSchema extends AnyZodSchema | undefined = undefined,
-  TBodySchema extends AnyZodSchema | undefined = undefined
+  TBodySchema extends AnyZodSchema | undefined = undefined,
 >(
   options: WorkerActionRouteBuilderOptions<
     TParamsSchema,
@@ -1313,6 +1845,8 @@ export function createActionWorkerApiRoute<
       }
 
       const runnerId = request.headers.get(WORKER_HEADERS.RUNNER_ID) ?? undefined;
+      // `|| undefined` so a blank header can't become a zero-match snapshot filter (→ false reject).
+      const environmentId = request.headers.get(WORKER_HEADERS.ENVIRONMENT_ID) || undefined;
 
       const result = await handler({
         params: parsedParams,
@@ -1322,6 +1856,7 @@ export function createActionWorkerApiRoute<
         body: parsedBody,
         headers: parsedHeaders,
         runnerId,
+        environmentId,
       });
       return result;
     } catch (error) {
@@ -1337,17 +1872,7 @@ export function createActionWorkerApiRoute<
         return json({ error: error.message }, { status: error.status ?? 422 });
       }
 
-      logger.error("Error in action", {
-        error:
-          error instanceof Error
-            ? {
-                name: error.name,
-                message: error.message,
-                stack: error.stack,
-              }
-            : String(error),
-        url: request.url,
-      });
+      logBoundaryError("Error in action", error, request.url);
 
       return json({ error: "Internal Server Error" }, { status: 500 });
     }

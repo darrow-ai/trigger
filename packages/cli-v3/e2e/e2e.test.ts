@@ -1,4 +1,5 @@
-import { BuildManifest, WorkerManifest } from "@trigger.dev/core/v3/schemas";
+import { alwaysExternal } from "@trigger.dev/core/v3/build";
+import type { BuildManifest, WorkerManifest } from "@trigger.dev/core/v3/schemas";
 import * as fs from "node:fs";
 import { mkdir, rename, rm } from "node:fs/promises";
 import * as path from "node:path";
@@ -8,13 +9,20 @@ import { loadConfig } from "../src/config.js";
 import { indexWorkerManifest } from "../src/indexing/indexWorkerManifest.js";
 import { writeJSONFile } from "../src/utilities/fileSystem.js";
 import { logger } from "../src/utilities/logger.js";
-import { getTmpDir } from "../src/utilities/tempDirectories.js";
-import { fixturesConfig, TestCase } from "./fixtures.js";
-import { E2EOptions, E2EOptionsSchema } from "./schemas.js";
-import { executeTestCaseRun, runTsc } from "./utils.js";
 import { normalizeImportPath } from "../src/utilities/normalizeImportPath.js";
-import { installFixtureDeps, LOCKFILES, PackageManager, parsePackageManager } from "./utils.js";
-import { alwaysExternal } from "@trigger.dev/core/v3/build";
+import { getTmpDir } from "../src/utilities/tempDirectories.js";
+import type { TestCase } from "./fixtures.js";
+import { fixturesConfig } from "./fixtures.js";
+import type { E2EOptions } from "./schemas.js";
+import { E2EOptionsSchema } from "./schemas.js";
+import type { PackageManager } from "./utils.js";
+import {
+  executeTestCaseRun,
+  installFixtureDeps,
+  LOCKFILES,
+  parsePackageManager,
+  runTsc,
+} from "./utils.js";
 
 const TIMEOUT = 120_000;
 
@@ -36,7 +44,7 @@ try {
     logLevel: process.env.LOG,
     packageManager: process.env.PM,
   });
-} catch (e) {
+} catch (_e) {
   options = {
     logLevel: "log",
   };
@@ -52,7 +60,7 @@ if (testCases.length === 0) {
   }
 }
 
-describe.concurrent("buildWorker", async () => {
+describe("buildWorker", async () => {
   beforeEach<E2EFixtureTest>(async ({ fixtureDir, skip, packageManager, workspaceDir }) => {
     await rimraf(path.join(workspaceDir, "**/node_modules"), {
       glob: true,
@@ -71,7 +79,7 @@ describe.concurrent("buildWorker", async () => {
           path.resolve(path.join(workspaceDir, "yarn.lock")),
           path.resolve(path.join(workspaceDir, "yarn.lock.copy"))
         );
-      } catch (e) {
+      } catch (_e) {
         await rename(
           path.resolve(path.join(workspaceDir, "yarn.lock.copy")),
           path.resolve(path.join(workspaceDir, "yarn.lock"))
@@ -104,10 +112,17 @@ describe.concurrent("buildWorker", async () => {
 
   for (let testCase of testCases) {
     test.extend<E2EFixtureTest>({
+      // Seed `workspaceRelativeDir` before the spread so the key always exists.
+      // vitest 4 resolves fixture-to-fixture dependencies strictly at
+      // `test.extend()` time: the `workspaceDir` fixture below destructures
+      // `workspaceRelativeDir`, so it must be a defined fixture even for test
+      // cases that don't set it (it's an optional `TestCase` field). The spread
+      // overrides this default when the case provides its own value.
+      workspaceRelativeDir: "",
       ...testCase,
       fixtureDir: async ({ id }, use) =>
         await use(path.resolve(path.join(process.cwd(), "e2e/fixtures", id))),
-      workspaceDir: async ({ fixtureDir, workspaceRelativeDir = "" }, use) =>
+      workspaceDir: async ({ fixtureDir, workspaceRelativeDir }, use) =>
         await use(path.resolve(path.join(fixtureDir, workspaceRelativeDir))),
       packageManager: async ({ workspaceDir }, use) =>
         await use(await parsePackageManager(options.packageManager, workspaceDir)),

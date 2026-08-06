@@ -1,35 +1,22 @@
-import { Keyboard } from "lucide-react";
+import { KeyboardIcon } from "~/assets/icons/KeyboardIcon";
 import { useState } from "react";
 import { useShortcutKeys } from "~/hooks/useShortcutKeys";
-import { Button } from "./primitives/Buttons";
 import { Header3 } from "./primitives/Headers";
+import { SideMenuItemButton } from "./navigation/SideMenuItem";
 import { Paragraph } from "./primitives/Paragraph";
-import {
-  Sheet,
-  SheetContent,
-  SheetHeader,
-  SheetTitle,
-  SheetTrigger
-} from "./primitives/SheetV3";
+import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "./primitives/SheetV3";
 import { ShortcutKey } from "./primitives/ShortcutKey";
 
 export function Shortcuts() {
   return (
     <Sheet>
       <SheetTrigger asChild>
-        <Button
-          variant="small-menu-item"
-          LeadingIcon={Keyboard}
-          leadingIconClassName="text-blue-500"
+        <SideMenuItemButton
+          icon={KeyboardIcon}
+          name="Shortcuts"
           data-action="shortcuts"
-          fullWidth
-          textAlignLeft
-          shortcut={{ modifiers: ["shift"], key: "?", enabled: false }}
-          className="gap-x-0 pl-1.5"
-          iconSpacing="gap-x-1.5"
-        >
-          Shortcuts
-        </Button>
+          trailing={<ShortcutKey shortcut={{ modifiers: ["shift"], key: "?" }} variant="medium" />}
+        />
       </SheetTrigger>
       <ShortcutContent />
     </Sheet>
@@ -59,7 +46,7 @@ function ShortcutContent() {
       <SheetHeader>
         <SheetTitle>
           <div className="flex items-center gap-x-2">
-            <Keyboard className="size-5 text-indigo-500" />
+            <KeyboardIcon className="size-5 text-text-bright" />
             <span className="font-sans text-base font-medium text-text-bright">
               Keyboard shortcuts
             </span>
@@ -83,8 +70,12 @@ function ShortcutContent() {
               <ShortcutKey shortcut={{ key: "f" }} variant="medium/bright" />
             </Shortcut>
             <Shortcut name="Toggle side menu">
-              <ShortcutKey shortcut={{ modifiers: ["mod"]}} variant="medium/bright" />
+              <ShortcutKey shortcut={{ modifiers: ["mod"] }} variant="medium/bright" />
               <ShortcutKey shortcut={{ key: "b" }} variant="medium/bright" />
+            </Shortcut>
+            <Shortcut name="Favorite this page">
+              <ShortcutKey shortcut={{ modifiers: ["alt"] }} variant="medium/bright" />
+              <ShortcutKey shortcut={{ key: "f" }} variant="medium/bright" />
             </Shortcut>
             <Shortcut name="Select filter">
               <ShortcutKey shortcut={{ key: "1" }} variant="medium/bright" />

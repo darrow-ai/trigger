@@ -28,7 +28,7 @@ export default function Story() {
   return (
     <div className="bg-background-dimmed p-12">
       <Header1 className="mb-2">Small buttons</Header1>
-      <div className="grid grid-cols-4 gap-8 border-b border-charcoal-700 pb-8">
+      <div className="grid grid-cols-4 gap-8 border-b border-grid-bright pb-8">
         <div className="flex flex-col items-start gap-2">
           <Header3 className="mb-1 uppercase">Basic</Header3>
           <Button variant="primary/small">Primary button</Button>
@@ -36,6 +36,7 @@ export default function Story() {
           <Button variant="tertiary/small">Tertiary button</Button>
           <Button variant="minimal/small">Minimal button</Button>
           <Button variant="danger/small">Danger button</Button>
+          <Button variant="warning/small">Warning button</Button>
         </div>
         <div className="flex flex-col items-start gap-2">
           <Header3 className="mb-1 uppercase">Icon left</Header3>
@@ -158,13 +159,14 @@ export default function Story() {
         </div>
       </div>
       <Header1 className="mb-2 mt-8">Medium buttons</Header1>
-      <div className="grid grid-cols-4 gap-8 border-b border-charcoal-700 pb-8">
+      <div className="grid grid-cols-4 gap-8 border-b border-grid-bright pb-8">
         <div className="flex flex-col items-start gap-2">
           <Header3 className="mb-1 uppercase">Basic</Header3>
           <Button variant="primary/medium">Primary button</Button>
           <Button variant="secondary/medium">Secondary button</Button>
           <Button variant="tertiary/medium">Tertiary button</Button>
           <Button variant="danger/medium">Danger button</Button>
+          <Button variant="warning/medium">Warning button</Button>
         </div>
         <div className="flex flex-col items-start gap-2">
           <Header3 className="mb-1 uppercase">Icon left</Header3>
@@ -310,6 +312,10 @@ export default function Story() {
               />
               <span className="text-text-bright">This is a delete button</span>
             </Button>
+            <Button variant="warning/large" fullWidth>
+              <TrashIcon className="mr-1.5 h-4 w-4" />
+              <span>This is a warning button</span>
+            </Button>
           </div>
         </div>
       </div>
@@ -335,12 +341,18 @@ export default function Story() {
               />
               <span className="text-text-bright">This is a delete button</span>
             </Button>
+            <Button variant="warning/extra-large" fullWidth>
+              <TrashIcon
+                className={"mr-1.5 size-5 text-text-bright transition group-hover:text-text-bright"}
+              />
+              <span>This is a warning button</span>
+            </Button>
           </div>
         </div>
       </div>
       <Header1 className="mb-2 mt-8">Menu items</Header1>
       <div className="grid grid-cols-1">
-        <div className="flex flex-col items-start gap-1 rounded border border-charcoal-800 bg-charcoal-850 p-1">
+        <div className="flex flex-col items-start gap-1 rounded border border-background-bright bg-background-dimmed p-1">
           <Button variant="menu-item" fullWidth textAlignLeft LeadingIcon={FolderIcon}>
             Acme Inc.
           </Button>
@@ -353,7 +365,9 @@ export default function Story() {
             textAlignLeft
             LeadingIcon={GlobeAltIcon}
             TrailingIcon={isSelected ? CheckIcon : undefined}
-            className={isSelected ? "bg-charcoal-750 group-hover:bg-charcoal-750" : undefined}
+            className={
+              isSelected ? "bg-background-hover group-hover:bg-background-hover" : undefined
+            }
           >
             Item enabled
           </Button>
@@ -383,6 +397,26 @@ export default function Story() {
           >
             Disabled menu item
           </Button>
+        </div>
+      </div>
+      <Header1 className="mb-2 mt-8">Ask AI button</Header1>
+      <div className="grid grid-cols-4 gap-8 border-b border-grid-bright pb-8">
+        <div className="flex flex-col items-start gap-2">
+          <Header3 className="mb-1 uppercase">Sizes</Header3>
+          <Button variant="ask-ai/small">Ask AI</Button>
+          <Button variant="ask-ai/medium">Ask AI</Button>
+          <Button variant="ask-ai/large">Ask AI</Button>
+        </div>
+        <div className="flex flex-col items-start gap-2">
+          <Header3 className="mb-1 uppercase">Disabled</Header3>
+          <Button variant="ask-ai/small" disabled>
+            Ask AI
+          </Button>
+        </div>
+        <div className="col-span-2 self-end text-sm text-text-dimmed">
+          Reserved for the AI agent. The variant supplies the agent logo automatically, so no
+          LeadingIcon is needed. Pass one to animate it. See the "AI agent" story for the live
+          pairing.
         </div>
       </div>
     </div>

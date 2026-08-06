@@ -1,6 +1,17 @@
-import { PromptManifest, QueueManifest, TaskManifest, WorkerManifest } from "../schemas/index.js";
-import { type PromptMetadataWithFunctions, type TaskMetadataWithFunctions, type TaskSchema } from "../types/index.js";
-import { ResourceCatalog } from "./catalog.js";
+import type {
+  PromptManifest,
+  QueueManifest,
+  SkillManifest,
+  SkillMetadata,
+  TaskManifest,
+  WorkerManifest,
+} from "../schemas/index.js";
+import {
+  type PromptMetadataWithFunctions,
+  type TaskMetadataWithFunctions,
+  type TaskSchema,
+} from "../types/index.js";
+import type { ResourceCatalog } from "./catalog.js";
 
 export class NoopResourceCatalog implements ResourceCatalog {
   registerTaskMetadata(task: TaskMetadataWithFunctions): void {
@@ -20,6 +31,10 @@ export class NoopResourceCatalog implements ResourceCatalog {
   }
 
   listTaskManifests(): Array<TaskManifest> {
+    return [];
+  }
+
+  listTaskIdCollisions(): Array<{ id: string; filePaths: string[] }> {
     return [];
   }
 
@@ -68,6 +83,18 @@ export class NoopResourceCatalog implements ResourceCatalog {
   }
 
   getPromptSchema(id: string): TaskSchema | undefined {
+    return undefined;
+  }
+
+  registerSkillMetadata(skill: SkillMetadata): void {
+    // noop
+  }
+
+  listSkillManifests(): Array<SkillManifest> {
+    return [];
+  }
+
+  getSkillManifest(id: string): SkillManifest | undefined {
     return undefined;
   }
 }

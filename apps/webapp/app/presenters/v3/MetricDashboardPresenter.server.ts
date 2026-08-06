@@ -37,6 +37,9 @@ export const Widget = z.object({
   title: z.string(),
   query: z.string().default(""),
   display: QueryWidgetConfig,
+  // Opt into server-side gap fill (carry-forward for gauges, zero-fill for counters).
+  // Top-level rather than in `display` because display config is client-only and never reaches the query POST.
+  fillGaps: z.boolean().optional(),
 });
 
 export type Widget = z.infer<typeof Widget>;
@@ -58,7 +61,13 @@ export type CustomDashboard = {
   defaultPeriod: string;
 };
 
-export type BuiltInDashboardFilter = "tasks" | "queues" | "models" | "prompts" | "operations" | "providers";
+export type BuiltInDashboardFilter =
+  | "tasks"
+  | "queues"
+  | "models"
+  | "prompts"
+  | "operations"
+  | "providers";
 
 export type BuiltInDashboard = {
   key: string;

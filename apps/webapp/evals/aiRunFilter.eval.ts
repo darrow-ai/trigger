@@ -8,7 +8,7 @@ import {
   type QueryVersions,
 } from "~/v3/services/aiRunFilterService.server";
 import dotenv from "dotenv";
-import { traceAISDKModel } from "evalite/ai-sdk";
+import { wrapAISDKModel } from "evalite/ai-sdk";
 import { openai } from "@ai-sdk/openai";
 
 dotenv.config({ path: "../../.env" });
@@ -232,8 +232,12 @@ evalite("AI Run Filter", {
         expected: JSON.stringify({
           success: true,
           filters: {
-            from: new Date(new Date(Date.now() - 24*60*60*1000).toDateString() + " 14:00:00").getTime(),
-            to: new Date(new Date(Date.now() - 24*60*60*1000).toDateString() + " 14:59:59").getTime(),
+            from: new Date(
+              new Date(Date.now() - 24 * 60 * 60 * 1000).toDateString() + " 14:00:00"
+            ).getTime(),
+            to: new Date(
+              new Date(Date.now() - 24 * 60 * 60 * 1000).toDateString() + " 14:59:59"
+            ).getTime(),
           },
         }),
       },
@@ -272,7 +276,7 @@ evalite("AI Run Filter", {
         queryQueues,
         queryTasks,
       },
-      traceAISDKModel(openai("gpt-4o-mini"))
+      wrapAISDKModel(openai("gpt-4o-mini"))
     );
 
     const result = await service.call(input, "123456");

@@ -1,4 +1,4 @@
-import { SecretReference, User, type PrismaClient } from "@trigger.dev/database";
+import { type SecretReference, type User, type PrismaClient } from "@trigger.dev/database";
 import { prisma } from "~/db.server";
 import { ServiceValidationError } from "~/v3/services/baseService.server";
 import { createRandomStringGenerator } from "@better-auth/utils/random";
@@ -7,7 +7,7 @@ import { createHash } from "@better-auth/utils/hash";
 import { createOTP } from "@better-auth/utils/otp";
 import { base32 } from "@better-auth/utils/base32";
 import { z } from "zod";
-import { scheduleEmail } from "../email.server";
+import { scheduleEmail } from "../scheduleEmail.server";
 
 const generateRandomString = createRandomStringGenerator("A-Z", "0-9");
 

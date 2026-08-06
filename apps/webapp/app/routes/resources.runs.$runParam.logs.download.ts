@@ -1,127 +1,139 @@
-import { LoaderFunctionArgs } from "@remix-run/server-runtime";
+import type { LoaderFunctionArgs } from "@remix-run/server-runtime";
 import { prisma } from "~/db.server";
+import { env } from "~/env.server";
+import { runStore } from "~/v3/runStore.server";
+import { controlPlaneResolver } from "~/v3/runOpsMigration/controlPlaneResolver.server";
 import { requireUser } from "~/services/session.server";
-import { v3RunParamsSchema } from "~/utils/pathBuilder";
-import type { RunPreparedEvent } from "~/v3/eventRepository/eventRepository.types";
+import { v3RunParamsSchema, v3RunPath } from "~/utils/pathBuilder";
 import { createGzip } from "zlib";
 import { Readable } from "stream";
-import { formatDurationMilliseconds } from "@trigger.dev/core/v3/utils/durations";
 import { getTaskEventStoreTableForRun } from "~/v3/taskEventStore.server";
-import { TaskEventKind } from "@trigger.dev/database";
-import { resolveEventRepositoryForStore } from "~/v3/eventRepository/index.server";
+import { getEventRepositoryForStore } from "~/v3/eventRepository/index.server";
+import {
+  getTraceExportFormat,
+  streamTraceExport,
+  type TraceExportContext,
+} from "~/v3/eventRepository/traceExport.server";
+import { getMollifierBuffer } from "~/v3/mollifier/mollifierBuffer.server";
 
 export async function loader({ params, request }: LoaderFunctionArgs) {
   const user = await requireUser(request);
   const parsedParams = v3RunParamsSchema.pick({ runParam: true }).parse(params);
 
-  const run = await prisma.taskRun.findFirst({
-    where: {
-      friendlyId: parsedParams.runParam,
-      project: {
-        organization: {
-          members: {
-            some: {
-              userId: user.id,
-            },
-          },
-        },
-      },
-    },
-  });
+  const url = new URL(request.url);
+  // ?format=log|jsonl|markdown (default log). ?showDebug=true includes internal
+  // engine debug events; these stay admin-only (matching the admin-gated Debug
+  // toggle in the trace view) and are off by default.
+  const format = getTraceExportFormat(url.searchParams.get("format"));
+  const showDebug = url.searchParams.get("showDebug") === "true" && user.admin;
+  const filename = `${parsedParams.runParam}.${format.extension}`;
 
-  if (!run) {
+  // Run-ops read keyed by friendlyId only (routes to the owning DB by residency). Org
+  // membership is a control-plane concern resolved separately below — joining it here is a
+  // cross-DB join that returns nothing once the run lives in run-ops.
+  let run = await runStore.findRun(
+    { friendlyId: parsedParams.runParam },
+    {
+      select: {
+        friendlyId: true,
+        traceId: true,
+        organizationId: true,
+        runtimeEnvironmentId: true,
+        createdAt: true,
+        completedAt: true,
+        taskEventStore: true,
+        taskIdentifier: true,
+      },
+    }
+  );
+
+  // Authorize on the control-plane DB: the user must be a member of the run's org. A
+  // non-member is treated as not-found (matching the old scoped where) and falls through
+  // to the buffer fallback below.
+  if (run?.organizationId) {
+    const member = await prisma.orgMember.findFirst({
+      where: { userId: user.id, organizationId: run.organizationId },
+      select: { id: true },
+    });
+    if (!member) {
+      run = null;
+    }
+  }
+
+  if (!run || !run.organizationId) {
+    // Buffered run? It hasn't executed, so there's no trace — but a 404 is wrong:
+    // the run does exist and reads as "your run vanished". If the buffer entry
+    // exists (and the user is a member of its org), stream one informational line
+    // instead of a 0-byte mystery.
+    const buffer = getMollifierBuffer();
+    if (buffer) {
+      const entry = await buffer.getEntry(parsedParams.runParam);
+      if (entry) {
+        const member = await prisma.orgMember.findFirst({
+          where: { userId: user.id, organizationId: entry.orgId },
+          select: { id: true },
+        });
+        if (member) {
+          return streamGzipText(
+            `Run ${parsedParams.runParam} is queued and has not started executing yet — no trace to download.\n`,
+            filename
+          );
+        }
+      }
+    }
     return new Response("Not found", { status: 404 });
   }
 
-  const eventRepository = resolveEventRepositoryForStore(run.taskEventStore);
+  const environment = await controlPlaneResolver.resolveAuthenticatedEnv(run.runtimeEnvironmentId);
 
-  const runEvents = await eventRepository.getRunEvents(
+  if (!environment) {
+    return new Response("Not found", { status: 404 });
+  }
+
+  const eventRepository = await getEventRepositoryForStore(run.taskEventStore, run.organizationId);
+
+  // Stream the trace straight from the store to the gzip response, one event at
+  // a time, never materialising the full set or building a tree. This keeps the
+  // download bounded in memory and non-blocking regardless of how large the
+  // trace is. The chosen format renders each event as it streams through.
+  const events = eventRepository.streamTraceEvents(
     getTaskEventStoreTableForRun(run),
     run.runtimeEnvironmentId,
     run.traceId,
-    run.friendlyId,
     run.createdAt,
-    run.completedAt ?? undefined
+    run.completedAt ?? undefined,
+    { includeDebugLogs: showDebug }
   );
 
-  // Create a Readable stream from the runEvents array
-  const readable = new Readable({
-    read() {
-      runEvents.forEach((event) => {
-        try {
-          if (!user.admin && event.kind === TaskEventKind.LOG) {
-            // Only return debug logs for admins
-            return;
-          }
-          this.push(formatRunEvent(event) + "\n");
-        } catch {}
-      });
-      this.push(null); // End of stream
-    },
-  });
+  const context: TraceExportContext = {
+    runFriendlyId: run.friendlyId,
+    traceId: run.traceId,
+    taskIdentifier: run.taskIdentifier,
+    runUrl: `${env.APP_ORIGIN}${v3RunPath(
+      environment.organization,
+      environment.project,
+      environment,
+      { friendlyId: run.friendlyId }
+    )}`,
+  };
 
-  // Create a gzip transform stream
-  const gzip = createGzip();
+  return streamGzipText(streamTraceExport(events, format, context), filename);
+}
 
-  // Pipe the readable stream into the gzip stream
-  const compressedStream = readable.pipe(gzip);
+function streamGzipText(source: string | AsyncIterable<string>, filename: string): Response {
+  // `Readable.from` handles both a single string and an async generator. For
+  // the generator case it pulls lazily under backpressure, so a large trace is
+  // never fully materialised in memory — gzip drains it as fast as the client
+  // reads, and the generator pauses in between.
+  const readable = typeof source === "string" ? Readable.from([source]) : Readable.from(source);
+  const compressedStream = readable.pipe(createGzip());
 
-  // Return the response with the compressed stream
   return new Response(compressedStream as any, {
     status: 200,
     headers: {
       "Content-Type": "application/octet-stream",
-      "Content-Disposition": `attachment; filename="${parsedParams.runParam}.log"`,
+      "Content-Disposition": `attachment; filename="${filename}"`,
       "Content-Encoding": "gzip",
     },
   });
-}
-
-function formatRunEvent(event: RunPreparedEvent): string {
-  const entries = [];
-  const parts: string[] = [];
-
-  parts.push(getDateFromNanoseconds(event.startTime).toISOString());
-
-  if (event.taskSlug) {
-    parts.push(event.taskSlug);
-  }
-
-  parts.push(event.level);
-  parts.push(event.message);
-
-  if (event.level === "TRACE") {
-    parts.push(`(${formatDurationMilliseconds(event.duration / 1_000_000)})`);
-  }
-
-  entries.push(parts.join(" "));
-
-  if (event.events) {
-    for (const subEvent of event.events) {
-      if (subEvent.name === "exception") {
-        const subEventParts: string[] = [];
-
-        subEventParts.push(subEvent.time as unknown as string);
-
-        if (event.taskSlug) {
-          subEventParts.push(event.taskSlug);
-        }
-
-        subEventParts.push(subEvent.name);
-        subEventParts.push((subEvent.properties as any).exception.message);
-
-        if ((subEvent.properties as any).exception.stack) {
-          subEventParts.push((subEvent.properties as any).exception.stack);
-        }
-
-        entries.push(subEventParts.join(" "));
-      }
-    }
-  }
-
-  return entries.join("\n");
-}
-
-function getDateFromNanoseconds(nanoseconds: bigint) {
-  return new Date(Number(nanoseconds) / 1_000_000);
 }

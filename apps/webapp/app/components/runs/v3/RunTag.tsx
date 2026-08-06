@@ -1,11 +1,30 @@
 import { useCallback, useMemo, useState } from "react";
-import tagLeftPath from "./tag-left.svg";
 import { SimpleTooltip } from "~/components/primitives/Tooltip";
 import { Link } from "@remix-run/react";
 import { cn } from "~/utils/cn";
 import { ClipboardCheckIcon, ClipboardIcon, XIcon } from "lucide-react";
 
 type Tag = string | { key: string; value: string };
+
+function TagNotch() {
+  return (
+    <svg
+      width="9"
+      height="25"
+      viewBox="0 0 9 25"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      className="block h-full w-2.25"
+      aria-hidden="true"
+    >
+      <path
+        d="M8.51694 0.5H10.5V24.5H8.51694C7.17088 24.5 5.94409 23.7281 5.36161 22.5146L1.69703 14.88C0.974863 13.3755 0.974863 11.6245 1.69703 10.12L5.3616 2.48544C5.94409 1.27194 7.17088 0.5 8.51694 0.5Z"
+        vectorEffect="non-scaling-stroke"
+        className="fill-background-bright stroke-grid-bright"
+      />
+    </svg>
+  );
+}
 
 export function RunTag({
   tag,
@@ -26,8 +45,8 @@ export function RunTag({
     if (typeof tagResult === "string") {
       return (
         <>
-          <img src={tagLeftPath} alt="" className="block h-full w-[0.5625rem]" />
-          <span className="flex items-center rounded-r-sm border-y border-r border-charcoal-700 bg-charcoal-800 pr-1.5 text-text-dimmed group-hover:rounded-r-none group-has-[[href]]:group-hover:border-charcoal-650 group-has-[[href]]:group-hover:text-charcoal-300">
+          <TagNotch />
+          <span className="flex items-center rounded-r-sm border-y border-r border-grid-bright bg-background-bright pr-1.5 text-text-dimmed group-hover:rounded-r-none group-hover:group-has-[[href]]:border-border-bright group-hover:group-has-[[href]]:text-text-bright">
             {tag}
           </span>
         </>
@@ -35,11 +54,11 @@ export function RunTag({
     } else {
       return (
         <>
-          <img src={tagLeftPath} alt="" className="block h-full w-[0.5625rem]" />
-          <span className="flex items-center border-y border-r border-charcoal-700 bg-charcoal-800 pr-1.5 text-text-dimmed group-has-[[href]]:group-hover:border-charcoal-650 group-has-[[href]]:group-hover:text-charcoal-300">
+          <TagNotch />
+          <span className="flex items-center border-y border-r border-grid-bright bg-background-bright pr-1.5 text-text-dimmed group-hover:group-has-[[href]]:border-border-bright group-hover:group-has-[[href]]:text-text-bright">
             {tagResult.key}
           </span>
-          <span className="flex items-center whitespace-nowrap rounded-r-sm border-y border-r border-charcoal-700 bg-charcoal-750 px-1.5 text-text-dimmed group-hover:rounded-r-none group-has-[[href]]:group-hover:border-charcoal-650 group-has-[[href]]:group-hover:bg-charcoal-700 group-has-[[href]]:group-hover:text-charcoal-300">
+          <span className="flex items-center whitespace-nowrap rounded-r-sm border-y border-r border-grid-bright bg-background-hover px-1.5 text-text-dimmed group-hover:rounded-r-none group-hover:group-has-[[href]]:border-border-bright group-hover:group-has-[[href]]:bg-background-raised group-hover:group-has-[[href]]:text-text-bright">
             {tagResult.value}
           </span>
         </>
@@ -99,11 +118,11 @@ function CopyButton({ textToCopy, isHovered }: { textToCopy: string; isHovered: 
           onClick={copy}
           onMouseDown={(e) => e.stopPropagation()}
           className={cn(
-            "absolute -right-6 top-0 z-10 size-6 items-center justify-center rounded-r-sm border-y border-r border-charcoal-650 bg-charcoal-750",
+            "absolute -right-6 top-0 z-10 size-6 items-center justify-center rounded-r-sm border-y border-r border-border-bright bg-background-hover",
             isHovered ? "flex" : "hidden",
             copied
               ? "text-green-500"
-              : "text-text-dimmed hover:border-charcoal-600 hover:bg-charcoal-700 hover:text-text-bright"
+              : "text-text-dimmed hover:border-border-bright hover:bg-background-raised hover:text-text-bright"
           )}
         >
           {copied ? (
@@ -144,9 +163,9 @@ function DeleteButton({
           onClick={handleDelete}
           onMouseDown={(e) => e.stopPropagation()}
           className={cn(
-            "absolute -right-6 top-0 z-10 size-6 items-center justify-center rounded-r-sm border-y border-r border-charcoal-650 bg-charcoal-750",
+            "absolute -right-6 top-0 z-10 size-6 items-center justify-center rounded-r-sm border-y border-r border-border-bright bg-background-hover",
             isHovered ? "flex" : "hidden",
-            "text-text-dimmed hover:border-charcoal-600 hover:bg-charcoal-700 hover:text-rose-400"
+            "text-text-dimmed hover:border-border-bright hover:bg-background-raised hover:text-rose-400"
           )}
         >
           <XIcon className="size-3.5" />

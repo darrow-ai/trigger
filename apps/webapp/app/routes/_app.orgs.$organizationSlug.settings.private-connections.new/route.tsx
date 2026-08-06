@@ -1,5 +1,5 @@
-import { conform, useForm } from "@conform-to/react";
-import { parse } from "@conform-to/zod";
+import { getFormProps, getInputProps, getSelectProps, useForm } from "@conform-to/react";
+import { parseWithZod } from "@conform-to/zod";
 import { Form, useActionData, useParams, type MetaFunction } from "@remix-run/react";
 import { json, type ActionFunction, type LoaderFunctionArgs } from "@remix-run/server-runtime";
 import { tryCatch } from "@trigger.dev/core/utils";
@@ -12,6 +12,7 @@ import {
   PageContainer,
 } from "~/components/layout/AppLayout";
 import { Button, LinkButton } from "~/components/primitives/Buttons";
+import { ClipboardField } from "~/components/primitives/ClipboardField";
 import { Fieldset } from "~/components/primitives/Fieldset";
 import { FormButtons } from "~/components/primitives/FormButtons";
 import { FormError } from "~/components/primitives/FormError";
@@ -19,28 +20,25 @@ import { Header2, Header3 } from "~/components/primitives/Headers";
 import { Input } from "~/components/primitives/Input";
 import { InputGroup } from "~/components/primitives/InputGroup";
 import { Label } from "~/components/primitives/Label";
-import { NavBar, PageTitle } from "~/components/primitives/PageHeader";
+import { NavBar, PageAccessories, PageTitle } from "~/components/primitives/PageHeader";
 import { Paragraph } from "~/components/primitives/Paragraph";
 import { Select, SelectItem } from "~/components/primitives/Select";
 import { prisma } from "~/db.server";
 import { env } from "~/env.server";
 import { canAccessPrivateConnections } from "~/v3/canAccessPrivateConnections.server";
-import {
-  redirectWithErrorMessage,
-  redirectWithSuccessMessage,
-} from "~/models/message.server";
+import { redirectWithErrorMessage, redirectWithSuccessMessage } from "~/models/message.server";
 import type { CreatePrivateLinkConnectionBody } from "@trigger.dev/platform";
-import {
-  createPrivateLink,
-  getPrivateLinkRegions,
-} from "~/services/platform.v3.server";
+import { createPrivateLink, getPrivateLinkRegions } from "~/services/platform.v3.server";
 import { requireUserId } from "~/services/session.server";
 import {
+  docsPath,
   OrganizationParamsSchema,
   organizationPath,
   v3PrivateConnectionsPath,
 } from "~/utils/pathBuilder";
 import {
+  ArrowTopRightOnSquareIcon,
+  BookOpenIcon,
   CommandLineIcon,
   DocumentTextIcon,
   PencilSquareIcon,
@@ -69,7 +67,7 @@ export async function loader({ params, request }: LoaderFunctionArgs) {
     throw new Response(null, { status: 404, statusText: "Organization not found" });
   }
 
-  const [error, regions] = await tryCatch(getPrivateLinkRegions(organization.id));
+  const [_error, regions] = await tryCatch(getPrivateLinkRegions(organization.id));
 
   const awsAccountIds = env.PRIVATE_CONNECTIONS_AWS_ACCOUNT_IDS?.split(",").filter(Boolean) ?? [];
 
@@ -97,10 +95,10 @@ export const action: ActionFunction = async ({ request, params }) => {
   const { organizationSlug } = OrganizationParamsSchema.parse(params);
 
   const formData = await request.formData();
-  const submission = parse(formData, { schema });
+  const submission = parseWithZod(formData, { schema });
 
-  if (!submission.value || submission.intent !== "submit") {
-    return json(submission);
+  if (submission.status !== "success") {
+    return json(submission.reply());
   }
 
   const organization = await prisma.organization.findFirst({
@@ -152,7 +150,6 @@ export const action: ActionFunction = async ({ request, params }) => {
     message
   );
 };
-
 
 type SetupMethod = "manual" | "ai" | "terraform" | "docs";
 
@@ -266,7 +263,10 @@ resource "aws_lb_listener" "port_${p.port}" {
 resource "aws_vpc_endpoint_service" "trigger_privatelink" {
   acceptance_required        = false
   network_load_balancer_arns = [aws_lb.trigger_privatelink.arn]
-  supported_regions          = ["us-east-1", "eu-central-1"]
+
+  # Trigger.dev runs in us-east-1 and eu-central-1. Listing both makes this
+  # service consumable from either region so any of your tasks can connect.
+  supported_regions = ["us-east-1", "eu-central-1"]
 
   allowed_principals = [
 ${awsAccountIds.map((id) => `    "arn:aws:iam::${id}:root",`).join("\n")}
@@ -308,7 +308,7 @@ output "endpoint_service_name" {
               <select
                 value={entry.protocol}
                 onChange={(e) => updatePort(index, "protocol", e.target.value)}
-                className="rounded-md border border-charcoal-700 bg-charcoal-800 px-3 py-2 text-sm text-text-bright"
+                className="rounded-md border border-grid-bright bg-background-bright px-3 py-2 text-sm text-text-bright"
               >
                 <option value="TCP">TCP</option>
                 <option value="UDP">UDP</option>
@@ -363,8 +363,8 @@ output "endpoint_service_name" {
         </Select>
       </InputGroup>
 
-      <div className="rounded-md border border-charcoal-700 bg-charcoal-900">
-        <div className="flex items-center justify-between border-b border-charcoal-700 px-3 py-2">
+      <div className="rounded-md border border-grid-bright bg-background-deep">
+        <div className="flex items-center justify-between border-b border-grid-bright px-3 py-2">
           <span className="text-xs font-medium text-text-dimmed">main.tf</span>
           <button
             type="button"
@@ -395,9 +395,10 @@ function AIPromptWizard({ awsAccountIds }: { awsAccountIds: string[] }) {
   const validPorts = ports.filter((p) => p.port !== "");
   const regionLabel = AWS_REGIONS.find((r) => r.value === region)?.label ?? region;
 
-  const portsDescription = validPorts.length > 0
-    ? validPorts.map((p) => `${p.port} (${p.protocol})`).join(", ")
-    : "5432 (TCP)";
+  const _portsDescription =
+    validPorts.length > 0
+      ? validPorts.map((p) => `${p.port} (${p.protocol})`).join(", ")
+      : "5432 (TCP)";
 
   const prompt = `I need to set up AWS PrivateLink so that Trigger.dev can connect to my resource. Please create the following in my AWS account in the ${region} (${regionLabel}) region:
 
@@ -418,7 +419,7 @@ ${validPorts.length > 0 ? validPorts.map((p) => `   - Port ${p.port} (${p.protoc
 3. A VPC Endpoint Service:
    - Acceptance required: no
    - Attach the NLB created above
-   - Supported regions: us-east-1, eu-central-1
+   - Supported regions: us-east-1, eu-central-1 (these are the AWS regions Trigger.dev runs in, so the service must be consumable from both)
    - Allowed principals:
 ${awsAccountIds.map((id) => `     - arn:aws:iam::${id}:root`).join("\n") || "     - <Trigger.dev AWS account ARN>"}
 
@@ -453,7 +454,7 @@ After creating everything, give me the VPC Endpoint Service name (it looks like 
               <select
                 value={entry.protocol}
                 onChange={(e) => updatePort(index, "protocol", e.target.value)}
-                className="rounded-md border border-charcoal-700 bg-charcoal-800 px-3 py-2 text-sm text-text-bright"
+                className="rounded-md border border-grid-bright bg-background-bright px-3 py-2 text-sm text-text-bright"
               >
                 <option value="TCP">TCP</option>
                 <option value="UDP">UDP</option>
@@ -508,8 +509,8 @@ After creating everything, give me the VPC Endpoint Service name (it looks like 
         </Select>
       </InputGroup>
 
-      <div className="rounded-md border border-charcoal-700 bg-charcoal-900">
-        <div className="flex items-center justify-between border-b border-charcoal-700 px-3 py-2">
+      <div className="rounded-md border border-grid-bright bg-background-deep">
+        <div className="flex items-center justify-between border-b border-grid-bright px-3 py-2">
           <span className="text-xs font-medium text-text-dimmed">AI Prompt</span>
           <button
             type="button"
@@ -531,22 +532,37 @@ export default function Page() {
   const { availableRegions, activeRegions, awsAccountIds } = useTypedLoaderData<typeof loader>();
   const { organizationSlug } = useParams();
   const lastSubmission = useActionData();
-  const [setupMethod, setSetupMethod] = useState<SetupMethod | null>(null);
+  const [setupMethod, setSetupMethod] = useState<SetupMethod | null>("manual");
 
   const defaultRegion = "us-east-1";
 
   const [form, { name, endpointServiceName, targetRegion }] = useForm({
     id: "create-private-connection",
-    lastSubmission: lastSubmission as any,
+    lastResult: lastSubmission as any,
     onValidate({ formData }) {
-      return parse(formData, { schema });
+      return parseWithZod(formData, { schema });
     },
   });
 
   return (
     <PageContainer>
       <NavBar>
-        <PageTitle title="Add Private Connection" backButton={{ to: v3PrivateConnectionsPath({ slug: organizationSlug! }), text: "Private Connections" }} />
+        <PageTitle
+          title="Add Private Connection"
+          backButton={{
+            to: v3PrivateConnectionsPath({ slug: organizationSlug! }),
+            text: "Private Connections",
+          }}
+        />
+        <PageAccessories>
+          <LinkButton
+            variant="docs/small"
+            LeadingIcon={BookOpenIcon}
+            to={docsPath("private-networking/overview")}
+          >
+            Private connection docs
+          </LinkButton>
+        </PageAccessories>
       </NavBar>
       <PageBody scrollable={true}>
         <MainHorizontallyCenteredContainer className="max-w-3xl">
@@ -567,7 +583,7 @@ export default function Page() {
                 className={`rounded-lg border p-4 text-left transition ${
                   setupMethod === "manual"
                     ? "border-indigo-500 bg-indigo-500/10"
-                    : "border-grid-dimmed hover:border-charcoal-600"
+                    : "border-grid-dimmed hover:border-border-bright"
                 }`}
               >
                 <PencilSquareIcon className="mb-2 h-5 w-5 text-indigo-400" />
@@ -582,7 +598,7 @@ export default function Page() {
                 className={`rounded-lg border p-4 text-left transition ${
                   setupMethod === "ai"
                     ? "border-indigo-500 bg-indigo-500/10"
-                    : "border-grid-dimmed hover:border-charcoal-600"
+                    : "border-grid-dimmed hover:border-border-bright"
                 }`}
               >
                 <SparklesIcon className="mb-2 h-5 w-5 text-purple-400" />
@@ -597,7 +613,7 @@ export default function Page() {
                 className={`rounded-lg border p-4 text-left transition ${
                   setupMethod === "terraform"
                     ? "border-indigo-500 bg-indigo-500/10"
-                    : "border-grid-dimmed hover:border-charcoal-600"
+                    : "border-grid-dimmed hover:border-border-bright"
                 }`}
               >
                 <CommandLineIcon className="mb-2 h-5 w-5 text-emerald-400" />
@@ -612,7 +628,7 @@ export default function Page() {
                 className={`rounded-lg border p-4 text-left transition ${
                   setupMethod === "docs"
                     ? "border-indigo-500 bg-indigo-500/10"
-                    : "border-grid-dimmed hover:border-charcoal-600"
+                    : "border-grid-dimmed hover:border-border-bright"
                 }`}
               >
                 <DocumentTextIcon className="mb-2 h-5 w-5 text-amber-400" />
@@ -642,7 +658,7 @@ export default function Page() {
                 <Header3 spacing>Terraform Configuration</Header3>
                 <Paragraph variant="small" className="mb-4">
                   Fill in your resource details below and we'll generate a Terraform script. Run{" "}
-                  <code className="rounded bg-charcoal-800 px-1 py-0.5 text-xs">
+                  <code className="rounded bg-background-bright px-1 py-0.5 text-xs">
                     terraform apply
                   </code>{" "}
                   to create the VPC Endpoint Service, then paste the output service name below.
@@ -651,7 +667,7 @@ export default function Page() {
               </div>
             )}
 
-            {/* Docs iframe */}
+            {/* Docs link */}
             {setupMethod === "docs" && (
               <div className="mb-6 rounded-lg border border-grid-dimmed p-4">
                 <Header3 spacing>Setup Guide</Header3>
@@ -659,37 +675,47 @@ export default function Page() {
                   <>
                     <Paragraph variant="small" className="mb-3">
                       When adding allowed principals to your VPC Endpoint Service, use the following
-                      AWS account ID(s):
+                      AWS account ARN(s):
                     </Paragraph>
-                    <div className="mb-4 rounded-md border border-charcoal-700 bg-charcoal-900 p-3">
+                    <div className="mb-4 space-y-2">
                       {awsAccountIds.map((id) => (
-                        <code key={id} className="text-sm text-emerald-400">
-                          {id}
-                        </code>
+                        <ClipboardField
+                          key={id}
+                          value={`arn:aws:iam::${id}:root`}
+                          variant="primary/medium"
+                        />
                       ))}
                     </div>
                   </>
                 )}
-                <iframe
-                  src="https://trigger.dev/docs/network/private-link-setup-guide"
-                  title="Private Link Setup Guide"
-                  className="h-[600px] w-full rounded-md border border-charcoal-700"
-                />
+                <Paragraph variant="small" className="mb-3">
+                  Follow the step-by-step guide in our docs to create a VPC Endpoint Service in the
+                  AWS Console, then come back here to add the connection.
+                </Paragraph>
+                <LinkButton
+                  to={docsPath("private-networking/aws-console-setup")}
+                  variant="primary/medium"
+                  TrailingIcon={ArrowTopRightOnSquareIcon}
+                >
+                  Open setup guide
+                </LinkButton>
               </div>
             )}
 
-            {/* AWS account IDs reference */}
-            {setupMethod === "manual" && (
+            {/* AWS account ARNs reference */}
+            {setupMethod === "manual" && awsAccountIds.length > 0 && (
               <div className="mb-6 rounded-lg border border-grid-dimmed p-4">
-                <Paragraph variant="small" className="mb-2">
-                  Add the following AWS account ID(s) to your VPC Endpoint Service's allowed
+                <Paragraph variant="small" className="mb-3">
+                  Add the following AWS account ARN(s) to your VPC Endpoint Service's allowed
                   principals:
                 </Paragraph>
-                <div className="rounded-md border border-charcoal-700 bg-charcoal-900 p-3">
+                <div className="space-y-2">
                   {awsAccountIds.map((id) => (
-                    <code key={id} className="text-sm text-emerald-400">
-                      {id}
-                    </code>
+                    <ClipboardField
+                      key={id}
+                      value={`arn:aws:iam::${id}:root`}
+                      variant="primary/medium"
+                    />
                   ))}
                 </div>
               </div>
@@ -698,30 +724,30 @@ export default function Page() {
             {/* Connection form (always visible) */}
             <div className="rounded-lg border border-grid-dimmed p-4">
               <Header3 spacing>Connection Details</Header3>
-              <Form method="post" {...form.props}>
+              <Form method="post" {...getFormProps(form)}>
                 <Fieldset>
                   <InputGroup fullWidth>
                     <Label htmlFor={name.id} required>
                       Friendly name
                     </Label>
                     <Input
-                      {...conform.input(name, { type: "text" })}
+                      {...getInputProps(name, { type: "text" })}
                       placeholder="e.g., Production Database, Redis Cache"
                       fullWidth
                     />
-                    <FormError id={name.errorId}>{name.error}</FormError>
+                    <FormError id={name.errorId}>{name.errors}</FormError>
                   </InputGroup>
                   <InputGroup fullWidth>
                     <Label htmlFor={endpointServiceName.id} required>
                       VPC Endpoint Service name
                     </Label>
                     <Input
-                      {...conform.input(endpointServiceName, { type: "text" })}
+                      {...getInputProps(endpointServiceName, { type: "text" })}
                       placeholder="com.amazonaws.vpce.us-east-1.vpce-svc-0123456789abcdef0"
                       fullWidth
                     />
                     <FormError id={endpointServiceName.errorId}>
-                      {endpointServiceName.error}
+                      {endpointServiceName.errors}
                     </FormError>
                   </InputGroup>
                   <InputGroup fullWidth>
@@ -729,9 +755,9 @@ export default function Page() {
                       Target region
                     </Label>
                     <select
-                      {...conform.input(targetRegion)}
+                      {...getSelectProps(targetRegion)}
                       defaultValue={defaultRegion}
-                      className="w-full rounded-md border border-charcoal-700 bg-charcoal-800 px-3 py-2 text-sm text-text-bright"
+                      className="w-full rounded-md border border-grid-bright bg-background-bright px-3 py-2 text-sm text-text-bright"
                     >
                       {availableRegions.map((region: string) => (
                         <option key={region} value={region}>
@@ -739,7 +765,7 @@ export default function Page() {
                         </option>
                       ))}
                     </select>
-                    <FormError id={targetRegion.errorId}>{targetRegion.error}</FormError>
+                    <FormError id={targetRegion.errorId}>{targetRegion.errors}</FormError>
                     {activeRegions.length > 0 && (
                       <Paragraph variant="extra-small" className="text-text-dimmed">
                         Your tasks have recently run in: {activeRegions.join(", ")}

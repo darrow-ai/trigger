@@ -1,10 +1,13 @@
 import { type z } from "zod";
+import type { PrismaClient } from "@trigger.dev/database";
 import { prisma, type PrismaClientOrTransaction } from "~/db.server";
 import {
+  FEATURE_FLAG,
+  type FeatureFlagCatalogSchema,
   type FeatureFlagKey,
   FeatureFlagCatalog,
-  FeatureFlagCatalogSchema,
 } from "~/v3/featureFlags";
+import { stampMintKindFlip } from "~/v3/runOpsMigration/mintFlipGrace";
 
 export type FlagsOptions<T extends FeatureFlagKey> = {
   key: T;
@@ -50,6 +53,32 @@ export function makeFlag(_prisma: PrismaClientOrTransaction = prisma) {
   }
 
   return flag;
+}
+
+const cachedFlagStore = new Map<string, { value: unknown; expiresAt: number }>();
+
+/**
+ * flag() behind a short process-level TTL cache, for global flags read on hot
+ * paths (e.g. the root loader) where a database round-trip per request is too
+ * expensive. Flips propagate within ttlMs per process. Overrides are rejected
+ * by the type: a scoped resolution must never be reused across scopes.
+ */
+export async function cachedFlag<T extends FeatureFlagKey>(
+  opts: Omit<FlagsOptions<T>, "overrides"> & {
+    defaultValue: z.infer<(typeof FeatureFlagCatalog)[T]>;
+  },
+  ttlMs = 30_000
+): Promise<z.infer<(typeof FeatureFlagCatalog)[T]>> {
+  // defaultValue resolves the flag when the row is absent, so it's part of the key
+  const cacheKey = `${opts.key}:${JSON.stringify(opts.defaultValue)}`;
+  const hit = cachedFlagStore.get(cacheKey);
+  if (hit && hit.expiresAt > Date.now()) {
+    return hit.value as z.infer<(typeof FeatureFlagCatalog)[T]>;
+  }
+
+  const value = await flag(opts);
+  cachedFlagStore.set(cacheKey, { value, expiresAt: Date.now() + ttlMs });
+  return value;
 }
 
 export function makeSetFlag(_prisma: PrismaClientOrTransaction = prisma) {
@@ -145,4 +174,46 @@ export function makeSetMultipleFlags(_prisma: PrismaClientOrTransaction = prisma
 
     return updatedFlags;
   };
+}
+
+// Read -> stamp -> write the global mint-kind grace metadata in one transaction. The three
+// FeatureFlag rows may not exist yet, so a row FOR UPDATE can't lock them; an advisory xact lock
+// serializes concurrent global flips so one can't clobber another's grace stamp (mirrors per-org).
+export async function applyGlobalMintKindFlip(
+  client: PrismaClient,
+  requestedFlags: Partial<z.infer<typeof FeatureFlagCatalogSchema>>,
+  graceMs: number
+): Promise<{ key: string; value: any }[]> {
+  return client.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('runops-global-mint-kind-flip'))`;
+
+    const existingRows = await tx.featureFlag.findMany({
+      where: {
+        key: {
+          in: [
+            FEATURE_FLAG.runOpsMintKind,
+            FEATURE_FLAG.runOpsMintKindPrev,
+            FEATURE_FLAG.runOpsMintKindFlippedAt,
+          ],
+        },
+      },
+      select: { key: true, value: true },
+    });
+    const existingGlobal: Record<string, unknown> = {};
+    for (const row of existingRows) {
+      existingGlobal[row.key] = row.value;
+    }
+
+    // Anchor the cutover to the control-plane DB clock, not this process's wall clock.
+    const [{ now }] = await tx.$queryRaw<{ now: Date }[]>`SELECT now() AS now`;
+
+    const stamped = stampMintKindFlip(
+      existingGlobal,
+      { ...requestedFlags },
+      now.getTime(),
+      graceMs
+    ) as Partial<z.infer<typeof FeatureFlagCatalogSchema>>;
+
+    return makeSetMultipleFlags(tx)(stamped);
+  });
 }

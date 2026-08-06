@@ -67,7 +67,7 @@ export function UsageBar({ current, billingLimit, tierLimit, isPaying }: UsageBa
             animate={{ width: tierRunLimitPercentage + "%" }}
             transition={{ duration: 1.5, type: "spring" }}
             style={{ width: `${tierRunLimitPercentage}%` }}
-            className="absolute h-3 rounded-l-sm bg-green-900/50"
+            className="absolute h-3 rounded-l-sm bg-green-900/20"
           >
             <Legend
               text={isPaying ? `Included usage:` : `Tier limit:`}
@@ -110,7 +110,7 @@ function Legend({ text, value, position, percentage, tooltipContent }: LegendPro
   return (
     <div
       className={cn(
-        "absolute left-full z-10 flex border-charcoal-500",
+        "absolute left-full z-10 flex border-border-brightest",
         positions[position],
         flipLegendPosition === true ? "-translate-x-full border-r" : "border-l"
       )}

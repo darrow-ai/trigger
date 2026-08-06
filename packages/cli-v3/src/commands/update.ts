@@ -1,9 +1,14 @@
 import { confirm, intro, isCancel, log, outro } from "@clack/prompts";
-import { Command } from "commander";
+import type { Command } from "commander";
 import { detectPackageManager, installDependencies } from "nypm";
 import { dirname, join, resolve } from "path";
-import { PackageJson, readPackageJSON, type ResolveOptions, resolvePackageJSON } from "pkg-types";
-import { z } from "zod";
+import {
+  type PackageJson,
+  readPackageJSON,
+  type ResolveOptions,
+  resolvePackageJSON,
+} from "pkg-types";
+import type { z } from "zod";
 import { CommonCommandOptions, OutroCommandError, wrapCommandAction } from "../cli/common.js";
 import { chalkError, prettyError, prettyWarning } from "../utilities/cliOutput.js";
 import { removeFile, writeJSONFilePreserveOrder } from "../utilities/fileSystem.js";
@@ -66,12 +71,34 @@ export async function updateTriggerPackages(
 
   const projectPath = resolve(process.cwd(), dir);
 
-  const { packageJson, readonlyPackageJson, packageJsonPath } = await getPackageJson(projectPath);
+  let packageJsonResult: Awaited<ReturnType<typeof getPackageJson>> | undefined;
 
-  if (!packageJson) {
-    log.error("Failed to load package.json. Try to re-run with `-l debug` to see what's going on.");
+  try {
+    packageJsonResult = await getPackageJson(projectPath);
+  } catch (error) {
+    // resolvePackageJSON throws when there's no package.json in projectPath or any parent
+    // directory — usually because the command ran before the project was set up. Don't crash
+    // with a raw stack trace; fall through to the actionable guidance below.
+    logger.debug("Failed to resolve package.json for update check", { projectPath, error });
+  }
+
+  if (!packageJsonResult?.packageJson) {
+    prettyError(
+      "No package.json found",
+      `Couldn't find a package.json in ${projectPath} or any parent directory.`,
+      "Run `npx trigger.dev@latest init` to set up your project, then try again."
+    );
+
+    // When embedded in another command (e.g. `dev`), there's nothing to run without a project,
+    // so stop here with a clean exit instead of letting the caller fail again downstream.
+    if (embedded) {
+      process.exit(1);
+    }
+
     return false;
   }
+
+  const { packageJson, readonlyPackageJson, packageJsonPath } = packageJsonResult;
 
   const newCliVersion = await updateCheck();
 
@@ -371,7 +398,7 @@ function mutatePackageJsonWithUpdatedPackages(
   depsToUpdate: Dependency[],
   targetVersion: string
 ) {
-  for (const { type, name, version } of depsToUpdate) {
+  for (const { type, name, version: _version } of depsToUpdate) {
     if (!packageJson[type]) {
       throw new Error(
         `No ${type} entry found in package.json. Please try to upgrade manually instead.`

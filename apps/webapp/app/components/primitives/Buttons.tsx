@@ -9,6 +9,7 @@ import React, {
 } from "react";
 import { type ShortcutDefinition, useShortcutKeys } from "~/hooks/useShortcutKeys";
 import { cn } from "~/utils/cn";
+import { AgentDotMatrix } from "./AgentDotMatrix";
 import { ShortcutKey } from "./ShortcutKey";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./Tooltip";
 import { Icon, type RenderIcon } from "./Icon";
@@ -17,6 +18,15 @@ import { Spinner } from "./Spinner";
 const sizes = {
   small: {
     button: "h-6 px-2.5 text-xs",
+    icon: "h-3.5 -mx-1",
+    iconSpacing: "gap-x-2.5",
+    shortcutVariant: "small" as const,
+    shortcut: "-ml-0.5 -mr-1.5 justify-self-center",
+  },
+  // Icon-only small button: fixed width so a row of icon buttons (with different icon
+  // aspect ratios) lines up, e.g. the queue block accessories.
+  "small-icon": {
+    button: "h-6 min-w-[34px] px-2 text-xs",
     icon: "h-3.5 -mx-1",
     iconSpacing: "gap-x-2.5",
     shortcutVariant: "small" as const,
@@ -49,18 +59,17 @@ type Size = keyof typeof sizes;
 
 const theme = {
   primary: {
-    textColor:
-      "text-text-bright group-hover/button:text-white transition group-disabled/button:text-text-dimmed",
+    textColor: "text-white transition group-disabled/button:text-white/60",
     button:
       "bg-indigo-600 border border-indigo-500 group-hover/button:bg-indigo-500 group-hover/button:border-indigo-400 group-disabled/button:opacity-50 group-disabled/button:bg-indigo-600 group-disabled/button:border-indigo-500 group-disabled/button:pointer-events-none",
     shortcut:
-      "border-text-bright/40 text-text-bright group-hover/button:border-text-bright/60 group-hover/button:text-text-bright",
-    icon: "text-text-bright",
+      "border-white/40 text-white group-hover/button:border-white/60 group-hover/button:text-white",
+    icon: "text-white",
   },
   secondary: {
     textColor: "text-text-bright transition group-disabled/button:text-text-dimmed/80",
     button:
-      "bg-secondary group-hover/button:bg-charcoal-600 group-hover/button:border-charcoal-550 border border-charcoal-600 group-disabled/button:bg-secondary group-disabled/button:opacity-60 group-disabled/button:pointer-events-none",
+      "bg-secondary border border-border-bright/50 shadow-xs group-hover/button:bg-background-raised group-disabled/button:bg-secondary group-disabled/button:opacity-60 group-disabled/button:pointer-events-none",
     shortcut:
       "border-text-dimmed/40 text-text-dimmed group-hover/button:text-text-bright group-hover/button:border-text-dimmed",
     icon: "text-text-bright",
@@ -68,7 +77,7 @@ const theme = {
   tertiary: {
     textColor: "text-text-bright transition group-disabled/button:text-text-dimmed/80",
     button:
-      "bg-tertiary group-hover/button:bg-charcoal-600 group-disabled/button:bg-tertiary group-disabled/button:opacity-60 group-disabled/button:pointer-events-none",
+      "bg-tertiary group-hover/button:bg-surface-control group-disabled/button:bg-tertiary group-disabled/button:opacity-60 group-disabled/button:pointer-events-none",
     shortcut:
       "border-text-dimmed/40 text-text-dimmed group-hover/button:text-text-bright group-hover/button:border-text-dimmed",
     icon: "text-text-bright",
@@ -82,20 +91,38 @@ const theme = {
     icon: "text-text-dimmed",
   },
   danger: {
-    textColor:
-      "text-text-bright group-hover/button:text-white transition group-disabled/button:text-text-bright/80",
+    textColor: "text-white transition group-disabled/button:text-white/80",
     button:
       "bg-error group-hover/button:bg-rose-500 disabled:opacity-50 group-disabled/button:bg-error group-disabled/button:pointer-events-none",
-    shortcut: "border-text-bright text-text-bright group-hover/button:border-bright/60",
-    icon: "text-text-bright",
+    shortcut: "border-white text-white group-hover/button:border-white/60",
+    icon: "text-white",
+  },
+  warning: {
+    textColor: "text-warning transition group-disabled/button:text-warning/60",
+    button:
+      "bg-warning/10 border border-warning/20 group-hover/button:bg-warning/20 group-hover/button:border-warning/40 group-disabled/button:opacity-60 group-disabled/button:pointer-events-none",
+    shortcut: "border-warning/40 text-warning group-hover/button:border-warning/60",
+    icon: "text-warning",
   },
   docs: {
-    textColor: "text-blue-200/70 transition group-disabled/button:text-text-dimmed/80",
+    textColor:
+      // System themes: monochrome label, the book icon keeps the blue
+      "text-callout-docs-text/70 system:text-text-bright transition group-disabled/button:text-text-dimmed/80",
     button:
-      "bg-charcoal-700 border border-charcoal-600/50 shadow group-hover/button:bg-charcoal-650 group-disabled/button:bg-tertiary group-disabled/button:opacity-60 group-disabled/button:pointer-events-none",
+      "bg-secondary border border-border-bright/50 shadow-xs group-hover/button:bg-background-raised group-disabled/button:bg-tertiary group-disabled/button:opacity-60 group-disabled/button:pointer-events-none",
     shortcut:
       "border-text-dimmed/40 text-text-dimmed group-hover/button:text-text-bright group-hover/button:border-text-dimmed",
     icon: "text-blue-500",
+  },
+  // Reserved for the AI agent's "Ask AI" affordance: secondary styling with a
+  // softened trigger-green border.
+  "ask-ai": {
+    textColor: "text-text-bright transition group-disabled/button:text-text-dimmed/80",
+    button:
+      "cursor-pointer bg-secondary border border-[#41FF54]/25 group-hover/button:bg-surface-control group-hover/button:border-[#41FF54]/40 group-disabled/button:bg-secondary group-disabled/button:opacity-60 group-disabled/button:cursor-default group-disabled/button:pointer-events-none",
+    shortcut:
+      "border-text-dimmed/40 text-text-dimmed group-hover/button:text-text-bright group-hover/button:border-text-dimmed",
+    icon: "text-text-bright",
   },
 };
 
@@ -109,6 +136,24 @@ function createVariant(sizeName: Size, themeName: Theme) {
     iconSpacing: sizes[sizeName].iconSpacing,
     shortcutVariant: sizes[sizeName].shortcutVariant,
     shortcut: cn(sizes[sizeName].shortcut, theme[themeName].shortcut),
+    // Rendered as the leading icon when the caller doesn't pass one.
+    defaultLeadingIcon: undefined as RenderIcon | undefined,
+  };
+}
+
+// The ask-ai button always leads with the square agent logo, so it supplies its
+// own leading icon and its padding is tuned around it: small = 16px logo, 4px
+// left / 6px right; medium 32/16 -> 8px; large 40/20 -> 10px. Pass an explicit
+// `LeadingIcon` (e.g. an <AgentDotMatrix active />) to animate it.
+function createAskAiVariant(sizeName: Size, opticalPadding: string, logoSize: number) {
+  const base = createVariant(sizeName, "ask-ai");
+  return {
+    ...base,
+    button: cn(base.button, opticalPadding),
+    iconSpacing: "gap-x-1.5",
+    defaultLeadingIcon: (
+      <AgentDotMatrix size={logoSize} palette="mono" restColor="#ffffff" decorative />
+    ),
   };
 }
 
@@ -118,6 +163,7 @@ const variant = {
   "primary/large": createVariant("large", "primary"),
   "primary/extra-large": createVariant("extra-large", "primary"),
   "secondary/small": createVariant("small", "secondary"),
+  "secondary/small-icon": createVariant("small-icon", "secondary"),
   "secondary/medium": createVariant("medium", "secondary"),
   "secondary/large": createVariant("large", "secondary"),
   "secondary/extra-large": createVariant("extra-large", "secondary"),
@@ -133,41 +179,51 @@ const variant = {
   "danger/medium": createVariant("medium", "danger"),
   "danger/large": createVariant("large", "danger"),
   "danger/extra-large": createVariant("extra-large", "danger"),
+  "warning/small": createVariant("small", "warning"),
+  "warning/medium": createVariant("medium", "warning"),
+  "warning/large": createVariant("large", "warning"),
+  "warning/extra-large": createVariant("extra-large", "warning"),
   "docs/small": createVariant("small", "docs"),
   "docs/medium": createVariant("medium", "docs"),
   "docs/large": createVariant("large", "docs"),
   "docs/extra-large": createVariant("extra-large", "docs"),
+  "ask-ai/small": createAskAiVariant("small", "px-1 pr-1.5", 16),
+  "ask-ai/medium": createAskAiVariant("medium", "px-2", 16),
+  "ask-ai/large": createAskAiVariant("large", "px-2.5", 20),
   "menu-item": {
     textColor: "text-text-bright px-1",
     button:
-      "h-9 px-[0.475rem] text-sm rounded-sm bg-transparent group-hover/button:bg-charcoal-750",
+      "h-9 px-[0.475rem] text-sm rounded-sm bg-transparent group-hover/button:bg-background-hover",
     icon: "h-5",
     iconSpacing: "gap-x-0.5",
     shortcutVariant: undefined,
     shortcut: undefined,
+    defaultLeadingIcon: undefined,
   },
   "small-menu-item": {
     textColor: "text-text-bright",
     button:
-      "h-[1.8rem] px-[0.4rem] text-2sm rounded-sm text-text-dimmed bg-transparent group-hover/button:bg-charcoal-750",
+      "h-[1.8rem] px-[0.4rem] text-2sm rounded-sm text-text-dimmed bg-transparent group-hover/button:bg-background-hover",
     icon: "h-[1.125rem]",
     iconSpacing: "gap-x-1.5",
     shortcutVariant: undefined,
     shortcut: undefined,
+    defaultLeadingIcon: undefined,
   },
   "small-menu-sub-item": {
     textColor: "text-text-dimmed",
     button:
-      "h-[1.8rem] px-[0.5rem] ml-5 text-2sm rounded-sm text-text-dimmed bg-transparent group-hover/button:bg-charcoal-750 focus-custom",
+      "h-[1.8rem] px-2 ml-5 text-2sm rounded-sm text-text-dimmed bg-transparent group-hover/button:bg-background-hover focus-custom",
     icon: undefined,
     iconSpacing: undefined,
     shortcutVariant: undefined,
     shortcut: undefined,
+    defaultLeadingIcon: undefined,
   },
 };
 
 const allVariants = {
-  $all: "font-normal text-center font-sans justify-center items-center shrink-0 transition duration-150 rounded-[3px] select-none group-focus/button:outline-none group-disabled/button:opacity-75 group-disabled/button:pointer-events-none focus-custom",
+  $all: "cursor-pointer font-normal text-center font-sans justify-center items-center shrink-0 transition duration-150 rounded-[3px] select-none group-focus/button:outline-hidden group-disabled/button:opacity-75 group-disabled/button:pointer-events-none focus-custom",
   variant: variant,
 };
 
@@ -219,6 +275,8 @@ export function ButtonContent(props: ButtonContentPropsType) {
   }, [isLoading]);
 
   const variation = allVariants.variant[props.variant];
+  // Some variants (ask-ai) always lead with their own glyph unless overridden.
+  const leadingIcon = LeadingIcon ?? variation.defaultLeadingIcon;
 
   const btnClassName = cn(allVariants.$all, variation.button);
   const iconClassName = variation.icon;
@@ -248,9 +306,9 @@ export function ButtonContent(props: ButtonContentPropsType) {
             showSpinner && "invisible"
           )}
         >
-          {LeadingIcon && (
+          {leadingIcon && (
             <Icon
-              icon={LeadingIcon}
+              icon={leadingIcon}
               className={cn(
                 iconClassName,
                 variation.icon,
@@ -305,7 +363,7 @@ export function ButtonContent(props: ButtonContentPropsType) {
       <TooltipProvider>
         <Tooltip>
           <TooltipTrigger asChild>{buttonContent}</TooltipTrigger>
-          <TooltipContent className="flex items-center gap-3 py-1.5 pl-2.5 pr-3 text-xs text-text-bright">
+          <TooltipContent className="flex items-center gap-1.5 py-1.5 pl-2.5 pr-2 text-xs text-text-bright">
             {tooltip} {shortcut && renderShortcutKey()}
           </TooltipContent>
         </Tooltip>
@@ -318,12 +376,12 @@ export function ButtonContent(props: ButtonContentPropsType) {
 
 type ButtonPropsType = Pick<
   JSX.IntrinsicElements["button"],
-  "type" | "disabled" | "onClick" | "name" | "value" | "form" | "autoFocus"
+  "type" | "disabled" | "onClick" | "name" | "value" | "form" | "autoFocus" | "aria-label"
 > &
   React.ComponentProps<typeof ButtonContent>;
 
 export const Button = forwardRef<HTMLButtonElement, ButtonPropsType>(
-  ({ type, disabled, autoFocus, onClick, ...props }, ref) => {
+  ({ type, disabled, autoFocus, onClick, "aria-label": ariaLabel, ...props }, ref) => {
     const innerRef = useRef<HTMLButtonElement>(null);
     useImperativeHandle(ref, () => innerRef.current as HTMLButtonElement);
 
@@ -343,7 +401,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonPropsType>(
 
     const buttonElement = (
       <button
-        className={cn("group/button outline-none focus-custom", props.fullWidth ? "w-full" : "")}
+        className={cn("group/button outline-hidden focus-custom", props.fullWidth ? "w-full" : "")}
         type={type}
         disabled={isDisabled}
         onClick={onClick}
@@ -352,8 +410,13 @@ export const Button = forwardRef<HTMLButtonElement, ButtonPropsType>(
         ref={innerRef}
         form={props.form}
         autoFocus={autoFocus}
+        aria-label={ariaLabel}
       >
-        <ButtonContent {...props} tooltip={undefined} />
+        <ButtonContent
+          {...props}
+          tooltip={undefined}
+          hideShortcutKey={props.tooltip ? true : props.hideShortcutKey}
+        />
       </button>
     );
 
@@ -362,13 +425,12 @@ export const Button = forwardRef<HTMLButtonElement, ButtonPropsType>(
         <TooltipProvider>
           <Tooltip>
             <TooltipTrigger asChild>
-              <span className={isDisabled ? "cursor-default" : undefined}>
-                {buttonElement}
-              </span>
+              <span className={cn("flex", isDisabled && "cursor-default")}>{buttonElement}</span>
             </TooltipTrigger>
-            <TooltipContent className="flex items-center gap-3 py-1.5 pl-2.5 pr-3 text-xs text-text-bright">
-              {props.tooltip} {props.shortcut && !props.hideShortcutKey && (
-                <ShortcutKey shortcut={props.shortcut} variant="medium" className="ml-1" />
+            <TooltipContent className="flex items-center gap-1.5 py-1.5 pl-2.5 pr-2 text-xs text-text-bright">
+              {props.tooltip}{" "}
+              {props.shortcut && !props.hideShortcutKey && (
+                <ShortcutKey shortcut={props.shortcut} variant="medium" />
               )}
             </TooltipContent>
           </Tooltip>
@@ -396,7 +458,7 @@ export const LinkButton = ({
   ...props
 }: LinkPropsType) => {
   const innerRef = useRef<HTMLAnchorElement>(null);
-  
+
   useShortcutKeys({
     shortcut: props.shortcut,
     action: () => {
@@ -411,7 +473,7 @@ export const LinkButton = ({
     return (
       <div
         className={cn(
-          "group/button pointer-events-none cursor-default opacity-40 outline-none",
+          "group/button pointer-events-none cursor-default opacity-40 outline-hidden",
           props.fullWidth ? "w-full" : ""
         )}
       >
@@ -462,7 +524,7 @@ export const NavLinkButton = ({ to, className, target, ...props }: NavLinkPropsT
   return (
     <NavLink
       to={to}
-      className={cn("group/button outline-none block", props.fullWidth ? "w-full" : "")}
+      className={cn("group/button outline-hidden block", props.fullWidth ? "w-full" : "")}
       target={target}
     >
       {({ isActive, isPending }) => (

@@ -1,13 +1,16 @@
-import { Logger, LogLevel } from "@trigger.dev/core/logger";
-import Redis, { RedisOptions } from "ioredis";
+import type { LogLevel } from "@trigger.dev/core/logger";
+import { Logger } from "@trigger.dev/core/logger";
+import type { RedisOptions } from "ioredis";
+import Redis from "ioredis";
+import { defaultReconnectOnError } from "@internal/redis";
 import { env } from "~/env.server";
-import { StreamIngestor, StreamResponder, StreamResponseOptions } from "./types";
+import type { StreamIngestor, StreamResponder, StreamResponseOptions } from "./types";
 
 export type RealtimeStreamsOptions = {
   redis: RedisOptions | undefined;
   logger?: Logger;
   logLevel?: LogLevel;
-  inactivityTimeoutMs?: number; // Close stream after this many ms of no new data (default: 60000)
+  inactivityTimeoutMs?: number; // Close stream after this many ms of no new data (default: 15000)
 };
 
 // Legacy constant for backward compatibility (no longer written, but still recognized when reading)
@@ -23,10 +26,24 @@ type StreamChunk =
 export class RedisRealtimeStreams implements StreamIngestor, StreamResponder {
   private logger: Logger;
   private inactivityTimeoutMs: number;
+  // Shared connection for short-lived non-blocking operations (XADD, XREVRANGE, EXPIRE).
+  // Lazily created on first use so we don't open a connection if only streamResponse is called.
+  private _sharedRedis: Redis | undefined;
 
   constructor(private options: RealtimeStreamsOptions) {
     this.logger = options.logger ?? new Logger("RedisRealtimeStreams", options.logLevel ?? "info");
-    this.inactivityTimeoutMs = options.inactivityTimeoutMs ?? 60000; // Default: 60 seconds
+    this.inactivityTimeoutMs = options.inactivityTimeoutMs ?? 15000; // Default: 15 seconds
+  }
+
+  private get sharedRedis(): Redis {
+    if (!this._sharedRedis) {
+      this._sharedRedis = new Redis({
+        reconnectOnError: defaultReconnectOnError,
+        ...this.options.redis,
+        connectionName: "realtime:shared",
+      });
+    }
+    return this._sharedRedis;
   }
 
   async initializeStream(
@@ -43,7 +60,11 @@ export class RedisRealtimeStreams implements StreamIngestor, StreamResponder {
     signal: AbortSignal,
     options?: StreamResponseOptions
   ): Promise<Response> {
-    const redis = new Redis(this.options.redis ?? {});
+    const redis = new Redis({
+      reconnectOnError: defaultReconnectOnError,
+      ...this.options.redis,
+      connectionName: "realtime:streamResponse",
+    });
     const streamKey = `stream:${runId}:${streamId}`;
     let isCleanedUp = false;
 
@@ -269,7 +290,10 @@ export class RedisRealtimeStreams implements StreamIngestor, StreamResponder {
     async function cleanup() {
       if (isCleanedUp) return;
       isCleanedUp = true;
-      await redis.quit().catch(console.error);
+      // disconnect() tears down the TCP socket immediately, which causes any
+      // pending XREAD BLOCK to reject right away instead of waiting for the
+      // block timeout to elapse.  quit() would queue behind the blocking command.
+      redis.disconnect();
     }
 
     signal.addEventListener("abort", cleanup, { once: true });
@@ -290,24 +314,16 @@ export class RedisRealtimeStreams implements StreamIngestor, StreamResponder {
     clientId: string,
     resumeFromChunk?: number
   ): Promise<Response> {
-    const redis = new Redis(this.options.redis ?? {});
+    const redis = this.sharedRedis;
     const streamKey = `stream:${runId}:${streamId}`;
     const startChunk = resumeFromChunk ?? 0;
     // Start counting from the resume point, not from 0
     let currentChunkIndex = startChunk;
 
-    const self = this;
-
-    async function cleanup() {
-      try {
-        await redis.quit();
-      } catch (error) {
-        self.logger.error("[RedisRealtimeStreams][ingestData] Error in cleanup:", { error });
-      }
-    }
-
     try {
-      const textStream = stream.pipeThrough(new TextDecoderStream());
+      const textStream = stream.pipeThrough(
+        new TextDecoderStream() as ReadableWritablePair<string, Uint8Array>
+      );
       const reader = textStream.getReader();
 
       while (true) {
@@ -361,13 +377,11 @@ export class RedisRealtimeStreams implements StreamIngestor, StreamResponder {
       this.logger.error("[RealtimeStreams][ingestData] Error in ingestData:", { error });
 
       return new Response(null, { status: 500 });
-    } finally {
-      await cleanup();
     }
   }
 
   async appendPart(part: string, partId: string, runId: string, streamId: string): Promise<void> {
-    const redis = new Redis(this.options.redis ?? {});
+    const redis = this.sharedRedis;
     const streamKey = `stream:${runId}:${streamId}`;
 
     await redis.xadd(
@@ -386,12 +400,10 @@ export class RedisRealtimeStreams implements StreamIngestor, StreamResponder {
 
     // Set TTL for cleanup when stream is done
     await redis.expire(streamKey, env.REALTIME_STREAM_TTL);
-
-    await redis.quit();
   }
 
   async getLastChunkIndex(runId: string, streamId: string, clientId: string): Promise<number> {
-    const redis = new Redis(this.options.redis ?? {});
+    const redis = this.sharedRedis;
     const streamKey = `stream:${runId}:${streamId}`;
 
     try {
@@ -415,7 +427,7 @@ export class RedisRealtimeStreams implements StreamIngestor, StreamResponder {
         }
 
         // Search through this batch for the client's last chunk
-        for (const [id, fields] of entries) {
+        for (const [_id, fields] of entries) {
           let entryClientId: string | null = null;
           let chunkIndex: number | null = null;
           let data: string | null = null;
@@ -460,10 +472,6 @@ export class RedisRealtimeStreams implements StreamIngestor, StreamResponder {
       });
       // Return -1 to indicate we don't know what the server has
       return -1;
-    } finally {
-      await redis.quit().catch((err) => {
-        this.logger.error("[RedisRealtimeStreams][getLastChunkIndex] Error in cleanup:", { err });
-      });
     }
   }
 

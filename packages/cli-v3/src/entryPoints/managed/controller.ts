@@ -1,4 +1,4 @@
-import { WorkerManifest } from "@trigger.dev/core/v3";
+import type { WorkerManifest } from "@trigger.dev/core/v3";
 import {
   WarmStartClient,
   WORKLOAD_HEADERS,
@@ -8,8 +8,9 @@ import {
 } from "@trigger.dev/core/v3/workers";
 import { io, type Socket } from "socket.io-client";
 import { RunnerEnv } from "./env.js";
-import { ManagedRunLogger, RunLogger, SendDebugLogOptions } from "./logger.js";
-import { EnvObject } from "std-env";
+import type { RunLogger, SendDebugLogOptions } from "./logger.js";
+import { ManagedRunLogger } from "./logger.js";
+import type { EnvObject } from "std-env";
 import { RunExecution } from "./execution.js";
 import { TaskRunProcessProvider } from "./taskRunProcessProvider.js";
 import { tryCatch } from "@trigger.dev/core/utils";
@@ -75,7 +76,7 @@ export class ManagedRunController {
     });
 
     const properties = {
-      ...env.raw,
+      ...env.rawForLogging,
       TRIGGER_POD_SCHEDULED_AT_MS: env.TRIGGER_POD_SCHEDULED_AT_MS.toISOString(),
       TRIGGER_DEQUEUED_AT_MS: env.TRIGGER_DEQUEUED_AT_MS.toISOString(),
     };

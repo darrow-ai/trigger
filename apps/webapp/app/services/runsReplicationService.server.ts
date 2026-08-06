@@ -1,5 +1,14 @@
-import type { ClickHouse, TaskRunInsertArray, PayloadInsertArray } from "@internal/clickhouse";
-import { getTaskRunField, getPayloadField } from "@internal/clickhouse";
+import type { ClickhouseFactory } from "~/services/clickhouse/clickhouseFactory.server";
+import {
+  type ClickHouse,
+  type ClickHouseSettings,
+  type PayloadInsertArray,
+  type TaskRunInsertArray,
+  composeTaskRunVersion,
+  getPayloadField,
+  getTaskRunField,
+  TASK_RUN_INDEX,
+} from "@internal/clickhouse";
 import { type RedisOptions } from "@internal/redis";
 import {
   LogicalReplicationClient,
@@ -21,7 +30,10 @@ import {
 import { Logger, type LogLevel } from "@trigger.dev/core/logger";
 import { tryCatch } from "@trigger.dev/core/utils";
 import { parsePacketAsJson } from "@trigger.dev/core/v3/utils/ioSerialization";
-import { unsafeExtractIdempotencyKeyScope, unsafeExtractIdempotencyKeyUser } from "@trigger.dev/core/v3/serverOnly";
+import {
+  unsafeExtractIdempotencyKeyScope,
+  unsafeExtractIdempotencyKeyUser,
+} from "@trigger.dev/core/v3/serverOnly";
 import { RunAnnotations } from "@trigger.dev/core/v3";
 import { type TaskRun } from "@trigger.dev/database";
 import { nanoid } from "nanoid";
@@ -29,6 +41,12 @@ import EventEmitter from "node:events";
 import pLimit from "p-limit";
 import { detectBadJsonStrings } from "~/utils/detectBadJsonStrings";
 import { calculateErrorFingerprint } from "~/utils/errorFingerprinting";
+import { baseWorkerQueue } from "~/runEngine/concerns/workerQueueSplit.server";
+import {
+  insertWithBadRowSkip,
+  insertWithLimitedStrip,
+  type JsonParseRecoveryOutcome,
+} from "~/v3/eventRepository/sanitizeRowsOnParseError.server";
 
 interface TransactionEvent<T = any> {
   tag: "insert" | "update" | "delete";
@@ -45,12 +63,35 @@ interface Transaction<T = any> {
   replicationLagMs: number;
 }
 
+export type RunsReplicationSource = {
+  /**
+   * Stable per-source id. MUST be unique across sources. It is the key off
+   * which every per-source identity is derived: the LogicalReplicationClient
+   * `name` (and therefore the redlock leader-lock resource key), metrics tags,
+   * logs. e.g. "legacy" | "new".
+   */
+  id: string;
+  pgConnectionUrl: string;
+  slotName: string;
+  publicationName: string;
+  /** 0 = legacy/control-plane DB, 1 = dedicated run-ops DB. Packed into _version via composeTaskRunVersion. */
+  originGeneration: number;
+};
+
 export type RunsReplicationServiceOptions = {
-  clickhouse: ClickHouse;
+  clickhouseFactory: ClickhouseFactory;
   pgConnectionUrl: string;
   serviceName: string;
   slotName: string;
   publicationName: string;
+  /**
+   * Optional list of replication sources. When provided (and non-empty), the
+   * service fans in from each named source into the single shared flush
+   * scheduler. When omitted, the scalar `pgConnectionUrl`/`slotName`/
+   * `publicationName` are used as a single implicit `"default"` source,
+   * preserving the legacy single-source behavior exactly.
+   */
+  sources?: RunsReplicationSource[];
   redisOptions: RedisOptions;
   maxFlushConcurrency?: number;
   flushIntervalMs?: number;
@@ -73,9 +114,28 @@ export type RunsReplicationServiceOptions = {
   insertMaxDelayMs?: number;
   disablePayloadInsert?: boolean;
   disableErrorFingerprinting?: boolean;
+  maxPoisonStripsPerBatch?: number;
 };
 
 type PostgresTaskRun = TaskRun & { masterQueue: string };
+
+type CurrentTransaction =
+  | (Omit<Transaction<TaskRun>, "commitEndLsn" | "replicationLagMs"> & {
+      commitEndLsn?: string | null;
+      replicationLagMs?: number;
+    })
+  | null;
+
+type SourceRuntime = {
+  source: RunsReplicationSource;
+  client: LogicalReplicationClient;
+  latestCommitEndLsn: string | null;
+  lastAcknowledgedLsn: string | null;
+  lastAcknowledgedAt: number | null;
+  acknowledgeInterval: NodeJS.Timeout | null;
+  currentTransaction: CurrentTransaction;
+  currentParseDurationMs: number | null;
+};
 
 type TaskRunInsert = {
   _version: bigint;
@@ -86,32 +146,29 @@ type TaskRunInsert = {
 export type RunsReplicationServiceEvents = {
   message: [{ lsn: string; message: PgoutputMessage; service: RunsReplicationService }];
   batchFlushed: [
-    { flushId: string; taskRunInserts: TaskRunInsertArray[]; payloadInserts: PayloadInsertArray[] }
+    { flushId: string; taskRunInserts: TaskRunInsertArray[]; payloadInserts: PayloadInsertArray[] },
   ];
 };
 
 export class RunsReplicationService {
   private _isSubscribed = false;
-  private _currentTransaction:
-    | (Omit<Transaction<TaskRun>, "commitEndLsn" | "replicationLagMs"> & {
-        commitEndLsn?: string | null;
-        replicationLagMs?: number;
-      })
-    | null = null;
 
-  private _replicationClient: LogicalReplicationClient;
+  /**
+   * Per-source runtime state. Each source has its own replication client, leader
+   * lock, slot, and in-flight transaction state. All fan in to the single shared
+   * _concurrentFlushScheduler. Transaction/LSN state MUST be per-source because
+   * logical-replication transactions interleave per stream.
+   */
+  private _sources: Map<string, SourceRuntime>;
+
   private _concurrentFlushScheduler: ConcurrentFlushScheduler<TaskRunInsert>;
   private logger: Logger;
   private _isShuttingDown = false;
   private _isShutDownComplete = false;
+  private _shutdownStopInFlight = false;
   private _tracer: Tracer;
   private _meter: Meter;
-  private _currentParseDurationMs: number | null = null;
-  private _lastAcknowledgedAt: number | null = null;
   private _acknowledgeTimeoutMs: number;
-  private _latestCommitEndLsn: string | null = null;
-  private _lastAcknowledgedLsn: string | null = null;
-  private _acknowledgeInterval: NodeJS.Timeout | null = null;
   // Retry configuration
   private _insertMaxRetries: number;
   private _insertBaseDelayMs: number;
@@ -119,6 +176,48 @@ export class RunsReplicationService {
   private _insertStrategy: "insert" | "insert_async";
   private _disablePayloadInsert: boolean;
   private _disableErrorFingerprinting: boolean;
+
+  /**
+   * Counts batches where every row was un-ingestable even with its JSON
+   * stripped, so nothing landed. Row isolation lands anything strippable, so
+   * this should stay at zero; a non-zero value means the recovery itself is
+   * failing. Only incremented when ClickHouse's summary says so exactly
+   * (`written_rows === 0`). Counter only, does not gate behaviour.
+   */
+  private _permanentlyDroppedBatches = 0;
+
+  /**
+   * Counts batches that took the row-isolation recovery path: a
+   * `Cannot parse JSON object` failure the sanitizer could not repair, where we
+   * followed ClickHouse's `at row N` hint to the poison rows and landed the batch
+   * with their JSON stripped. Reliable per-event signal that user data is hitting
+   * the ceiling.
+   */
+  private _rowIsolationRecoveries = 0;
+
+  /**
+   * Counts batches that gave up on isolating rows precisely and fell back to a
+   * single `allow_errors` insert, either because the per-batch strip budget was
+   * spent (a poison flood) or because ClickHouse gave no usable row hint. The
+   * remaining un-ingestable rows are skipped; `bailReason` in the log line says
+   * which cause it was.
+   */
+  private _recoveryCapHits = 0;
+
+  /**
+   * Counts rows that landed with their un-ingestable `output` emptied (the run
+   * kept its status, only the output content was lost; it still reads from
+   * Postgres on the run detail page).
+   */
+  private _rowsStripped = 0;
+
+  /**
+   * Counts rows dropped entirely because they could not be parsed even with
+   * their JSON stripped. The true data-loss signal; expected to stay near zero.
+   * A lower bound on `task_runs_v2`, whose materialized views make the exact
+   * count underivable from ClickHouse's insert summary (see `droppedRowCount`).
+   */
+  private _permanentlyDroppedRows = 0;
 
   // Metrics
   private _replicationLagHistogram: Histogram;
@@ -128,6 +227,11 @@ export class RunsReplicationService {
   private _payloadsInsertedCounter: Counter;
   private _insertRetriesCounter: Counter;
   private _eventsProcessedCounter: Counter;
+  private _rowIsolatedBatchesCounter: Counter;
+  private _recoveryCapHitsCounter: Counter;
+  private _rowsStrippedCounter: Counter;
+  private _rowsDroppedCounter: Counter;
+  private _droppedBatchesCounter: Counter;
   private _flushDurationHistogram: Histogram;
 
   public readonly events: EventEmitter<RunsReplicationServiceEvents>;
@@ -181,6 +285,38 @@ export class RunsReplicationService {
       description: "Replication events processed (inserts, updates, deletes)",
     });
 
+    this._rowIsolatedBatchesCounter = this._meter.createCounter(
+      "runs_replication.batches_row_isolated",
+      {
+        description:
+          "Batches recovered by isolating un-ingestable rows (landed the rest) after a ClickHouse JSON parse error",
+        unit: "batches",
+      }
+    );
+
+    this._recoveryCapHitsCounter = this._meter.createCounter("runs_replication.recovery_cap_hits", {
+      description:
+        "Batches that fell back to a single allow_errors insert instead of isolating rows, because the per-batch strip budget was spent or ClickHouse gave no usable row hint",
+      unit: "batches",
+    });
+
+    this._rowsStrippedCounter = this._meter.createCounter("runs_replication.rows_stripped", {
+      description:
+        "Rows landed with their un-ingestable JSON stripped (kept the row, lost only the JSON content)",
+      unit: "rows",
+    });
+
+    this._rowsDroppedCounter = this._meter.createCounter("runs_replication.rows_dropped", {
+      description:
+        "Rows dropped entirely because they could not parse even with their JSON stripped; a lower bound on task_runs_v2, whose materialized views make the exact count underivable from ClickHouse's insert summary",
+      unit: "rows",
+    });
+
+    this._droppedBatchesCounter = this._meter.createCounter("runs_replication.batches_dropped", {
+      description: "Batches where every row was un-ingestable even with its JSON stripped",
+      unit: "batches",
+    });
+
     this._flushDurationHistogram = this._meter.createHistogram(
       "runs_replication.flush_duration_ms",
       {
@@ -195,25 +331,61 @@ export class RunsReplicationService {
     this._disablePayloadInsert = options.disablePayloadInsert ?? false;
     this._disableErrorFingerprinting = options.disableErrorFingerprinting ?? false;
 
-    this._replicationClient = new LogicalReplicationClient({
-      pgConfig: {
-        connectionString: options.pgConnectionUrl,
-      },
-      name: options.serviceName,
-      slotName: options.slotName,
-      publicationName: options.publicationName,
-      table: "TaskRun",
-      redisOptions: options.redisOptions,
-      autoAcknowledge: false,
-      publicationActions: ["insert", "update", "delete"],
-      logger: options.logger ?? new Logger("LogicalReplicationClient", options.logLevel ?? "info"),
-      leaderLockTimeoutMs: options.leaderLockTimeoutMs ?? 30_000,
-      leaderLockExtendIntervalMs: options.leaderLockExtendIntervalMs ?? 10_000,
-      ackIntervalSeconds: options.ackIntervalSeconds ?? 10,
-      leaderLockAcquireAdditionalTimeMs: options.leaderLockAcquireAdditionalTimeMs ?? 10_000,
-      leaderLockRetryIntervalMs: options.leaderLockRetryIntervalMs ?? 500,
-      tracer: options.tracer,
-    });
+    const sources: RunsReplicationSource[] =
+      options.sources && options.sources.length > 0
+        ? options.sources
+        : [
+            {
+              id: "default",
+              pgConnectionUrl: options.pgConnectionUrl,
+              slotName: options.slotName,
+              publicationName: options.publicationName,
+              originGeneration: 0,
+            },
+          ];
+
+    RunsReplicationService.#validateSources(sources);
+
+    this._sources = new Map<string, SourceRuntime>();
+
+    for (const source of sources) {
+      const client = new LogicalReplicationClient({
+        pgConfig: {
+          connectionString: source.pgConnectionUrl,
+        },
+        name: `${options.serviceName}:${source.id}`,
+        slotName: source.slotName,
+        publicationName: source.publicationName,
+        table: "TaskRun",
+        redisOptions: options.redisOptions,
+        autoAcknowledge: false,
+        resubscribeOnFailure: true,
+        publicationActions: ["insert", "update", "delete"],
+        logger:
+          options.logger ?? new Logger("LogicalReplicationClient", options.logLevel ?? "info"),
+        leaderLockTimeoutMs: options.leaderLockTimeoutMs ?? 30_000,
+        leaderLockExtendIntervalMs: options.leaderLockExtendIntervalMs ?? 10_000,
+        ackIntervalSeconds: options.ackIntervalSeconds ?? 10,
+        leaderLockAcquireAdditionalTimeMs: options.leaderLockAcquireAdditionalTimeMs ?? 10_000,
+        leaderLockRetryIntervalMs: options.leaderLockRetryIntervalMs ?? 500,
+        tracer: options.tracer,
+      });
+
+      const runtime: SourceRuntime = {
+        source,
+        client,
+        latestCommitEndLsn: null,
+        lastAcknowledgedLsn: null,
+        lastAcknowledgedAt: null,
+        acknowledgeInterval: null,
+        currentTransaction: null,
+        currentParseDurationMs: null,
+      };
+
+      this.#wireClientEvents(runtime);
+
+      this._sources.set(source.id, runtime);
+    }
 
     this._concurrentFlushScheduler = new ConcurrentFlushScheduler<TaskRunInsert>({
       batchSize: options.flushBatchSize ?? 50,
@@ -236,42 +408,105 @@ export class RunsReplicationService {
       tracer: options.tracer,
     });
 
-    this._replicationClient.events.on("data", async ({ lsn, log, parseDuration }) => {
-      this.#handleData(lsn, log, parseDuration);
-    });
-
-    this._replicationClient.events.on("heartbeat", async ({ lsn, shouldRespond }) => {
-      if (this._isShuttingDown) return;
-      if (this._isShutDownComplete) return;
-
-      if (shouldRespond) {
-        this._lastAcknowledgedLsn = lsn;
-        await this._replicationClient.acknowledge(lsn);
-      }
-    });
-
-    this._replicationClient.events.on("error", (error) => {
-      this.logger.error("Replication client error", {
-        error,
-      });
-    });
-
-    this._replicationClient.events.on("start", () => {
-      this.logger.info("Replication client started");
-    });
-
-    this._replicationClient.events.on("acknowledge", ({ lsn }) => {
-      this.logger.debug("Acknowledged", { lsn });
-    });
-
-    this._replicationClient.events.on("leaderElection", (isLeader) => {
-      this.logger.info("Leader election", { isLeader });
-    });
-
     // Initialize retry configuration
     this._insertMaxRetries = options.insertMaxRetries ?? 3;
     this._insertBaseDelayMs = options.insertBaseDelayMs ?? 100;
     this._insertMaxDelayMs = options.insertMaxDelayMs ?? 2000;
+  }
+
+  static #validateSources(sources: RunsReplicationSource[]) {
+    const ids = new Set<string>();
+    const slotNames = new Set<string>();
+    const originGenerations = new Set<number>();
+
+    for (const source of sources) {
+      // Distinct id: a duplicate id derives a duplicate client name -> duplicate
+      // redlock leader-lock key -> only one source ever streams.
+      if (ids.has(source.id)) {
+        throw new Error(
+          `RunsReplicationService: duplicate source id "${source.id}" — source ids must be unique`
+        );
+      }
+      ids.add(source.id);
+
+      // Distinct slotName: two consumers on one WAL stream is a data race.
+      if (slotNames.has(source.slotName)) {
+        throw new Error(
+          `RunsReplicationService: duplicate slotName "${source.slotName}" — slot names must be unique across sources`
+        );
+      }
+      slotNames.add(source.slotName);
+
+      // Distinct originGeneration: a shared generation defeats the dedup tiebreak.
+      if (originGenerations.has(source.originGeneration)) {
+        throw new Error(
+          `RunsReplicationService: duplicate originGeneration "${source.originGeneration}" — originGeneration must be unique across sources`
+        );
+      }
+      originGenerations.add(source.originGeneration);
+    }
+  }
+
+  #wireClientEvents(runtime: SourceRuntime) {
+    const { client, source } = runtime;
+
+    client.events.on("data", async ({ lsn, log, parseDuration }) => {
+      this.#handleData(runtime, lsn, log, parseDuration);
+    });
+
+    client.events.on("heartbeat", async ({ lsn, shouldRespond }) => {
+      if (this._isShuttingDown) return;
+      if (this._isShutDownComplete) return;
+
+      if (shouldRespond) {
+        runtime.lastAcknowledgedLsn = lsn;
+        await client.acknowledge(lsn);
+      }
+    });
+
+    client.events.on("error", (error) => {
+      this.logger.error("Replication client error", {
+        sourceId: source.id,
+        error,
+      });
+    });
+
+    client.events.on("start", () => {
+      this.logger.info("Replication client started", { sourceId: source.id });
+    });
+
+    client.events.on("acknowledge", ({ lsn }) => {
+      this.logger.debug("Acknowledged", { sourceId: source.id, lsn });
+    });
+
+    client.events.on("leaderElection", (isLeader) => {
+      this.logger.info("Leader election", { sourceId: source.id, isLeader });
+    });
+  }
+
+  /** Exposed for tests and metrics — batches where nothing landed even after stripping JSON. */
+  get permanentlyDroppedBatches() {
+    return this._permanentlyDroppedBatches;
+  }
+
+  /** Exposed for tests and metrics — batches that took the row-isolation recovery path. */
+  get rowIsolationRecoveries() {
+    return this._rowIsolationRecoveries;
+  }
+
+  /** Exposed for tests and metrics — batches whose isolation hit the per-batch insert budget. */
+  get recoveryCapHits() {
+    return this._recoveryCapHits;
+  }
+
+  /** Exposed for tests and metrics — rows that landed with their un-ingestable JSON stripped. */
+  get rowsStripped() {
+    return this._rowsStripped;
+  }
+
+  /** Exposed for tests and metrics — rows dropped entirely (could not parse even stripped). */
+  get permanentlyDroppedRows() {
+    return this._permanentlyDroppedRows;
   }
 
   public async shutdown() {
@@ -281,9 +516,15 @@ export class RunsReplicationService {
 
     this.logger.info("Initiating shutdown of runs replication service");
 
-    if (!this._currentTransaction) {
+    const hasCurrentTransaction = Array.from(this._sources.values()).some(
+      (runtime) => runtime.currentTransaction !== null
+    );
+
+    if (!hasCurrentTransaction) {
       this.logger.info("No transaction to commit, shutting down immediately");
-      await this._replicationClient.stop();
+      await Promise.all(
+        Array.from(this._sources.values()).map((runtime) => runtime.client.shutdown())
+      );
       this._isShutDownComplete = true;
       return;
     }
@@ -292,43 +533,70 @@ export class RunsReplicationService {
   }
 
   async start() {
-    this.logger.info("Starting replication client", {
-      lastLsn: this._latestCommitEndLsn,
-    });
+    for (const runtime of this._sources.values()) {
+      this.logger.info("Starting replication client", {
+        sourceId: runtime.source.id,
+        lastLsn: runtime.latestCommitEndLsn,
+      });
 
-    await this._replicationClient.subscribe(this._latestCommitEndLsn ?? undefined);
+      await runtime.client.subscribe(runtime.latestCommitEndLsn ?? undefined);
 
-    this._acknowledgeInterval = setInterval(this.#acknowledgeLatestTransaction.bind(this), 1000);
+      runtime.acknowledgeInterval = setInterval(
+        () => this.#acknowledgeLatestTransaction(runtime),
+        1000
+      );
+    }
+
     this._concurrentFlushScheduler.start();
   }
 
   async stop() {
-    this.logger.info("Stopping replication client");
+    for (const runtime of this._sources.values()) {
+      this.logger.info("Stopping replication client", { sourceId: runtime.source.id });
 
-    await this._replicationClient.stop();
+      await runtime.client.shutdown();
 
-    if (this._acknowledgeInterval) {
-      clearInterval(this._acknowledgeInterval);
+      if (runtime.acknowledgeInterval) {
+        clearInterval(runtime.acknowledgeInterval);
+      }
     }
   }
 
   async teardown() {
-    this.logger.info("Teardown replication client");
+    for (const runtime of this._sources.values()) {
+      this.logger.info("Teardown replication client", { sourceId: runtime.source.id });
 
-    await this._replicationClient.teardown();
+      await runtime.client.teardown();
 
-    if (this._acknowledgeInterval) {
-      clearInterval(this._acknowledgeInterval);
+      if (runtime.acknowledgeInterval) {
+        clearInterval(runtime.acknowledgeInterval);
+      }
     }
   }
 
-  async backfill(runs: PostgresTaskRun[]) {
-    // divide into batches of 50 to get data from Postgres
+  async backfill(runs: PostgresTaskRun[], sourceId?: string) {
     const flushId = nanoid();
     // Use current timestamp as LSN (high enough to be above existing data)
     const now = Date.now();
     const syntheticLsn = `${now.toString(16).padStart(8, "0").toUpperCase()}/00000000`;
-    const baseVersion = lsnToUInt64(syntheticLsn);
+
+    // Backfill and live replication of the SAME source share an origin generation
+    // and rely on raw-LSN ordering within that generation. Default to the single
+    // source self-host uses (gen 0 => passthrough).
+    const runtime = sourceId ? this._sources.get(sourceId) : this._sources.values().next().value;
+
+    if (!runtime) {
+      throw new Error(
+        sourceId
+          ? `RunsReplicationService.backfill: no source found with id "${sourceId}"`
+          : "RunsReplicationService.backfill: no sources configured"
+      );
+    }
+
+    const baseVersion = composeTaskRunVersion({
+      originGeneration: runtime.source.originGeneration,
+      lsnVersion: lsnToUInt64(syntheticLsn),
+    });
 
     await this.#flushBatch(
       flushId,
@@ -340,8 +608,14 @@ export class RunsReplicationService {
     );
   }
 
-  #handleData(lsn: string, message: PgoutputMessage, parseDuration: bigint) {
+  #handleData(
+    runtime: SourceRuntime,
+    lsn: string,
+    message: PgoutputMessage,
+    parseDuration: bigint
+  ) {
     this.logger.debug("Handling data", {
+      sourceId: runtime.source.id,
       lsn,
       tag: message.tag,
       parseDuration,
@@ -355,28 +629,28 @@ export class RunsReplicationService {
           return;
         }
 
-        this._currentTransaction = {
+        runtime.currentTransaction = {
           beginStartTimestamp: Date.now(),
           commitLsn: message.commitLsn,
           xid: message.xid,
           events: [],
         };
 
-        this._currentParseDurationMs = Number(parseDuration) / 1_000_000;
+        runtime.currentParseDurationMs = Number(parseDuration) / 1_000_000;
 
         break;
       }
       case "insert": {
-        if (!this._currentTransaction) {
+        if (!runtime.currentTransaction) {
           return;
         }
 
-        if (this._currentParseDurationMs) {
-          this._currentParseDurationMs =
-            this._currentParseDurationMs + Number(parseDuration) / 1_000_000;
+        if (runtime.currentParseDurationMs) {
+          runtime.currentParseDurationMs =
+            runtime.currentParseDurationMs + Number(parseDuration) / 1_000_000;
         }
 
-        this._currentTransaction.events.push({
+        runtime.currentTransaction.events.push({
           tag: message.tag,
           data: message.new as TaskRun,
           raw: message,
@@ -384,16 +658,16 @@ export class RunsReplicationService {
         break;
       }
       case "update": {
-        if (!this._currentTransaction) {
+        if (!runtime.currentTransaction) {
           return;
         }
 
-        if (this._currentParseDurationMs) {
-          this._currentParseDurationMs =
-            this._currentParseDurationMs + Number(parseDuration) / 1_000_000;
+        if (runtime.currentParseDurationMs) {
+          runtime.currentParseDurationMs =
+            runtime.currentParseDurationMs + Number(parseDuration) / 1_000_000;
         }
 
-        this._currentTransaction.events.push({
+        runtime.currentTransaction.events.push({
           tag: message.tag,
           data: message.new as TaskRun,
           raw: message,
@@ -401,16 +675,16 @@ export class RunsReplicationService {
         break;
       }
       case "delete": {
-        if (!this._currentTransaction) {
+        if (!runtime.currentTransaction) {
           return;
         }
 
-        if (this._currentParseDurationMs) {
-          this._currentParseDurationMs =
-            this._currentParseDurationMs + Number(parseDuration) / 1_000_000;
+        if (runtime.currentParseDurationMs) {
+          runtime.currentParseDurationMs =
+            runtime.currentParseDurationMs + Number(parseDuration) / 1_000_000;
         }
 
-        this._currentTransaction.events.push({
+        runtime.currentTransaction.events.push({
           tag: message.tag,
           data: message.old as TaskRun,
           raw: message,
@@ -419,26 +693,26 @@ export class RunsReplicationService {
         break;
       }
       case "commit": {
-        if (!this._currentTransaction) {
+        if (!runtime.currentTransaction) {
           return;
         }
 
-        if (this._currentParseDurationMs) {
-          this._currentParseDurationMs =
-            this._currentParseDurationMs + Number(parseDuration) / 1_000_000;
+        if (runtime.currentParseDurationMs) {
+          runtime.currentParseDurationMs =
+            runtime.currentParseDurationMs + Number(parseDuration) / 1_000_000;
         }
 
         const replicationLagMs = Date.now() - Number(message.commitTime / 1000n);
-        this._currentTransaction.commitEndLsn = message.commitEndLsn;
-        this._currentTransaction.replicationLagMs = replicationLagMs;
-        const transaction = this._currentTransaction as Transaction<PostgresTaskRun>;
-        this._currentTransaction = null;
+        runtime.currentTransaction.commitEndLsn = message.commitEndLsn;
+        runtime.currentTransaction.replicationLagMs = replicationLagMs;
+        const transaction = runtime.currentTransaction as Transaction<PostgresTaskRun>;
+        runtime.currentTransaction = null;
 
         if (transaction.commitEndLsn) {
-          this._latestCommitEndLsn = transaction.commitEndLsn;
+          runtime.latestCommitEndLsn = transaction.commitEndLsn;
         }
 
-        this.#handleTransaction(transaction);
+        this.#handleTransaction(runtime, transaction);
         break;
       }
       default: {
@@ -449,13 +723,23 @@ export class RunsReplicationService {
     }
   }
 
-  #handleTransaction(transaction: Transaction<PostgresTaskRun>) {
+  #handleTransaction(runtime: SourceRuntime, transaction: Transaction<PostgresTaskRun>) {
     if (this._isShutDownComplete) return;
 
     if (this._isShuttingDown) {
-      this._replicationClient.stop().finally(() => {
-        this._isShutDownComplete = true;
-      });
+      // A global shutdown stops every source's client; mark complete once all
+      // have stopped. Guard against re-firing per incoming transaction, and
+      // swallow client.stop() rejections so they don't surface as unhandled.
+      if (!this._shutdownStopInFlight) {
+        this._shutdownStopInFlight = true;
+        Promise.all(Array.from(this._sources.values()).map((r) => r.client.shutdown()))
+          .catch((error) => {
+            this.logger.error("Error stopping replication clients during shutdown", { error });
+          })
+          .finally(() => {
+            this._isShutDownComplete = true;
+          });
+      }
     }
 
     // If there are no events, do nothing
@@ -465,6 +749,7 @@ export class RunsReplicationService {
 
     if (!transaction.commitEndLsn) {
       this.logger.error("Transaction has no commit end lsn", {
+        sourceId: runtime.source.id,
         transaction,
       });
 
@@ -473,8 +758,13 @@ export class RunsReplicationService {
 
     const lsnToUInt64Start = process.hrtime.bigint();
 
-    // If there are events, we need to handle them
-    const _version = lsnToUInt64(transaction.commitEndLsn);
+    // Compose the source's origin generation above the LSN so a higher-generation
+    // source wins the ClickHouse dedup tiebreak regardless of raw LSN. Gen 0 (the
+    // single-source default) is a passthrough.
+    const _version = composeTaskRunVersion({
+      originGeneration: runtime.source.originGeneration,
+      lsnVersion: lsnToUInt64(transaction.commitEndLsn),
+    });
 
     const lsnToUInt64DurationMs = Number(process.hrtime.bigint() - lsnToUInt64Start) / 1_000_000;
 
@@ -487,7 +777,10 @@ export class RunsReplicationService {
     );
 
     // Record metrics
-    this._replicationLagHistogram.record(transaction.replicationLagMs);
+    this._replicationLagHistogram.record(transaction.replicationLagMs, {
+      source: runtime.source.id,
+      generation: runtime.source.originGeneration,
+    });
 
     // Count events by type
     for (const event of transaction.events) {
@@ -495,55 +788,58 @@ export class RunsReplicationService {
     }
 
     this.logger.debug("handle_transaction", {
+      sourceId: runtime.source.id,
       transaction: {
         xid: transaction.xid,
         commitLsn: transaction.commitLsn,
         commitEndLsn: transaction.commitEndLsn,
         events: transaction.events.length,
-        parseDurationMs: this._currentParseDurationMs,
+        parseDurationMs: runtime.currentParseDurationMs,
         lsnToUInt64DurationMs,
         version: _version.toString(),
       },
     });
   }
 
-  async #acknowledgeLatestTransaction() {
-    if (!this._latestCommitEndLsn) {
+  async #acknowledgeLatestTransaction(runtime: SourceRuntime) {
+    if (!runtime.latestCommitEndLsn) {
       return;
     }
 
-    if (this._lastAcknowledgedLsn === this._latestCommitEndLsn) {
+    if (runtime.lastAcknowledgedLsn === runtime.latestCommitEndLsn) {
       return;
     }
 
     const now = Date.now();
 
-    if (this._lastAcknowledgedAt) {
-      const timeSinceLastAcknowledged = now - this._lastAcknowledgedAt;
+    if (runtime.lastAcknowledgedAt) {
+      const timeSinceLastAcknowledged = now - runtime.lastAcknowledgedAt;
       // If we've already acknowledged within the last second, don't acknowledge again
       if (timeSinceLastAcknowledged < this._acknowledgeTimeoutMs) {
         return;
       }
     }
 
-    this._lastAcknowledgedAt = now;
-    this._lastAcknowledgedLsn = this._latestCommitEndLsn;
+    runtime.lastAcknowledgedAt = now;
+    runtime.lastAcknowledgedLsn = runtime.latestCommitEndLsn;
 
     this.logger.debug("acknowledge_latest_transaction", {
-      commitEndLsn: this._latestCommitEndLsn,
-      lastAcknowledgedAt: this._lastAcknowledgedAt,
+      sourceId: runtime.source.id,
+      commitEndLsn: runtime.latestCommitEndLsn,
+      lastAcknowledgedAt: runtime.lastAcknowledgedAt,
     });
 
-    const [ackError] = await tryCatch(
-      this._replicationClient.acknowledge(this._latestCommitEndLsn)
-    );
+    const [ackError] = await tryCatch(runtime.client.acknowledge(runtime.latestCommitEndLsn));
 
     if (ackError) {
-      this.logger.error("Error acknowledging transaction", { ackError });
+      this.logger.error("Error acknowledging transaction", {
+        sourceId: runtime.source.id,
+        ackError,
+      });
     }
 
-    if (this._isShutDownComplete && this._acknowledgeInterval) {
-      clearInterval(this._acknowledgeInterval);
+    if (this._isShutDownComplete && runtime.acknowledgeInterval) {
+      clearInterval(runtime.acknowledgeInterval);
     }
   }
 
@@ -560,16 +856,50 @@ export class RunsReplicationService {
     const flushStartTime = performance.now();
 
     await startSpan(this._tracer, "flushBatch", async (span) => {
-      const preparedInserts = await startSpan(this._tracer, "prepare_inserts", async (span) => {
+      const preparedInserts = await startSpan(this._tracer, "prepare_inserts", async () => {
         return await Promise.all(batch.map(this.#prepareRunInserts.bind(this)));
       });
 
-      const taskRunInserts = preparedInserts
-        .map(({ taskRunInsert }) => taskRunInsert)
-        .filter((x): x is TaskRunInsertArray => Boolean(x))
-        // batch inserts in clickhouse are more performant if the items
-        // are pre-sorted by the primary key
-        .sort((a, b) => {
+      const routeCache = new Map<string, ClickHouse>();
+      const groups = new Map<
+        ClickHouse,
+        { taskRunInserts: TaskRunInsertArray[]; payloadInserts: PayloadInsertArray[] }
+      >();
+
+      for (let i = 0; i < batch.length; i++) {
+        const batchedRun = batch[i]!;
+        const prep = preparedInserts[i]!;
+        const { run } = batchedRun;
+
+        if (!run.organizationId || !run.environmentType) {
+          continue;
+        }
+
+        let client = routeCache.get(run.organizationId);
+        if (!client) {
+          client = this.options.clickhouseFactory.getClickhouseForOrganizationSync(
+            run.organizationId,
+            "replication"
+          );
+          routeCache.set(run.organizationId, client);
+        }
+
+        let group = groups.get(client);
+        if (!group) {
+          group = { taskRunInserts: [], payloadInserts: [] };
+          groups.set(client, group);
+        }
+
+        if (prep.taskRunInsert) {
+          group.taskRunInserts.push(prep.taskRunInsert);
+        }
+        if (prep.payloadInsert) {
+          group.payloadInserts.push(prep.payloadInsert);
+        }
+      }
+
+      const sortTaskRunInserts = (rows: TaskRunInsertArray[]) =>
+        rows.sort((a, b) => {
           const aOrgId = getTaskRunField(a, "organization_id");
           const bOrgId = getTaskRunField(b, "organization_id");
           if (aOrgId !== bOrgId) {
@@ -596,41 +926,61 @@ export class RunsReplicationService {
           return aRunId < bRunId ? -1 : 1;
         });
 
-      const payloadInserts = preparedInserts
-        .map(({ payloadInsert }) => payloadInsert)
-        .filter((x): x is PayloadInsertArray => Boolean(x))
-        // batch inserts in clickhouse are more performant if the items
-        // are pre-sorted by the primary key
-        .sort((a, b) => {
+      const sortPayloadInserts = (rows: PayloadInsertArray[]) =>
+        rows.sort((a, b) => {
           const aRunId = getPayloadField(a, "run_id");
           const bRunId = getPayloadField(b, "run_id");
           if (aRunId === bRunId) return 0;
           return aRunId < bRunId ? -1 : 1;
         });
 
-      span.setAttribute("task_run_inserts", taskRunInserts.length);
-      span.setAttribute("payload_inserts", payloadInserts.length);
+      const combinedTaskRunInserts: TaskRunInsertArray[] = [];
+      const combinedPayloadInserts: PayloadInsertArray[] = [];
+      let taskRunError: Error | null = null;
+      let payloadError: Error | null = null;
+
+      for (const [clickhouse, group] of groups) {
+        sortTaskRunInserts(group.taskRunInserts);
+        sortPayloadInserts(group.payloadInserts);
+        combinedTaskRunInserts.push(...group.taskRunInserts);
+        combinedPayloadInserts.push(...group.payloadInserts);
+
+        const [trErr, trOutcome] = await this.#insertWithRetry(
+          (attempt) => this.#insertTaskRunInserts(clickhouse, group.taskRunInserts, attempt),
+          "task run inserts",
+          flushId
+        );
+        if (trErr && !taskRunError) {
+          taskRunError = trErr;
+        }
+
+        const [plErr, plOutcome] = await this.#insertWithRetry(
+          (attempt) => this.#insertPayloadInserts(clickhouse, group.payloadInserts, attempt),
+          "payload inserts",
+          flushId
+        );
+        if (plErr && !payloadError) {
+          payloadError = plErr;
+        }
+
+        if (!trErr && trOutcome) {
+          this._taskRunsInsertedCounter.add(landedRowCount(group.taskRunInserts.length, trOutcome));
+        }
+        if (!plErr && plOutcome) {
+          this._payloadsInsertedCounter.add(landedRowCount(group.payloadInserts.length, plOutcome));
+        }
+      }
+
+      span.setAttribute("task_run_inserts", combinedTaskRunInserts.length);
+      span.setAttribute("payload_inserts", combinedPayloadInserts.length);
 
       this.logger.debug("Flushing inserts", {
         flushId,
-        taskRunInserts: taskRunInserts.length,
-        payloadInserts: payloadInserts.length,
+        taskRunInserts: combinedTaskRunInserts.length,
+        payloadInserts: combinedPayloadInserts.length,
+        clickhouseGroups: groups.size,
       });
 
-      // Insert task runs and payloads with retry logic for connection errors
-      const [taskRunError, taskRunResult] = await this.#insertWithRetry(
-        (attempt) => this.#insertTaskRunInserts(taskRunInserts, attempt),
-        "task run inserts",
-        flushId
-      );
-
-      const [payloadError, payloadResult] = await this.#insertWithRetry(
-        (attempt) => this.#insertPayloadInserts(payloadInserts, attempt),
-        "payload inserts",
-        flushId
-      );
-
-      // Log any errors that occurred
       if (taskRunError) {
         this.logger.error("Error inserting task run inserts", {
           error: taskRunError,
@@ -649,31 +999,25 @@ export class RunsReplicationService {
 
       this.logger.debug("Flushed inserts", {
         flushId,
-        taskRunInserts: taskRunInserts.length,
-        payloadInserts: payloadInserts.length,
+        taskRunInserts: combinedTaskRunInserts.length,
+        payloadInserts: combinedPayloadInserts.length,
       });
 
-      this.events.emit("batchFlushed", { flushId, taskRunInserts, payloadInserts });
+      this.events.emit("batchFlushed", {
+        flushId,
+        taskRunInserts: combinedTaskRunInserts,
+        payloadInserts: combinedPayloadInserts,
+      });
 
-      // Record metrics
       const flushDurationMs = performance.now() - flushStartTime;
       const hasErrors = taskRunError !== null || payloadError !== null;
 
       this._batchSizeHistogram.record(batch.length);
       this._flushDurationHistogram.record(flushDurationMs);
       this._batchesFlushedCounter.add(1, { success: !hasErrors });
-
-      if (!taskRunError) {
-        this._taskRunsInsertedCounter.add(taskRunInserts.length);
-      }
-
-      if (!payloadError) {
-        this._payloadsInsertedCounter.add(payloadInserts.length);
-      }
     });
   }
 
-  // New method to handle inserts with retry logic for connection errors
   async #insertWithRetry<T>(
     insertFn: (attempt: number) => Promise<T>,
     operationName: string,
@@ -770,50 +1114,135 @@ export class RunsReplicationService {
     };
   }
 
-  async #insertTaskRunInserts(taskRunInserts: TaskRunInsertArray[], attempt: number) {
+  async #insertTaskRunInserts(
+    clickhouse: ClickHouse,
+    taskRunInserts: TaskRunInsertArray[],
+    attempt: number
+  ) {
+    if (taskRunInserts.length === 0) {
+      return;
+    }
     return await startSpan(this._tracer, "insertTaskRunsInserts", async (span) => {
-      const [insertError, insertResult] =
-        await this.options.clickhouse.taskRuns.insertCompactArrays(taskRunInserts, {
+      const rawInsert = async (rows: TaskRunInsertArray[], extraSettings?: ClickHouseSettings) => {
+        const [insertError, insertResult] = await clickhouse.taskRuns.insertCompactArrays(rows, {
           params: {
-            clickhouse_settings: this.#getClickhouseInsertSettings(),
+            clickhouse_settings: { ...this.#getClickhouseInsertSettings(), ...extraSettings },
           },
         });
+        if (insertError) {
+          this.logger.error("Error inserting task run inserts attempt", {
+            error: insertError,
+            attempt,
+          });
+          recordSpanError(span, insertError);
+          throw insertError;
+        }
+        return insertResult;
+      };
 
-      if (insertError) {
-        this.logger.error("Error inserting task run inserts attempt", {
-          error: insertError,
-          attempt,
-        });
-
-        recordSpanError(span, insertError);
-        throw insertError;
-      }
-
-      return insertResult;
+      const outcome = await insertWithLimitedStrip({
+        rows: taskRunInserts,
+        contextLabel: "task_runs_v2",
+        logger: this.logger,
+        logContext: { attempt },
+        insert: (rows) => rawInsert(rows),
+        insertSync: (rows) =>
+          rawInsert(rows, { async_insert: 0, input_format_parallel_parsing: 0 }),
+        insertAllowingBadRows: (rows) =>
+          rawInsert(rows, {
+            async_insert: 0,
+            input_format_parallel_parsing: 0,
+            input_format_allow_errors_num: String(rows.length),
+            input_format_allow_errors_ratio: 1,
+          }),
+        stripJsonColumns: stripTaskRunJsonColumns,
+        maxPoisonStrips: this.options.maxPoisonStripsPerBatch,
+        hasMaterializedViews: true,
+      });
+      this.#recordRecoveryOutcome(outcome, "task_runs_v2", taskRunInserts.length);
+      return outcome;
     });
   }
 
-  async #insertPayloadInserts(payloadInserts: PayloadInsertArray[], attempt: number) {
+  async #insertPayloadInserts(
+    clickhouse: ClickHouse,
+    payloadInserts: PayloadInsertArray[],
+    attempt: number
+  ) {
+    if (payloadInserts.length === 0) {
+      return;
+    }
     return await startSpan(this._tracer, "insertPayloadInserts", async (span) => {
-      const [insertError, insertResult] =
-        await this.options.clickhouse.taskRuns.insertPayloadsCompactArrays(payloadInserts, {
-          params: {
-            clickhouse_settings: this.#getClickhouseInsertSettings(),
-          },
-        });
+      const rawInsert = async (rows: PayloadInsertArray[], extraSettings?: ClickHouseSettings) => {
+        const [insertError, insertResult] = await clickhouse.taskRuns.insertPayloadsCompactArrays(
+          rows,
+          {
+            params: {
+              clickhouse_settings: { ...this.#getClickhouseInsertSettings(), ...extraSettings },
+            },
+          }
+        );
+        if (insertError) {
+          this.logger.error("Error inserting payload inserts attempt", {
+            error: insertError,
+            attempt,
+          });
+          recordSpanError(span, insertError);
+          throw insertError;
+        }
+        return insertResult;
+      };
 
-      if (insertError) {
-        this.logger.error("Error inserting payload inserts attempt", {
-          error: insertError,
-          attempt,
-        });
-
-        recordSpanError(span, insertError);
-        throw insertError;
-      }
-
-      return insertResult;
+      const outcome = await insertWithBadRowSkip({
+        rows: payloadInserts,
+        contextLabel: "raw_task_runs_payload_v1",
+        logger: this.logger,
+        logContext: { attempt },
+        insert: (rows) => rawInsert(rows),
+        insertAllowingBadRows: (rows) =>
+          rawInsert(rows, {
+            async_insert: 0,
+            input_format_parallel_parsing: 0,
+            input_format_allow_errors_num: String(rows.length),
+            input_format_allow_errors_ratio: 1,
+          }),
+        hasMaterializedViews: false,
+      });
+      this.#recordRecoveryOutcome(outcome, "raw_task_runs_payload_v1", payloadInserts.length);
+      return outcome;
     });
+  }
+
+  #recordRecoveryOutcome(
+    outcome: JsonParseRecoveryOutcome,
+    contextLabel: string,
+    batchSize: number
+  ) {
+    if (outcome.kind !== "recovered") {
+      return;
+    }
+
+    this._rowIsolationRecoveries += 1;
+    this._rowIsolatedBatchesCounter.add(1, { table: contextLabel });
+
+    if (outcome.capped) {
+      this._recoveryCapHits += 1;
+      this._recoveryCapHitsCounter.add(1, { table: contextLabel });
+    }
+
+    if (outcome.rowsStripped > 0) {
+      this._rowsStripped += outcome.rowsStripped;
+      this._rowsStrippedCounter.add(outcome.rowsStripped, { table: contextLabel });
+    }
+
+    if (outcome.rowsDropped > 0) {
+      this._permanentlyDroppedRows += outcome.rowsDropped;
+      this._rowsDroppedCounter.add(outcome.rowsDropped, { table: contextLabel });
+      if (outcome.rowsDroppedExact && outcome.rowsDropped === batchSize) {
+        this._permanentlyDroppedBatches += 1;
+        this._droppedBatchesCounter.add(1, { table: contextLabel });
+      }
+    }
   }
 
   async #prepareRunInserts(
@@ -860,12 +1289,13 @@ export class RunsReplicationService {
     const errorData = { data: run.error };
 
     // Calculate error fingerprint for failed runs
-    const errorFingerprint = (
+    const errorFingerprint =
       !this._disableErrorFingerprinting &&
-      ['SYSTEM_FAILURE', 'CRASHED', 'INTERRUPTED', 'COMPLETED_WITH_ERRORS', 'TIMED_OUT'].includes(run.status)
-    )
-      ? calculateErrorFingerprint(run.error)
-      : '';
+      ["SYSTEM_FAILURE", "CRASHED", "INTERRUPTED", "COMPLETED_WITH_ERRORS", "TIMED_OUT"].includes(
+        run.status
+      )
+        ? calculateErrorFingerprint(run.error)
+        : "";
 
     const annotations = this.#parseAnnotations(run.annotations);
 
@@ -917,10 +1347,13 @@ export class RunsReplicationService {
       event === "delete" ? 1 : 0, // _is_deleted
       run.concurrencyKey ?? "", // concurrency_key
       run.bulkActionGroupIds ?? [], // bulk_action_group_ids
-      run.masterQueue ?? "", // worker_queue
+      baseWorkerQueue(run.masterQueue ?? ""), // worker_queue (raw - operators slice by this)
+      run.region ?? "", // region (geo for customers)
+      run.planType ?? "", // plan_type
       run.maxDurationInSeconds ?? null, // max_duration_in_seconds
       annotations?.triggerSource ?? "", // trigger_source
       annotations?.rootTriggerSource ?? "", // root_trigger_source
+      annotations?.taskKind ?? "", // task_kind
       run.isWarmStart ?? null, // is_warm_start
     ];
   }
@@ -978,7 +1411,6 @@ export class RunsReplicationService {
 
     return { data: parsedData };
   }
-
 }
 
 export type ConcurrentFlushSchedulerConfig<T> = {
@@ -1161,4 +1593,29 @@ export class ConcurrentFlushScheduler<T> {
 function lsnToUInt64(lsn: string): bigint {
   const [seg, off] = lsn.split("/");
   return (BigInt("0x" + seg) << 32n) | BigInt("0x" + off);
+}
+
+function landedRowCount(groupSize: number, outcome: JsonParseRecoveryOutcome): number {
+  if (outcome.kind === "recovered") {
+    return Math.max(0, groupSize - outcome.rowsDropped);
+  }
+  return groupSize;
+}
+
+const STRIPPED_JSON: { data: unknown } = { data: undefined };
+
+/**
+ * Empties `output`, the run JSON that in practice exceeds what ClickHouse can
+ * ingest (a large or deeply nested task return value). `error` is deliberately
+ * left alone: emptying it while keeping `error_fingerprint` would let the row
+ * match the error materialized views with no error content, and since those
+ * views pick their display columns with `any()` over the fingerprint group, one
+ * stripped run could retitle every run sharing that fingerprint. A run whose
+ * `error` is itself un-ingestable therefore makes no progress here and falls
+ * through to the `allow_errors` bail, which skips just that row.
+ */
+function stripTaskRunJsonColumns(row: TaskRunInsertArray): TaskRunInsertArray {
+  const stripped = [...row] as TaskRunInsertArray;
+  stripped[TASK_RUN_INDEX.output] = STRIPPED_JSON;
+  return stripped;
 }

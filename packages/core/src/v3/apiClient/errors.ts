@@ -3,7 +3,7 @@ export type APIHeaders = Record<string, string | null | undefined>;
 export class ApiError extends Error {
   readonly status: number | undefined;
   readonly headers: APIHeaders | undefined;
-  readonly error: Object | undefined;
+  readonly error: object | undefined;
 
   readonly code: string | null | undefined;
   readonly param: string | null | undefined;
@@ -11,7 +11,7 @@ export class ApiError extends Error {
 
   constructor(
     status: number | undefined,
-    error: Object | undefined,
+    error: object | undefined,
     message: string | undefined,
     headers: APIHeaders | undefined
   ) {
@@ -33,10 +33,10 @@ export class ApiError extends Error {
         ? error.message
         : JSON.stringify(error.message)
       : typeof error === "string"
-      ? error
-      : error
-      ? JSON.stringify(error)
-      : undefined;
+        ? error
+        : error
+          ? JSON.stringify(error)
+          : undefined;
 
     if (errorMessage) {
       return errorMessage;
@@ -59,7 +59,7 @@ export class ApiError extends Error {
 
   static generate(
     status: number | undefined,
-    errorResponse: Object | undefined,
+    errorResponse: object | undefined,
     message: string | undefined,
     headers: APIHeaders | undefined
   ) {
@@ -117,31 +117,43 @@ export class ApiConnectionError extends ApiError {
 }
 
 export class BadRequestError extends ApiError {
-  override readonly status: 400 = 400;
+  override readonly status = 400 as const;
 }
 
 export class AuthenticationError extends ApiError {
-  override readonly status: 401 = 401;
+  override readonly status = 401 as const;
 }
 
 export class PermissionDeniedError extends ApiError {
-  override readonly status: 403 = 403;
+  override readonly status = 403 as const;
+}
+
+/**
+ * True when `error` is a 401/403 from the Trigger API (e.g. expired run-scoped PAT on realtime streams).
+ * Uses structural checks so it works even if multiple copies of `@trigger.dev/core` are bundled (subclass `instanceof` can fail).
+ */
+export function isTriggerRealtimeAuthError(error: unknown): boolean {
+  if (error === null || typeof error !== "object") {
+    return false;
+  }
+  const e = error as ApiError;
+  return e.name === "TriggerApiError" && (e.status === 401 || e.status === 403);
 }
 
 export class NotFoundError extends ApiError {
-  override readonly status: 404 = 404;
+  override readonly status = 404 as const;
 }
 
 export class ConflictError extends ApiError {
-  override readonly status: 409 = 409;
+  override readonly status = 409 as const;
 }
 
 export class UnprocessableEntityError extends ApiError {
-  override readonly status: 422 = 422;
+  override readonly status = 422 as const;
 }
 
 export class RateLimitError extends ApiError {
-  override readonly status: 429 = 429;
+  override readonly status = 429 as const;
 
   get millisecondsUntilReset(): number | undefined {
     // x-ratelimit-reset is the unix timestamp in milliseconds when the rate limit will reset.
@@ -165,7 +177,7 @@ export class RateLimitError extends ApiError {
 export class InternalServerError extends ApiError {}
 
 export class ApiSchemaValidationError extends ApiError {
-  override readonly status: 200 = 200;
+  override readonly status = 200 as const;
   readonly rawBody: any;
 
   constructor({

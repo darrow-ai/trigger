@@ -3,6 +3,7 @@ import { z } from "zod";
 import { type TaskRunListSearchFilters } from "~/components/runs/v3/RunFilters";
 import type { Organization } from "~/models/organization.server";
 import type { Project } from "~/models/project.server";
+import { RUNS_BULK_INSPECTOR_OPEN_VALUE } from "~/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.runs._index/shouldRevalidateRunsList";
 import { objectToSearchParams } from "./searchParams";
 import { type WaitpointSearchParams } from "~/components/runs/v3/WaitpointTokenFilters";
 export type OrgForPath = Pick<Organization, "slug">;
@@ -61,6 +62,41 @@ export function impersonate(path: string) {
   return `/@${path}`;
 }
 
+/**
+ * Where a `/@/orgs/<slug>/<splat>` impersonation link lands once impersonation
+ * has started: the same deep link with the `/@` prefix stripped.
+ *
+ * `search` must be carried through explicitly. A `/@/runs/<id>` link redirects
+ * to a `v3RunSpanPath`, whose `?span=<spanId>` selects the span to open, so
+ * dropping it lands the admin on the run with nothing selected.
+ */
+export function impersonationDestinationPath(
+  organizationSlug: string,
+  splatPath: string,
+  search: string = ""
+) {
+  return `/orgs/${organizationSlug}/${splatPath}${search}`;
+}
+
+/**
+ * Where the impersonation consent page's form must POST back to.
+ *
+ * The form has to name this path explicitly. A `<Form>` with no `action`
+ * resolves to `useResolvedPath(".")`, and because this app does not enable
+ * `future.v3_relativeSplatPath`, that resolves to the matched route's
+ * `pathnameBase` — which excludes the splat. The form would post to
+ * `/@/orgs/<slug>`, the action would see an empty splat, and the admin would
+ * land on the organization root instead of the deep link the consent page just
+ * promised them.
+ */
+export function impersonationConsentPostBackPath(
+  organizationSlug: string,
+  splatPath: string,
+  search: string = ""
+) {
+  return impersonate(impersonationDestinationPath(organizationSlug, splatPath, search));
+}
+
 export function accountPath() {
   return `/account`;
 }
@@ -112,6 +148,14 @@ export function selectPlanPath(organization: OrgForPath) {
 
 export function organizationTeamPath(organization: OrgForPath) {
   return `${organizationPath(organization)}/settings/team`;
+}
+
+export function organizationRolesPath(organization: OrgForPath) {
+  return `${organizationPath(organization)}/settings/roles`;
+}
+
+export function organizationSsoPath(organization: OrgForPath) {
+  return `${organizationPath(organization)}/settings/sso`;
 }
 
 export function inviteTeamMemberPath(organization: OrgForPath) {
@@ -192,6 +236,14 @@ export function v3EnvironmentPath(
   return `/orgs/${organizationParam(organization)}/projects/${projectParam(
     project
   )}/env/${environmentParam(environment)}`;
+}
+
+export function v3TasksDashboardPath(
+  organization: OrgForPath,
+  project: ProjectForPath,
+  environment: EnvironmentForPath
+) {
+  return `${v3EnvironmentPath(organization, project, environment)}/tasks/dashboard`;
 }
 
 export function v3TasksStreamingPath(
@@ -303,6 +355,14 @@ export function v3BuiltInDashboardPath(
   return `${v3EnvironmentPath(organization, project, environment)}/dashboards/${key}`;
 }
 
+export function v3DashboardsLandingPath(
+  organization: OrgForPath,
+  project: ProjectForPath,
+  environment: EnvironmentForPath
+) {
+  return `${v3EnvironmentPath(organization, project, environment)}/dashboards`;
+}
+
 export function v3TestTaskPath(
   organization: OrgForPath,
   project: ProjectForPath,
@@ -311,6 +371,56 @@ export function v3TestTaskPath(
 ) {
   return `${v3TestPath(organization, project, environment)}/tasks/${encodeURIComponent(
     task.taskIdentifier
+  )}`;
+}
+
+export function v3PlaygroundPath(
+  organization: OrgForPath,
+  project: ProjectForPath,
+  environment: EnvironmentForPath
+) {
+  return `${v3EnvironmentPath(organization, project, environment)}/playground`;
+}
+
+export function v3PlaygroundAgentPath(
+  organization: OrgForPath,
+  project: ProjectForPath,
+  environment: EnvironmentForPath,
+  agentSlug: string
+) {
+  return `${v3PlaygroundPath(organization, project, environment)}/${encodeURIComponent(agentSlug)}`;
+}
+
+export function v3AgentTaskPath(
+  organization: OrgForPath,
+  project: ProjectForPath,
+  environment: EnvironmentForPath,
+  agentSlug: string
+) {
+  return `${v3EnvironmentPath(organization, project, environment)}/agents/${encodeURIComponent(
+    agentSlug
+  )}`;
+}
+
+export function v3StandardTaskPath(
+  organization: OrgForPath,
+  project: ProjectForPath,
+  environment: EnvironmentForPath,
+  taskSlug: string
+) {
+  return `${v3EnvironmentPath(organization, project, environment)}/tasks/standard/${encodeURIComponent(
+    taskSlug
+  )}`;
+}
+
+export function v3ScheduledTaskPath(
+  organization: OrgForPath,
+  project: ProjectForPath,
+  environment: EnvironmentForPath,
+  taskSlug: string
+) {
+  return `${v3EnvironmentPath(organization, project, environment)}/tasks/scheduled/${encodeURIComponent(
+    taskSlug
   )}`;
 }
 
@@ -334,7 +444,7 @@ export function v3CreateBulkActionPath(
   action?: "replay" | "cancel"
 ) {
   const searchParams = objectToSearchParams(filters) ?? new URLSearchParams();
-  searchParams.set("bulkInspector", "show");
+  searchParams.set("bulkInspector", RUNS_BULK_INSPECTOR_OPEN_VALUE);
   if (mode) {
     searchParams.set("mode", mode);
   }
@@ -405,14 +515,6 @@ export function v3RunIdempotencyKeyResetPath(
   )}/env/${environmentParam(environment)}/runs/${run.friendlyId}/idempotencyKey/reset`;
 }
 
-export function v3SchedulesPath(
-  organization: OrgForPath,
-  project: ProjectForPath,
-  environment: EnvironmentForPath
-) {
-  return `${v3EnvironmentPath(organization, project, environment)}/schedules`;
-}
-
 export function v3SchedulePath(
   organization: OrgForPath,
   project: ProjectForPath,
@@ -443,12 +545,25 @@ export function v3NewSchedulePath(
   return `${v3EnvironmentPath(organization, project, environment)}/schedules/new`;
 }
 
+export function v3SchedulesAddOnPath(organization: OrgForPath) {
+  return `/resources/orgs/${organizationParam(organization)}/schedules-addon`;
+}
+
 export function v3QueuesPath(
   organization: OrgForPath,
   project: ProjectForPath,
   environment: EnvironmentForPath
 ) {
   return `${v3EnvironmentPath(organization, project, environment)}/queues`;
+}
+
+export function v3QueuePath(
+  organization: OrgForPath,
+  project: ProjectForPath,
+  environment: EnvironmentForPath,
+  queue: { friendlyId: string }
+) {
+  return `${v3QueuesPath(organization, project, environment)}/${queue.friendlyId}`;
 }
 
 export function v3WaitpointTokensPath(
@@ -480,6 +595,23 @@ export function v3BatchesPath(
   environment: EnvironmentForPath
 ) {
   return `${v3EnvironmentPath(organization, project, environment)}/batches`;
+}
+
+export function v3SessionsPath(
+  organization: OrgForPath,
+  project: ProjectForPath,
+  environment: EnvironmentForPath
+) {
+  return `${v3EnvironmentPath(organization, project, environment)}/sessions`;
+}
+
+export function v3SessionPath(
+  organization: OrgForPath,
+  project: ProjectForPath,
+  environment: EnvironmentForPath,
+  session: { friendlyId: string }
+) {
+  return `${v3SessionsPath(organization, project, environment)}/${session.friendlyId}`;
 }
 
 export function v3BatchPath(
@@ -637,6 +769,14 @@ export function branchesPath(
   return `${v3EnvironmentPath(organization, project, environment)}/branches`;
 }
 
+export function branchesDevPath(
+  organization: OrgForPath,
+  project: ProjectForPath,
+  environment: EnvironmentForPath
+) {
+  return `${v3EnvironmentPath(organization, project, environment)}/dev-branches`;
+}
+
 export function concurrencyPath(
   organization: OrgForPath,
   project: ProjectForPath,
@@ -667,8 +807,13 @@ export function v3BillingPath(organization: OrgForPath, message?: string) {
   }`;
 }
 
+export function v3BillingLimitsPath(organization: OrgForPath) {
+  return `${organizationPath(organization)}/settings/billing-limits`;
+}
+
+/** @deprecated Use v3BillingLimitsPath — redirects from billing-alerts are preserved */
 export function v3BillingAlertsPath(organization: OrgForPath) {
-  return `${organizationPath(organization)}/settings/billing-alerts`;
+  return v3BillingLimitsPath(organization);
 }
 
 export function v3PrivateConnectionsPath(organization: OrgForPath) {

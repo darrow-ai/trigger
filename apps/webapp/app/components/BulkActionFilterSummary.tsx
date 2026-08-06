@@ -9,7 +9,7 @@ import { Paragraph } from "./primitives/Paragraph";
 import simplur from "simplur";
 import { appliedSummary, dateFromString, timeFilterRenderValues } from "./runs/v3/SharedFilters";
 import { formatNumber } from "~/utils/numberFormatter";
-import { SpinnerWhite } from "./primitives/Spinner";
+import { Spinner } from "./primitives/Spinner";
 import { ArrowPathIcon, CheckIcon, XCircleIcon } from "@heroicons/react/20/solid";
 import { XCircleIcon as XCircleIconOutline } from "@heroicons/react/24/outline";
 import assertNever from "assert-never";
@@ -44,7 +44,11 @@ export function BulkActionFilterSummary({
         </Paragraph>
       );
     case "filter": {
-      const { label, valueLabel, rangeType } = timeFilterRenderValues({
+      const {
+        label,
+        valueLabel,
+        rangeType: _rangeType,
+      } = timeFilterRenderValues({
         from: filters.from ? dateFromString(`${filters.from}`) : undefined,
         to: filters.to ? dateFromString(`${filters.to}`) : undefined,
         period: filters.period,
@@ -215,6 +219,19 @@ export function BulkActionFilterSummary({
                     />
                   );
                 }
+                case "regions": {
+                  const values = Array.isArray(value) ? value : [`${value}`];
+                  return (
+                    <AppliedFilter
+                      variant="minimal/medium"
+                      key={key}
+                      label={filterTitle(key)}
+                      icon={filterIcon(key)}
+                      value={appliedSummary(values)}
+                      removable={false}
+                    />
+                  );
+                }
                 case "machines": {
                   const values = Array.isArray(value) ? value : [`${value}`];
                   return (
@@ -236,6 +253,19 @@ export function BulkActionFilterSummary({
                       label={"Error ID"}
                       icon={filterIcon(key)}
                       value={value}
+                      removable={false}
+                    />
+                  );
+                }
+                case "sources": {
+                  const values = Array.isArray(value) ? value : [`${value}`];
+                  return (
+                    <AppliedFilter
+                      variant="minimal/medium"
+                      key={key}
+                      label={filterTitle(key)}
+                      icon={filterIcon(key)}
+                      value={appliedSummary(values)}
                       removable={false}
                     />
                   );
@@ -276,5 +306,5 @@ export function EstimatedCount({ count }: { count?: number }) {
     return <>~{formatNumber(count)}</>;
   }
 
-  return <SpinnerWhite className="mx-0.5 -mt-0.5 inline size-3" />;
+  return <Spinner color="blue" className="mx-0.5 -mt-0.5 inline size-3" />;
 }

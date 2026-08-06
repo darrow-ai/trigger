@@ -1,28 +1,49 @@
 import { createReadableStreamFromReadable, type EntryContext } from "@remix-run/node"; // or cloudflare/deno
 import { RemixServer } from "@remix-run/react";
+import * as Sentry from "@sentry/remix";
 import { wrapHandleErrorWithSentry } from "@sentry/remix";
+import { addTenantContextToEvent } from "~/utils/sentryTenantContext.server";
 import { parseAcceptLanguage } from "intl-parse-accept-language";
 import isbot from "isbot";
 import { renderToPipeableStream } from "react-dom/server";
 import { PassThrough } from "stream";
-import * as Worker from "~/services/worker.server";
+import { initMollifierDrainerWorker } from "~/v3/mollifierDrainerWorker.server";
+import { initMollifierStaleSweepWorker } from "~/v3/mollifierStaleSweepWorker.server";
+import { initBillingLimitWorker } from "~/v3/billingLimitWorker.server";
+import { initQueueMetricsConsumer, initQueueMetricsEmitter } from "~/v3/queueMetrics.server";
 import { bootstrap } from "./bootstrap";
 import { LocaleContextProvider } from "./components/primitives/LocaleProvider";
-import {
-  OperatingSystemContextProvider,
-  OperatingSystemPlatform,
-} from "./components/primitives/OperatingSystemProvider";
-import { Prisma } from "./db.server";
+import type { OperatingSystemPlatform } from "./components/primitives/OperatingSystemProvider";
+import { OperatingSystemContextProvider } from "./components/primitives/OperatingSystemProvider";
+import { assertRunOpsSplitSentinel, Prisma } from "./db.server";
 import { env } from "./env.server";
 import { eventLoopMonitor } from "./eventLoopMonitor.server";
 import { logger } from "./services/logger.server";
-import { resourceMonitor } from "./services/resourceMonitor.server";
 import { singleton } from "./utils/singleton";
 import { remoteBuildsEnabled } from "./v3/remoteImageBuilder.server";
 import {
   registerRunEngineEventBusHandlers,
   setupBatchQueueCallbacks,
 } from "./v3/runEngineHandlers.server";
+import { registerRunChangeNotifierHandlers } from "./services/realtime/runChangeNotifierHandlers.server";
+// Touch the sessions replication singleton at entry so it boots deterministically
+// on webapp startup. The singleton's initializer wires start (gated on
+// `clickhouseFactory.isReady()`) and SIGTERM/SIGINT shutdown — mirrors
+// runsReplicationInstance.
+//
+// IMPORTANT: do NOT replace this with `void sessionsReplicationInstance;`.
+// `apps/webapp/package.json` declares `"sideEffects": false`, so esbuild
+// treats `void <identifier>;` as a pure expression statement and tree-shakes
+// the entire import — the singleton's initializer never fires and the
+// sessions→ClickHouse logical replication slot stops being consumed. Assigning
+// to globalThis is an unambiguous side effect the bundler must preserve. See
+// TRI-9864 for the incident write-up.
+import { sessionsReplicationInstance } from "./services/sessionsReplicationInstance.server";
+(globalThis as Record<string, unknown>).__sessionsReplicationInstance = sessionsReplicationInstance;
+import { globalFlagsRegistry } from "./v3/globalFlagsRegistry.server";
+(globalThis as Record<string, unknown>).__globalFlagsRegistry = globalFlagsRegistry;
+import { workerRegionRegistry } from "./v3/workerRegions.server";
+(globalThis as Record<string, unknown>).__workerRegionRegistry = workerRegionRegistry;
 
 const ABORT_DELAY = 30000;
 
@@ -33,6 +54,12 @@ export default function handleRequest(
   remixContext: EntryContext
 ) {
   const url = new URL(request.url);
+
+  // Stale documents reference /build asset hashes that 404 after a deploy —
+  // always revalidate HTML. Route-set headers win.
+  if (!responseHeaders.has("Cache-Control")) {
+    responseHeaders.set("Cache-Control", "no-cache");
+  }
 
   if (url.pathname.startsWith("/login")) {
     responseHeaders.set("X-Frame-Options", "SAMEORIGIN");
@@ -83,6 +110,10 @@ function handleBotRequest(
 ) {
   return new Promise((resolve, reject) => {
     let shellRendered = false;
+    // Timer handle is cleared in every terminal callback so the abort closure
+    // (which captures the full React render tree + remixContext) doesn't pin
+    // memory for 30s per successful request. See react-router PR #14200.
+    let abortTimer: NodeJS.Timeout | undefined;
     const { pipe, abort } = renderToPipeableStream(
       <OperatingSystemContextProvider platform={platform}>
         <LocaleContextProvider locales={locales}>
@@ -105,8 +136,10 @@ function handleBotRequest(
           );
 
           pipe(body);
+          clearTimeout(abortTimer);
         },
         onShellError(error: unknown) {
+          clearTimeout(abortTimer);
           reject(error);
         },
         onError(error: unknown) {
@@ -121,7 +154,7 @@ function handleBotRequest(
       }
     );
 
-    setTimeout(abort, ABORT_DELAY);
+    abortTimer = setTimeout(abort, ABORT_DELAY);
   });
 }
 
@@ -135,6 +168,10 @@ function handleBrowserRequest(
 ) {
   return new Promise((resolve, reject) => {
     let shellRendered = false;
+    // Timer handle is cleared in every terminal callback so the abort closure
+    // (which captures the full React render tree + remixContext) doesn't pin
+    // memory for 30s per successful request. See react-router PR #14200.
+    let abortTimer: NodeJS.Timeout | undefined;
     const { pipe, abort } = renderToPipeableStream(
       <OperatingSystemContextProvider platform={platform}>
         <LocaleContextProvider locales={locales}>
@@ -157,8 +194,10 @@ function handleBrowserRequest(
           );
 
           pipe(body);
+          clearTimeout(abortTimer);
         },
         onShellError(error: unknown) {
+          clearTimeout(abortTimer);
           reject(error);
         },
         onError(error: unknown) {
@@ -173,7 +212,7 @@ function handleBrowserRequest(
       }
     );
 
-    setTimeout(abort, ABORT_DELAY);
+    abortTimer = setTimeout(abort, ABORT_DELAY);
   });
 }
 
@@ -193,9 +232,11 @@ export const handleError = wrapHandleErrorWithSentry((error, { request }) => {
   }
 });
 
-Worker.init().catch((error) => {
-  logError(error);
-});
+initMollifierDrainerWorker();
+initMollifierStaleSweepWorker();
+initBillingLimitWorker();
+initQueueMetricsEmitter();
+initQueueMetricsConsumer();
 
 bootstrap().catch((error) => {
   logError(error);
@@ -203,10 +244,6 @@ bootstrap().catch((error) => {
 
 function logError(error: unknown, request?: Request) {
   console.error(error);
-
-  if (error instanceof Error && error.message.startsWith("There are locked jobs present")) {
-    console.log("⚠️  graphile-worker migration issue detected!");
-  }
 }
 
 process.on("uncaughtException", (error, origin) => {
@@ -233,12 +270,42 @@ process.on("uncaughtException", (error, origin) => {
   process.exit(1);
 });
 
+// Boot-time run-ops split interlock. Async, so it runs as a
+// fire-and-forget at startup; a flag-on-but-sentinel-fails misconfig crashes
+// the process loudly before any run-ops routing is wired.
+singleton("AssertRunOpsSplitSentinel", () => {
+  assertRunOpsSplitSentinel().catch((error) => {
+    logger.error("Run-ops split sentinel assertion failed; refusing to start", { error });
+    process.exit(1);
+  });
+  return true;
+});
+
 singleton("RunEngineEventBusHandlers", registerRunEngineEventBusHandlers);
 singleton("SetupBatchQueueCallbacks", setupBatchQueueCallbacks);
+// Attach the realtime run-changed publish delegations to the engine event bus.
+// No-ops (registers nothing) unless REALTIME_BACKEND_NATIVE_ENABLED=1.
+singleton("RunChangeNotifierHandlers", registerRunChangeNotifierHandlers);
+
+// Wrapped in singleton() so Remix's dev-mode CJS reloads don't append
+// duplicate copies of the processor — Sentry's processor list lives in
+// node_modules and persists across module reloads. Idempotent at runtime
+// (the processor is a pure read+stamp), but the pattern matches the rest
+// of this file.
+singleton("SentryTenantContextProcessor", () => {
+  if (env.SENTRY_DSN) {
+    Sentry.addEventProcessor(addTenantContextToEvent);
+  }
+  // Return a truthy value — `singleton()` uses `??=` so a `void`
+  // callback would re-execute (and re-register) on every dev reload.
+  return true;
+});
 
 export { apiRateLimiter } from "./services/apiRateLimit.server";
 export { engineRateLimiter } from "./services/engineRateLimit.server";
+export { otlpRateLimiter } from "./services/otlpRateLimit.server";
 export { runWithHttpContext } from "./services/httpAsyncStorage.server";
+export { tenantContextMiddleware } from "./services/tenantContextResolver.server";
 export { socketIo } from "./v3/handleSocketIo.server";
 export { wss } from "./v3/handleWebsockets.server";
 
@@ -250,8 +317,4 @@ if (remoteBuildsEnabled()) {
   console.log("🏗️  Remote builds enabled");
 } else {
   console.log("🏗️  Local builds enabled");
-}
-
-if (env.RESOURCE_MONITOR_ENABLED === "1") {
-  resourceMonitor.startMonitoring(1000);
 }

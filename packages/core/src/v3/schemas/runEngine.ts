@@ -1,5 +1,6 @@
 import { z } from "zod";
-import { Enum, MachinePreset, RuntimeEnvironmentType, TaskRunExecution } from "./common.js";
+import type { Enum, RuntimeEnvironmentType } from "./common.js";
+import { MachinePreset, TaskRunExecution } from "./common.js";
 import { EnvironmentType } from "./schemas.js";
 import type * as DB_TYPES from "@trigger.dev/database";
 
@@ -15,11 +16,15 @@ export const TriggerAction = z.enum(["trigger", "replay", "test"]).or(anyString)
 
 export type TriggerAction = z.infer<typeof TriggerAction>;
 
+export const TaskKind = z.enum(["STANDARD", "SCHEDULED", "AGENT"]).or(anyString);
+export type TaskKind = z.infer<typeof TaskKind>;
+
 export const RunAnnotations = z.object({
   triggerSource: TriggerSource,
   triggerAction: TriggerAction,
   rootTriggerSource: TriggerSource,
   rootScheduleId: z.string().optional(),
+  taskKind: TaskKind.optional(),
 });
 
 export type RunAnnotations = z.infer<typeof RunAnnotations>;
@@ -267,6 +272,8 @@ export const DequeuedMessage = z.object({
     id: z.string(),
     friendlyId: z.string(),
     version: z.string(),
+    // Canonical runtime identifier (e.g. "node", "node-22", "node-24", "bun")
+    runtime: z.string().optional(),
   }),
   deployment: z.object({
     id: z.string().optional(),
@@ -277,6 +284,7 @@ export const DequeuedMessage = z.object({
     id: z.string(),
     friendlyId: z.string(),
     isTest: z.boolean(),
+    isReplay: z.boolean().default(false),
     machine: MachinePreset,
     attemptNumber: z.number(),
     masterQueue: z.string(),

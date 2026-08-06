@@ -3,11 +3,14 @@ import { type LoaderFunctionArgs } from "@remix-run/server-runtime";
 import { Fragment } from "react";
 import { redirect, typedjson, useTypedLoaderData } from "remix-typedjson";
 import { AppContainer } from "~/components/layout/AppLayout";
-import { env } from "~/env.server";
 import { requireUser } from "~/services/session.server";
 import { cn } from "~/utils/cn";
 
 const stories: Story[] = [
+  {
+    name: "AI agent",
+    slug: "ai-agent",
+  },
   {
     name: "Animated panel",
     slug: "animated-panel",
@@ -61,12 +64,20 @@ const stories: Story[] = [
     slug: "free-plan-usage",
   },
   {
+    name: "Icons",
+    slug: "icons",
+  },
+  {
     name: "Info panel",
     slug: "info-panel",
   },
   {
     name: "Inline code",
     slug: "inline-code",
+  },
+  {
+    name: "Layout",
+    slug: "layout",
   },
   {
     name: "Loading bar divider",
@@ -103,6 +114,10 @@ const stories: Story[] = [
   {
     name: "Spinners",
     slug: "spinner",
+  },
+  {
+    name: "Streamdown",
+    slug: "streamdown",
   },
   {
     name: "Switch",
@@ -147,6 +162,12 @@ const stories: Story[] = [
   {
     name: "Usage",
     slug: "usage",
+  },
+  // Dashboard agent section
+  {
+    sectionTitle: "Dashboard agent",
+    name: "Agent UI",
+    slug: "agent-ui",
   },
   // Forms section
   {
@@ -231,7 +252,7 @@ function SideMenu({ stories }: { stories: Story[] }) {
       )}
     >
       <div className="flex h-full flex-col">
-        <div className="h-full overflow-hidden overflow-y-auto pt-2 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-charcoal-600">
+        <div className="h-full overflow-hidden overflow-y-auto pt-2 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-surface-control">
           {stories.map((story) => {
             return (
               <Fragment key={story.slug}>

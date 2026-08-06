@@ -14,6 +14,11 @@ import { PlacementTagProcessor } from "@trigger.dev/core/v3/serverOnly";
 import { env } from "../env.js";
 import { type K8sApi, createK8sApi, type k8s } from "../clients/kubernetes.js";
 import { getRunnerId } from "../util.js";
+import {
+  nodetypeNodeSelector,
+  runPodTolerations,
+  withBlockIoUringSeccompProfile,
+} from "./kubernetesPodSpec.js";
 
 type ResourceQuantities = {
   [K in "cpu" | "memory" | "ephemeral-storage"]?: string;
@@ -105,6 +110,11 @@ export class KubernetesWorkloadManager implements WorkloadManager {
     const runnerId = getRunnerId(opts.runFriendlyId, opts.nextAttemptNumber);
 
     try {
+      const basePodSpec = this.addPlacementTags(this.#defaultPodSpec, opts.placementTags);
+      const podSpec = this.opts.checkpointsEnabled
+        ? withBlockIoUringSeccompProfile(basePodSpec, opts.runtime)
+        : basePodSpec;
+
       await this.k8s.core.createNamespacedPod({
         namespace: this.namespace,
         body: {
@@ -119,9 +129,9 @@ export class KubernetesWorkloadManager implements WorkloadManager {
             },
           },
           spec: {
-            ...this.addPlacementTags(this.#defaultPodSpec, opts.placementTags),
+            ...podSpec,
             affinity: this.#getAffinity(opts),
-            tolerations: this.#getScheduleTolerations(this.#isScheduledRun(opts)),
+            tolerations: this.#getTolerations(this.#isScheduledRun(opts)),
             terminationGracePeriodSeconds: 60 * 60,
             containers: [
               {
@@ -152,6 +162,11 @@ export class KubernetesWorkloadManager implements WorkloadManager {
                   },
                   {
                     name: "TRIGGER_DEPLOYMENT_ID",
+                    value: opts.deploymentToken ?? opts.deploymentFriendlyId,
+                  },
+                  {
+                    // Plain friendlyId for telemetry (worker.id), not the opaque token in DEPLOYMENT_ID.
+                    name: "TRIGGER_DEPLOYMENT_FRIENDLY_ID",
                     value: opts.deploymentFriendlyId,
                   },
                   {
@@ -207,6 +222,10 @@ export class KubernetesWorkloadManager implements WorkloadManager {
                   {
                     name: "TRIGGER_MACHINE_MEMORY",
                     value: `${opts.machine.memory}`,
+                  },
+                  {
+                    name: "TRIGGER_SEND_RUN_DEBUG_LOGS",
+                    value: `${env.SEND_RUN_DEBUG_LOGS}`,
                   },
                   {
                     name: "LIMITS_CPU",
@@ -314,10 +333,11 @@ export class KubernetesWorkloadManager implements WorkloadManager {
             schedulerName: env.KUBERNETES_SCHEDULER_NAME,
           }
         : {}),
-      ...(env.KUBERNETES_WORKER_NODETYPE_LABEL
+      ...nodetypeNodeSelector(env.KUBERNETES_WORKER_NODETYPE_LABEL),
+      ...(env.KUBERNETES_POD_DNS_NDOTS_OVERRIDE_ENABLED
         ? {
-            nodeSelector: {
-              nodetype: env.KUBERNETES_WORKER_NODETYPE_LABEL,
+            dnsConfig: {
+              options: [{ name: "ndots", value: `${env.KUBERNETES_POD_DNS_NDOTS}` }],
             },
           }
         : {}),
@@ -420,7 +440,8 @@ export class KubernetesWorkloadManager implements WorkloadManager {
     // Only large machine affinity produces hard requirements (non-large runs must stay off the large pool).
     // Schedule affinity is soft both ways.
     const required = [
-      ...(largeNodeAffinity?.requiredDuringSchedulingIgnoredDuringExecution?.nodeSelectorTerms ?? []),
+      ...(largeNodeAffinity?.requiredDuringSchedulingIgnoredDuringExecution?.nodeSelectorTerms ??
+        []),
     ];
 
     const hasNodeAffinity = preferred.length > 0 || required.length > 0;
@@ -432,7 +453,9 @@ export class KubernetesWorkloadManager implements WorkloadManager {
     return {
       ...(hasNodeAffinity && {
         nodeAffinity: {
-          ...(preferred.length > 0 && { preferredDuringSchedulingIgnoredDuringExecution: preferred }),
+          ...(preferred.length > 0 && {
+            preferredDuringSchedulingIgnoredDuringExecution: preferred,
+          }),
           ...(required.length > 0 && {
             requiredDuringSchedulingIgnoredDuringExecution: { nodeSelectorTerms: required },
           }),
@@ -486,7 +509,10 @@ export class KubernetesWorkloadManager implements WorkloadManager {
   }
 
   #getScheduleNodeAffinityRules(isScheduledRun: boolean): k8s.V1NodeAffinity | undefined {
-    if (!env.KUBERNETES_SCHEDULED_RUN_AFFINITY_ENABLED || !env.KUBERNETES_SCHEDULED_RUN_AFFINITY_POOL_LABEL_VALUE) {
+    if (
+      !env.KUBERNETES_SCHEDULED_RUN_AFFINITY_ENABLED ||
+      !env.KUBERNETES_SCHEDULED_RUN_AFFINITY_POOL_LABEL_VALUE
+    ) {
       return undefined;
     }
 
@@ -529,12 +555,12 @@ export class KubernetesWorkloadManager implements WorkloadManager {
     };
   }
 
-  #getScheduleTolerations(isScheduledRun: boolean): k8s.V1Toleration[] | undefined {
-    if (!isScheduledRun || !env.KUBERNETES_SCHEDULED_RUN_TOLERATIONS?.length) {
-      return undefined;
-    }
-
-    return env.KUBERNETES_SCHEDULED_RUN_TOLERATIONS;
+  #getTolerations(isScheduledRun: boolean): k8s.V1Toleration[] | undefined {
+    return runPodTolerations(
+      env.KUBERNETES_RUNNER_TOLERATIONS,
+      env.KUBERNETES_SCHEDULED_RUN_TOLERATIONS,
+      isScheduledRun
+    );
   }
 
   #getProjectPodAffinity(projectId: string): k8s.V1PodAffinity | undefined {

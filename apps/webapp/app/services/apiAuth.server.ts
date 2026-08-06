@@ -1,5 +1,4 @@
 import { json } from "@remix-run/server-runtime";
-import { type Prettify } from "@trigger.dev/core";
 import { SignJWT, errors, jwtVerify } from "jose";
 import { z } from "zod";
 
@@ -7,11 +6,18 @@ import { $replica } from "~/db.server";
 import { env } from "~/env.server";
 import { findProjectByRef } from "~/models/project.server";
 import {
+  authIncludeBase,
+  authIncludeWithParent,
   findEnvironmentByApiKey,
+  findEnvironmentByApiKeyWithResolution,
   findEnvironmentByPublicApiKey,
+  toAuthenticated,
 } from "~/models/runtimeEnvironment.server";
+import type { RbacAbility, RbacResource } from "@trigger.dev/rbac";
 import { type RuntimeEnvironmentForEnvRepo } from "~/v3/environmentVariables/environmentVariablesRepository.server";
 import { logger } from "./logger.server";
+import { safeEnvironmentLogFields } from "./safeEnvironmentLog";
+import { missingJwtLogContext } from "./safeRequestLogContext";
 import {
   type PersonalAccessTokenAuthenticationResult,
   authenticateApiRequestWithPersonalAccessToken,
@@ -23,7 +29,11 @@ import {
   isOrganizationAccessToken,
 } from "./organizationAccessToken.server";
 import { isPublicJWT, validatePublicJwtKey } from "./realtime/jwtAuth.server";
-import { sanitizeBranchName } from "~/v3/gitBranch";
+import { isDefaultDevBranch, sanitizeBranchName } from "@trigger.dev/core/v3/utils/gitBranch";
+import {
+  authenticateAuthorizeBearerWithTelemetry,
+  observeLegacyBearerAuthentication,
+} from "~/services/authTelemetry.server";
 
 const ClaimsSchema = z.object({
   scopes: z.array(z.string()).optional(),
@@ -36,12 +46,10 @@ const ClaimsSchema = z.object({
     .optional(),
 });
 
-type Optional<T, K extends keyof T> = Prettify<Omit<T, K> & Partial<Pick<T, K>>>;
-
-export type AuthenticatedEnvironment = Optional<
-  NonNullable<Awaited<ReturnType<typeof findEnvironmentByApiKey>>>,
-  "orgMember"
->;
+// Re-export the slim shape defined in @trigger.dev/core. Single source of
+// truth across the auth boundary (RBAC plugin contract → webapp handlers).
+export type { AuthenticatedEnvironment } from "@trigger.dev/core/v3/auth/environment";
+import type { AuthenticatedEnvironment } from "@trigger.dev/core/v3/auth/environment";
 
 export type ApiAuthenticationResult =
   | ApiAuthenticationResultSuccess
@@ -52,10 +60,20 @@ export type ApiAuthenticationResultSuccess = {
   apiKey: string;
   type: "PUBLIC" | "PRIVATE" | "PUBLIC_JWT";
   environment: AuthenticatedEnvironment;
-  scopes?: string[];
   oneTimeUse?: boolean;
   realtime?: {
     skipColumns?: string[];
+  };
+  // Present when authentication went through the RBAC bearer controller.
+  // Legacy direct authentication intentionally omits it and remains fail-closed
+  // for restricted additional keys.
+  ability?: RbacAbility;
+  // Present when the request used a public JWT minted from a PAT/UAT exchange
+  // that stamped an `act` delegation claim. `actor.sub` is the acting user id,
+  // used for attribution (e.g. who resolved an error). Absent for plain env
+  // API keys (no user) and JWTs minted without delegation.
+  actor?: {
+    sub: string;
   };
 };
 
@@ -77,9 +95,9 @@ export async function authenticateApiRequest(
     return;
   }
 
-  const authentication = await authenticateApiKey(apiKey, { ...options, branchName });
-
-  return authentication;
+  return observeLegacyBearerAuthentication(request, () =>
+    authenticateApiKey(apiKey, { ...options, branchName })
+  );
 }
 
 /**
@@ -99,9 +117,9 @@ export async function authenticateApiRequestWithFailure(
     };
   }
 
-  const authentication = await authenticateApiKeyWithFailure(apiKey, { ...options, branchName });
-
-  return authentication;
+  return observeLegacyBearerAuthentication(request, () =>
+    authenticateApiKeyWithFailure(apiKey, { ...options, branchName })
+  );
 }
 
 /**
@@ -109,7 +127,11 @@ export async function authenticateApiRequestWithFailure(
  */
 export async function authenticateApiKey(
   apiKey: string,
-  options: { allowPublicKey?: boolean; allowJWT?: boolean; branchName?: string } = {}
+  options: {
+    allowPublicKey?: boolean;
+    allowJWT?: boolean;
+    branchName?: string;
+  } = {}
 ): Promise<ApiAuthenticationResultSuccess | undefined> {
   const result = getApiKeyResult(apiKey);
 
@@ -163,7 +185,6 @@ export async function authenticateApiKey(
         ok: true,
         ...result,
         environment: validationResults.environment,
-        scopes: parsedClaims.success ? parsedClaims.data.scopes : [],
         oneTimeUse: parsedClaims.success ? parsedClaims.data.otu : false,
         realtime: parsedClaims.success ? parsedClaims.data.realtime : undefined,
       };
@@ -177,7 +198,11 @@ export async function authenticateApiKey(
  */
 async function authenticateApiKeyWithFailure(
   apiKey: string,
-  options: { allowPublicKey?: boolean; allowJWT?: boolean; branchName?: string } = {}
+  options: {
+    allowPublicKey?: boolean;
+    allowJWT?: boolean;
+    branchName?: string;
+  } = {}
 ): Promise<ApiAuthenticationResult> {
   const result = getApiKeyResult(apiKey);
 
@@ -219,18 +244,24 @@ async function authenticateApiKeyWithFailure(
       };
     }
     case "PRIVATE": {
-      const environment = await findEnvironmentByApiKey(result.apiKey, options.branchName);
-      if (!environment) {
+      const resolution = await findEnvironmentByApiKeyWithResolution(
+        result.apiKey,
+        options.branchName
+      );
+      if (!resolution.ok) {
         return {
           ok: false,
-          error: "Invalid API Key",
+          error:
+            resolution.reason === "restricted"
+              ? "This endpoint does not support restricted API keys. Use an API key with full environment access."
+              : "Invalid API Key",
         };
       }
 
       return {
         ok: true,
         ...result,
-        environment,
+        environment: resolution.environment,
       };
     }
     case "PUBLIC_JWT": {
@@ -246,12 +277,57 @@ async function authenticateApiKeyWithFailure(
         ok: true,
         ...result,
         environment: validationResults.environment,
-        scopes: parsedClaims.success ? parsedClaims.data.scopes : [],
         oneTimeUse: parsedClaims.success ? parsedClaims.data.otu : false,
         realtime: parsedClaims.success ? parsedClaims.data.realtime : undefined,
       };
     }
   }
+}
+
+/**
+ * Authenticate an API-key request for a legacy (non-apiBuilder) route that
+ * needs to accept granular additional keys, then enforce that the key's ability
+ * authorizes `action` on `resource`. Root keys (and grace-window root keys)
+ * carry the unrestricted `admin` ability, preserving pre-granular behavior.
+ *
+ * Only apiKey credentials are accepted (no PAT / org token / public key). Use
+ * this for routes previously guarded by a bare `authenticateApiRequest` call.
+ */
+export async function authenticateApiKeyWithScope(
+  request: Request,
+  {
+    action,
+    resource,
+    allowJWT = false,
+  }: { action: string; resource: RbacResource; allowJWT?: boolean }
+): Promise<
+  | { ok: true; authentication: ApiAuthenticationResultSuccess }
+  | { ok: false; status: 401 | 403; error: string }
+> {
+  const apiKey = getApiKeyFromHeader(request.headers.get("Authorization"));
+  if (!apiKey) {
+    return { ok: false, status: 401, error: "Invalid or Missing API key" };
+  }
+
+  const result = await authenticateAuthorizeBearerWithTelemetry(
+    request,
+    { action, resource },
+    { allowJWT }
+  );
+  if (!result.ok) {
+    return result;
+  }
+
+  return {
+    ok: true,
+    authentication: {
+      ok: true,
+      apiKey,
+      type: "PRIVATE",
+      environment: result.environment,
+      ability: result.ability,
+    },
+  };
 }
 
 export async function authenticateAuthorizationHeader(
@@ -278,8 +354,14 @@ function isSecretApiKey(key: string) {
   return key.startsWith("tr_");
 }
 
+/**
+ * Reads the branch off the `x-trigger-branch` header and sanitizes it.
+ * Every server-side reader should go through here so sanitization is applied uniformly.
+ * The dev `"default"` sentinel is intentionally NOT resolved here:
+ * that translation is environment type-dependent.
+ */
 export function branchNameFromRequest(request: Request): string | undefined {
-  return request.headers.get("x-trigger-branch") ?? undefined;
+  return sanitizeBranchName(request.headers.get("x-trigger-branch")) ?? undefined;
 }
 
 function getApiKeyFromRequest(request: Request): {
@@ -308,10 +390,10 @@ function getApiKeyResult(apiKey: string): {
   const type = isPublicApiKey(apiKey)
     ? "PUBLIC"
     : isSecretApiKey(apiKey)
-    ? "PRIVATE"
-    : isPublicJWT(apiKey)
-    ? "PUBLIC_JWT"
-    : "PRIVATE"; // Fallback to private key
+      ? "PRIVATE"
+      : isPublicJWT(apiKey)
+        ? "PUBLIC_JWT"
+        : "PRIVATE"; // Fallback to private key
   return { apiKey, type };
 }
 
@@ -341,7 +423,7 @@ const defaultAllowedAuthenticationMethods: AllowedAuthenticationMethods = {
 };
 
 type FilteredAuthenticationResult<
-  T extends AllowedAuthenticationMethods = AllowedAuthenticationMethods
+  T extends AllowedAuthenticationMethods = AllowedAuthenticationMethods,
 > =
   | (T["personalAccessToken"] extends true
       ? Extract<AuthenticationResult, { type: "personalAccessToken" }>
@@ -377,7 +459,7 @@ type FilteredAuthenticationResult<
  * ```
  */
 export async function authenticateRequest<
-  T extends AllowedAuthenticationMethods = AllowedAuthenticationMethods
+  T extends AllowedAuthenticationMethods = AllowedAuthenticationMethods,
 >(
   request: Request,
   allowedAuthenticationMethods?: T
@@ -422,7 +504,10 @@ export async function authenticateRequest<
   }
 
   if (allowedMethods.apiKey) {
-    const result = await authenticateApiKey(apiKey, { allowPublicKey: false, branchName });
+    const result = await authenticateApiKey(apiKey, {
+      allowPublicKey: false,
+      branchName,
+    });
 
     if (!result) {
       return;
@@ -450,6 +535,14 @@ export async function authenticatedEnvironmentForAuthentication(
     slug = "stg";
   }
 
+  // Normalize the requested branch once: sanitize it, then collapse the dev
+  // `"default"` sentinel to "no branch" so it resolves to the root dev env
+  // rather than a (non-existent) branch literally named "default".
+  // TODO this slug check is brittle
+  const sanitizedBranch = sanitizeBranchName(branch);
+  const resolvedBranch =
+    slug === "dev" && isDefaultDevBranch(sanitizedBranch) ? null : sanitizedBranch;
+
   switch (auth.type) {
     case "apiKey": {
       if (!auth.result.ok) {
@@ -466,7 +559,10 @@ export async function authenticatedEnvironmentForAuthentication(
         );
       }
 
-      if (auth.result.environment.slug !== slug && auth.result.environment.branchName !== branch) {
+      if (
+        auth.result.environment.slug !== slug &&
+        auth.result.environment.branchName !== resolvedBranch
+      ) {
         throw json(
           {
             error:
@@ -495,9 +591,7 @@ export async function authenticatedEnvironmentForAuthentication(
         throw json({ error: "Project not found" }, { status: 404 });
       }
 
-      const sanitizedBranch = sanitizeBranchName(branch);
-
-      if (!sanitizedBranch) {
+      if (!resolvedBranch) {
         const environment = await $replica.runtimeEnvironment.findFirst({
           where: {
             projectId: project.id,
@@ -510,31 +604,31 @@ export async function authenticatedEnvironmentForAuthentication(
                 }
               : {}),
           },
-          include: {
-            project: true,
-            organization: true,
-          },
+          include: authIncludeBase,
         });
 
         if (!environment) {
           throw json({ error: "Environment not found" }, { status: 404 });
         }
 
-        return environment;
+        return toAuthenticated(environment);
       }
 
       const environment = await $replica.runtimeEnvironment.findFirst({
         where: {
           projectId: project.id,
-          type: "PREVIEW",
-          branchName: sanitizedBranch,
+          type: slug === "dev" ? "DEVELOPMENT" : "PREVIEW",
+          branchName: resolvedBranch,
+          ...(slug === "dev"
+            ? {
+                orgMember: {
+                  userId: user.id,
+                },
+              }
+            : {}),
           archivedAt: null,
         },
-        include: {
-          project: true,
-          organization: true,
-          parentEnvironment: true,
-        },
+        include: authIncludeWithParent,
       });
 
       if (!environment) {
@@ -542,15 +636,16 @@ export async function authenticatedEnvironmentForAuthentication(
       }
 
       if (!environment.parentEnvironment) {
-        throw json({ error: "Branch not associated with a preview environment" }, { status: 400 });
+        throw json({ error: "Branch not associated with a parent environment" }, { status: 400 });
       }
 
-      return {
+      // PREVIEW envs (and DEVELOPMENT branches) reuse the parent's apiKey for downstream auth flows
+      // (signed JWTs, internal-fetch helpers). Override before mapping so
+      // the slim shape carries the parent's key.
+      return toAuthenticated({
         ...environment,
         apiKey: environment.parentEnvironment.apiKey,
-        organization: environment.organization,
-        project: environment.project,
-      };
+      });
     }
     case "organizationAccessToken": {
       const organization = await $replica.organization.findUnique({
@@ -574,39 +669,31 @@ export async function authenticatedEnvironmentForAuthentication(
         throw json({ error: "Project not found" }, { status: 404 });
       }
 
-      const sanitizedBranch = sanitizeBranchName(branch);
-
-      if (!sanitizedBranch) {
+      if (!resolvedBranch) {
         const environment = await $replica.runtimeEnvironment.findFirst({
           where: {
             projectId: project.id,
             slug: slug,
           },
-          include: {
-            project: true,
-            organization: true,
-          },
+          include: authIncludeBase,
         });
 
         if (!environment) {
           throw json({ error: "Environment not found" }, { status: 404 });
         }
 
-        return environment;
+        return toAuthenticated(environment);
       }
 
       const environment = await $replica.runtimeEnvironment.findFirst({
         where: {
           projectId: project.id,
+          // No Development branches for OAT
           type: "PREVIEW",
-          branchName: sanitizedBranch,
+          branchName: resolvedBranch,
           archivedAt: null,
         },
-        include: {
-          project: true,
-          organization: true,
-          parentEnvironment: true,
-        },
+        include: authIncludeWithParent,
       });
 
       if (!environment) {
@@ -617,12 +704,10 @@ export async function authenticatedEnvironmentForAuthentication(
         throw json({ error: "Branch not associated with a preview environment" }, { status: 400 });
       }
 
-      return {
+      return toAuthenticated({
         ...environment,
         apiKey: environment.parentEnvironment.apiKey,
-        organization: environment.organization,
-        project: environment.project,
-      };
+      });
     }
     default: {
       auth satisfies never;
@@ -663,9 +748,9 @@ export async function validateJWTTokenAndRenew<T extends z.ZodTypeAny>(
     const jwt = request.headers.get("x-trigger-jwt");
 
     if (!jwt) {
-      logger.debug("Missing JWT token in request", {
-        headers: Object.fromEntries(request.headers),
-      });
+      // Log a safe breadcrumb, not the raw headers (which carry the
+      // caller's Authorization credential).
+      logger.debug("Missing JWT token in request", missingJwtLogContext(request));
 
       return;
     }
@@ -725,8 +810,9 @@ export async function validateJWTTokenAndRenew<T extends z.ZodTypeAny>(
         ...payload.data,
       });
 
+      // The environment carries secret material; log only non-secret fields.
       logger.debug("Renewed JWT token from Authorization header API Key", {
-        environment: authenticatedEnv.environment,
+        environment: safeEnvironmentLogFields(authenticatedEnv.environment),
         payload: payload.data,
       });
 

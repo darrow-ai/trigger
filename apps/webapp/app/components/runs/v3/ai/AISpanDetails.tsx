@@ -1,6 +1,7 @@
 import { CheckIcon, ClipboardDocumentIcon } from "@heroicons/react/20/solid";
-import { lazy, Suspense, useState } from "react";
+import { Suspense, useState } from "react";
 import { Button } from "~/components/primitives/Buttons";
+import { StreamdownRenderer } from "~/components/code/StreamdownRenderer";
 import { Header3 } from "~/components/primitives/Headers";
 import { Paragraph } from "~/components/primitives/Paragraph";
 import { TabButton, TabContainer } from "~/components/primitives/Tabs";
@@ -19,16 +20,6 @@ import { AIToolsInventory } from "./AIToolsInventory";
 import type { AISpanData, DisplayItem } from "./types";
 import type { PromptSpanData } from "~/presenters/v3/SpanPresenter.server";
 import { SpanHorizontalTimeline } from "~/components/runs/v3/SpanHorizontalTimeline";
-
-const StreamdownRenderer = lazy(() =>
-  import("streamdown").then((mod) => ({
-    default: ({ children }: { children: string }) => (
-      <mod.ShikiThemeContext.Provider value={["one-dark-pro", "one-dark-pro"]}>
-        <mod.Streamdown isAnimating={false}>{children}</mod.Streamdown>
-      </mod.ShikiThemeContext.Provider>
-    ),
-  }))
-);
 
 type AITab = "overview" | "messages" | "tools" | "prompt";
 
@@ -58,14 +49,20 @@ export function AISpanDetails({
       ? {
           slug: aiData.promptSlug,
           version: aiData.promptVersion,
-          path: v3PromptPath(organization, project, environment, aiData.promptSlug, aiData.promptVersion),
+          path: v3PromptPath(
+            organization,
+            project,
+            environment,
+            aiData.promptSlug,
+            aiData.promptVersion
+          ),
         }
       : undefined;
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
       {/* Tab bar */}
-      <div className="shrink-0 overflow-x-auto px-3 py-1 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-charcoal-600">
+      <div className="shrink-0 overflow-x-auto px-3 py-1 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-surface-control">
         <TabContainer>
           <TabButton
             isActive={tab === "overview"}
@@ -92,7 +89,7 @@ export function AISpanDetails({
             <span className="inline-flex items-center whitespace-nowrap">
               Tools
               {toolCount > 0 && (
-                <span className="ml-1 inline-flex min-w-4 -translate-y-px items-center justify-center rounded-full border border-charcoal-600 bg-charcoal-650 px-1 py-0.5 text-[0.625rem] font-medium leading-none text-text-bright">
+                <span className="ml-1 inline-flex min-w-4 -translate-y-px items-center justify-center rounded-full border border-border-bright bg-secondary px-1 py-0.5 text-[0.625rem] font-medium leading-none text-text-bright">
                   {toolCount}
                 </span>
               )}
@@ -112,10 +109,14 @@ export function AISpanDetails({
       </div>
 
       {/* Tab content */}
-      <div className="scrollbar-gutter-stable min-h-0 flex-1 overflow-y-auto scrollbar-thin scrollbar-track-transparent scrollbar-thumb-charcoal-600">
+      <div className="scrollbar-gutter-stable min-h-0 flex-1 overflow-y-auto scrollbar-thin scrollbar-track-transparent scrollbar-thumb-surface-control">
         {tab === "overview" && (
           <>
-            {startTime && <div className="px-3"><SpanHorizontalTimeline startTime={startTime} duration={duration ?? null} /></div>}
+            {startTime && (
+              <div className="px-3">
+                <SpanHorizontalTimeline startTime={startTime} duration={duration ?? null} />
+              </div>
+            )}
             <OverviewTab aiData={aiData} />
           </>
         )}
@@ -177,13 +178,7 @@ function OverviewTab({ aiData }: { aiData: AISpanData }) {
   );
 }
 
-function MessagesTab({
-  aiData,
-  promptLink,
-}: {
-  aiData: AISpanData;
-  promptLink?: PromptLink;
-}) {
+function MessagesTab({ aiData, promptLink }: { aiData: AISpanData; promptLink?: PromptLink }) {
   const showFallbackText = aiData.responseText && !hasAssistantItem(aiData.items);
   const showFallbackObject =
     !showFallbackText && aiData.responseObject && !hasAssistantItem(aiData.items);
@@ -226,7 +221,7 @@ function CopyRawFooter({ rawProperties }: { rawProperties: string }) {
   }
 
   return (
-    <div className="flex h-[3.25rem] shrink-0 items-center justify-end border-t border-grid-dimmed px-2">
+    <div className="flex h-13 shrink-0 items-center justify-end border-t border-grid-dimmed px-2">
       <Button
         variant="minimal/medium"
         onClick={handleCopy}
@@ -247,7 +242,10 @@ function PromptTab({
   promptLink?: PromptLink;
 }) {
   const labels = promptData.labels
-    ? promptData.labels.split(",").map((l) => l.trim()).filter(Boolean)
+    ? promptData.labels
+        .split(",")
+        .map((l) => l.trim())
+        .filter(Boolean)
     : [];
 
   return (
@@ -289,7 +287,7 @@ function PromptTab({
       {promptData.template && (
         <div className="flex flex-col gap-1.5 py-2.5">
           <Header3>Template</Header3>
-          <div className="rounded-md border border-grid-bright bg-charcoal-750/50 px-3.5 py-2">
+          <div className="rounded-md border border-grid-bright bg-background-hover/50 px-3.5 py-2">
             <div className="font-sans text-sm font-normal text-text-dimmed streamdown-container">
               <Suspense
                 fallback={<span className="whitespace-pre-wrap">{promptData.template}</span>}
@@ -303,7 +301,6 @@ function PromptTab({
     </div>
   );
 }
-
 
 // ---------------------------------------------------------------------------
 // Helpers

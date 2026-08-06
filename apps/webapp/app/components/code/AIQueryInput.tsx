@@ -1,24 +1,14 @@
 import { CheckIcon, PencilSquareIcon, PlusIcon, XMarkIcon } from "@heroicons/react/20/solid";
 import { AnimatePresence, motion } from "framer-motion";
-import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
+import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "~/components/primitives/Buttons";
 import { Spinner } from "~/components/primitives/Spinner";
+import { StreamdownRenderer } from "~/components/code/StreamdownRenderer";
 import { useEnvironment } from "~/hooks/useEnvironment";
 import { useOrganization } from "~/hooks/useOrganizations";
 import { useProject } from "~/hooks/useProject";
 import type { AITimeFilter } from "~/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.query/types";
 import { cn } from "~/utils/cn";
-
-// Lazy load streamdown components to avoid SSR issues
-const StreamdownRenderer = lazy(() =>
-  import("streamdown").then((mod) => ({
-    default: ({ children, isAnimating }: { children: string; isAnimating: boolean }) => (
-      <mod.ShikiThemeContext.Provider value={["one-dark-pro", "one-dark-pro"]}>
-        <mod.Streamdown isAnimating={isAnimating}>{children}</mod.Streamdown>
-      </mod.ShikiThemeContext.Provider>
-    ),
-  }))
-);
 
 type StreamEventType =
   | { type: "thinking"; content: string }
@@ -267,7 +257,7 @@ export function AIQueryInput({
               onChange={(e) => setPrompt(e.target.value)}
               disabled={isLoading}
               rows={8}
-              className="m-0 min-h-10 w-full resize-none border-0 bg-background-bright px-3 py-2.5 text-sm text-text-bright scrollbar-thin scrollbar-track-transparent scrollbar-thumb-charcoal-600 file:border-0 file:bg-transparent file:text-base file:font-medium placeholder:text-text-dimmed focus:border-0 focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 disabled:cursor-not-allowed disabled:opacity-50"
+              className="m-0 min-h-10 w-full resize-none border-0 bg-background-bright px-3 py-2.5 text-sm text-text-bright scrollbar-thin scrollbar-track-transparent scrollbar-thumb-surface-control file:border-0 file:bg-transparent file:text-base file:font-medium placeholder:text-text-dimmed focus:border-0 focus:outline-hidden focus:ring-0 focus-visible:outline-hidden focus-visible:ring-0 focus-visible:ring-offset-0 disabled:cursor-not-allowed disabled:opacity-50"
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey && prompt.trim() && !isLoading) {
                   e.preventDefault();
@@ -352,7 +342,7 @@ export function AIQueryInput({
             className="overflow-hidden"
           >
             <div className="px-1">
-              <div className="rounded-b-lg border-x border-b border-grid-dimmed bg-charcoal-850 p-3 pb-1">
+              <div className="rounded-b-lg border-x border-b border-grid-dimmed bg-background-dimmed p-3 pb-1">
                 <div className="mb-1 flex items-center justify-between">
                   <div className="flex items-center gap-1">
                     {isLoading ? (
@@ -366,10 +356,10 @@ export function AIQueryInput({
                       {isLoading
                         ? "AI is thinking…"
                         : lastResult === "success"
-                        ? "Query generated"
-                        : lastResult === "error"
-                        ? "Generation failed"
-                        : "AI response"}
+                          ? "Query generated"
+                          : lastResult === "error"
+                            ? "Generation failed"
+                            : "AI response"}
                     </span>
                   </div>
                   {isLoading ? (
@@ -400,7 +390,7 @@ export function AIQueryInput({
                     </Button>
                   )}
                 </div>
-                <div className="streamdown-container max-h-96 overflow-y-auto text-xs text-text-dimmed scrollbar-thin scrollbar-track-transparent scrollbar-thumb-charcoal-600">
+                <div className="streamdown-container max-h-96 overflow-y-auto text-xs text-text-dimmed scrollbar-thin scrollbar-track-transparent scrollbar-thumb-surface-control">
                   <Suspense fallback={<p className="whitespace-pre-wrap">{thinking}</p>}>
                     <StreamdownRenderer isAnimating={isLoading}>{thinking}</StreamdownRenderer>
                   </Suspense>

@@ -1,8 +1,8 @@
-import { env } from "~/env.server";
-import { parse } from "@conform-to/zod";
+import { parseWithZod } from "@conform-to/zod";
 import { Form, useLocation, useNavigation, useSubmit } from "@remix-run/react";
 import { type ActionFunctionArgs, json } from "@remix-run/server-runtime";
-import { stringifyIO, timeoutError, WaitpointTokenStatus } from "@trigger.dev/core/v3";
+import type { WaitpointTokenStatus } from "@trigger.dev/core/v3";
+import { stringifyIO, timeoutError } from "@trigger.dev/core/v3";
 import { WaitpointId } from "@trigger.dev/core/v3/isomorphic";
 import type { Waitpoint } from "@trigger.dev/database";
 import { useCallback, useRef } from "react";
@@ -12,9 +12,13 @@ import { JSONEditor } from "~/components/code/JSONEditor";
 import { Button } from "~/components/primitives/Buttons";
 import { DateTime } from "~/components/primitives/DateTime";
 import { Paragraph } from "~/components/primitives/Paragraph";
+import { SpinnerWhite } from "~/components/primitives/Spinner";
 import { InfoIconTooltip } from "~/components/primitives/Tooltip";
 import { LiveCountdown } from "~/components/runs/v3/LiveTimer";
 import { $replica } from "~/db.server";
+import { runStore } from "~/v3/runStore.server";
+import { env } from "~/env.server";
+import { useEnvironment } from "~/hooks/useEnvironment";
 import { useOrganization } from "~/hooks/useOrganizations";
 import { useProject } from "~/hooks/useProject";
 import { redirectWithErrorMessage, redirectWithSuccessMessage } from "~/models/message.server";
@@ -22,10 +26,8 @@ import { findEnvironmentBySlug } from "~/models/runtimeEnvironment.server";
 import { processWaitpointCompletionPacket } from "~/runEngine/concerns/waitpointCompletionPacket.server";
 import { logger } from "~/services/logger.server";
 import { requireUserId } from "~/services/session.server";
-import { EnvironmentParamSchema, ProjectParamSchema, v3RunsPath } from "~/utils/pathBuilder";
+import { EnvironmentParamSchema, v3RunsPath } from "~/utils/pathBuilder";
 import { engine } from "~/v3/runEngine.server";
-import { SpinnerWhite } from "~/components/primitives/Spinner";
-import { useEnvironment } from "~/hooks/useEnvironment";
 
 const CompleteWaitpointFormData = z.discriminatedUnion("type", [
   z.object({
@@ -51,10 +53,10 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   const { organizationSlug, projectParam, envParam, waitpointFriendlyId } = Params.parse(params);
 
   const formData = await request.formData();
-  const submission = parse(formData, { schema: CompleteWaitpointFormData });
+  const submission = parseWithZod(formData, { schema: CompleteWaitpointFormData });
 
-  if (!submission.value) {
-    return json(submission);
+  if (submission.status !== "success") {
+    return json(submission.reply());
   }
 
   try {
@@ -79,7 +81,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
 
     const waitpointId = WaitpointId.toId(waitpointFriendlyId);
 
-    const waitpoint = await $replica.waitpoint.findFirst({
+    let waitpoint = await runStore.findWaitpoint({
       select: {
         projectId: true,
         environmentId: true,
@@ -88,6 +90,14 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         id: waitpointId,
       },
     });
+    if (!waitpoint) {
+      // Read-your-writes: a just-minted token may not have replicated. Re-read the owning primary
+      // before the auth guard / "No waitpoint found" (mirrors the token complete/callback routes).
+      waitpoint = await runStore.findWaitpointOnPrimary({
+        select: { projectId: true, environmentId: true },
+        where: { id: waitpointId },
+      });
+    }
 
     if (waitpoint?.projectId !== project.id) {
       return redirectWithErrorMessage(
@@ -99,7 +109,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
 
     switch (submission.value.type) {
       case "DATETIME": {
-        const result = await engine.completeWaitpoint({
+        const _result = await engine.completeWaitpoint({
           id: waitpointId,
         });
 
@@ -112,7 +122,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       case "MANUAL": {
         if (submission.value.isTimeout) {
           try {
-            const result = await engine.completeWaitpoint({
+            const _result = await engine.completeWaitpoint({
               id: waitpointId,
               output: {
                 type: "application/json",
@@ -126,7 +136,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
               request,
               "Waitpoint timed out"
             );
-          } catch (e) {
+          } catch (_e) {
             return redirectWithErrorMessage(
               submission.value.failureRedirect,
               request,
@@ -172,7 +182,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
             `${WaitpointId.toFriendlyId(waitpointId)}/token`
           );
 
-          const result = await engine.completeWaitpoint({
+          const _result = await engine.completeWaitpoint({
             id: waitpointId,
             output: finalData.data
               ? { type: finalData.dataType, value: finalData.data, isError: false }
@@ -184,7 +194,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
             request,
             "Waitpoint completed"
           );
-        } catch (e) {
+        } catch (_e) {
           return redirectWithErrorMessage(
             submission.value.failureRedirect,
             request,
@@ -359,8 +369,8 @@ function CompleteManualWaitpointForm({ waitpoint }: { waitpoint: { id: string } 
             contentClassName="normal-case tracking-normal max-w-xs"
           />
         </div>
-        <div className="overflow-y-auto bg-charcoal-900 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-charcoal-600">
-          <div className="max-h-[70vh] min-h-40 overflow-y-auto bg-charcoal-900 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-charcoal-600">
+        <div className="overflow-y-auto bg-background-deep scrollbar-thin scrollbar-track-transparent scrollbar-thumb-surface-control">
+          <div className="max-h-[70vh] min-h-40 overflow-y-auto bg-background-deep scrollbar-thin scrollbar-track-transparent scrollbar-thumb-surface-control">
             <JSONEditor
               autoFocus
               defaultValue={currentJson.current}

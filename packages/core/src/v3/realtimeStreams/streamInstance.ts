@@ -1,9 +1,14 @@
-import { ApiClient } from "../apiClient/index.js";
-import { AsyncIterableStream } from "../streams/asyncIterableStream.js";
-import { AnyZodFetchOptions } from "../zodfetch.js";
+import type { ApiClient } from "../apiClient/index.js";
+import type { AsyncIterableStream } from "../streams/asyncIterableStream.js";
+import type { AnyZodFetchOptions } from "../zodfetch.js";
 import { StreamsWriterV1 } from "./streamsWriterV1.js";
 import { StreamsWriterV2 } from "./streamsWriterV2.js";
-import { StreamsWriter } from "./types.js";
+import type { StreamsWriter, StreamWriteResult } from "./types.js";
+
+export type CreateStreamResponseLike = {
+  version: string;
+  headers?: Record<string, string>;
+};
 
 export type StreamInstanceOptions<T> = {
   apiClient: ApiClient;
@@ -15,6 +20,14 @@ export type StreamInstanceOptions<T> = {
   requestOptions?: AnyZodFetchOptions;
   target?: "self" | "parent" | "root" | string;
   debug?: boolean;
+  /**
+   * Optional override for the create-stream call. Defaults to
+   * `apiClient.createStream(runId, "self", key, requestOptions)`. The
+   * manager passes a cached version so repeated `pipe()` calls for the
+   * same `(runId, key)` share a single PUT instead of hammering the
+   * server on every chunk.
+   */
+  createStream?: () => Promise<CreateStreamResponseLike>;
 };
 
 type StreamsWriterInstance<T> = StreamsWriterV1<T> | StreamsWriterV2<T>;
@@ -27,12 +40,17 @@ export class StreamInstance<T> implements StreamsWriter {
   }
 
   private async initializeWriter(): Promise<StreamsWriterInstance<T>> {
-    const { version, headers } = await this.options.apiClient.createStream(
-      this.options.runId,
-      "self",
-      this.options.key,
-      this.options?.requestOptions
-    );
+    const createStreamFn =
+      this.options.createStream ??
+      (() =>
+        this.options.apiClient.createStream(
+          this.options.runId,
+          "self",
+          this.options.key,
+          this.options?.requestOptions
+        ));
+
+    const { version, headers } = await createStreamFn();
 
     const parsedResponse = parseCreateStreamResponse(version, headers);
 
@@ -63,11 +81,13 @@ export class StreamInstance<T> implements StreamsWriter {
     return streamWriter;
   }
 
-  public async wait(): Promise<void> {
-    return this.streamPromise.then((writer) => writer.wait());
+  public async wait(): Promise<StreamWriteResult> {
+    const writer = await this.streamPromise;
+    return writer.wait();
   }
 
   public get stream(): AsyncIterableStream<T> {
+    // eslint-disable-next-line no-this-alias
     const self = this;
 
     return new ReadableStream<T>({
@@ -139,23 +159,4 @@ function parseCreateStreamResponse(
     maxRetries: maxRetries ? parseInt(maxRetries) : undefined,
     streamName,
   };
-}
-
-async function* streamToAsyncIterator<T>(stream: ReadableStream<T>): AsyncIterableIterator<T> {
-  const reader = stream.getReader();
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) return;
-      yield value;
-    }
-  } finally {
-    safeReleaseLock(reader);
-  }
-}
-
-function safeReleaseLock(reader: ReadableStreamDefaultReader<any>) {
-  try {
-    reader.releaseLock();
-  } catch (error) {}
 }

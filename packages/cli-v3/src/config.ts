@@ -1,14 +1,20 @@
-import {
+import type {
   BuildRuntime,
   CompatibilityFlag,
   CompatibilityFlagFeatures,
   ResolveEnvironmentVariablesFunction,
   TriggerConfig,
 } from "@trigger.dev/core/v3";
-import { DEFAULT_RUNTIME, ResolvedConfig } from "@trigger.dev/core/v3/build";
+import type { ResolvedConfig } from "@trigger.dev/core/v3/build";
+import {
+  DEFAULT_RUNTIME,
+  deprecatedRuntimeReplacement,
+  isDeprecatedConfigRuntime,
+  resolveBuildRuntime,
+} from "@trigger.dev/core/v3/build";
 import * as c12 from "c12";
 import { defu } from "defu";
-import * as esbuild from "esbuild";
+import type * as esbuild from "esbuild";
 import { readdir } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { findWorkspaceDir, resolveLockfile, resolvePackageJSON, resolveTSConfig } from "pkg-types";
@@ -118,8 +124,8 @@ export function configPlugin(resolvedConfig: ResolvedConfig): esbuild.Plugin | u
             ? $mod.exports.default.$args[0]
             : $mod.exports.default
           : $mod.exports.config?.$type === "function-call"
-          ? $mod.exports.config.$args[0]
-          : $mod.exports.config;
+            ? $mod.exports.config.$args[0]
+            : $mod.exports.config;
 
         options.build = {};
 
@@ -152,18 +158,9 @@ async function resolveConfig(
   overrides?: Partial<TriggerConfig>,
   warn = true
 ): Promise<ResolvedConfig> {
-  const packageJsonPath = await resolvePackageJSON(cwd);
-  const tsconfigPath = await safeResolveTsConfig(cwd);
-  const lockfilePath = await resolveLockfile(cwd);
-  const workspaceDir = await findWorkspaceDir(cwd);
-
-  const workingDir = result.configFile
-    ? dirname(result.configFile)
-    : packageJsonPath
-    ? dirname(packageJsonPath)
-    : cwd;
-
-  // `trigger.config` is the fallback value set by c12
+  // `trigger.config` is the fallback value set by c12. Bail out with actionable guidance before
+  // touching the filesystem: the pkg-types resolvers below throw raw errors when run outside a
+  // project (e.g. `dev` before `init`), which would mask this message.
   const missingConfigFile = !result.configFile || result.configFile === "trigger.config";
 
   if (missingConfigFile) {
@@ -181,21 +178,42 @@ async function resolveConfig(
   const config =
     "config" in result.config ? (result.config.config as TriggerConfig) : result.config;
 
+  const features = featuresFromCompatibilityFlags(
+    ["run_engine_v2" as const].concat(config.compatibilityFlags ?? [])
+  );
+  const defaultRuntime: BuildRuntime = features.run_engine_v2 ? "node" : DEFAULT_RUNTIME;
+  const configuredRuntime = overrides?.runtime ?? config.runtime ?? defaultRuntime;
+  const runtime = resolveBuildRuntime(configuredRuntime);
+
+  if (warn && isDeprecatedConfigRuntime(configuredRuntime)) {
+    prettyWarning(
+      `The "${configuredRuntime}" runtime is deprecated. Use "${deprecatedRuntimeReplacement(
+        configuredRuntime
+      )}" instead.`
+    );
+  }
+
   validateConfig(config, warn);
+
+  const packageJsonPath = await resolvePackageJSON(cwd);
+  const tsconfigPath = await safeResolveTsConfig(cwd);
+  const lockfilePath = await resolveLockfile(cwd);
+  const workspaceDir = await findWorkspaceDir(cwd);
+
+  const workingDir = result.configFile
+    ? dirname(result.configFile)
+    : packageJsonPath
+      ? dirname(packageJsonPath)
+      : cwd;
 
   let dirs = config.dirs ? config.dirs : await autoDetectDirs(workingDir);
 
   dirs = dirs.map((dir) => resolveTriggerDir(dir, workingDir));
 
-  const features = featuresFromCompatibilityFlags(
-    ["run_engine_v2" as const].concat(config.compatibilityFlags ?? [])
-  );
-
-  const defaultRuntime: BuildRuntime = features.run_engine_v2 ? "node" : DEFAULT_RUNTIME;
-
   const mergedConfig = defu(
     {
       workingDir,
+      runtime,
       configFile: result.configFile,
       packageJsonPath,
       tsconfigPath,
@@ -227,7 +245,7 @@ async function resolveConfig(
     ...mergedConfig,
     dirs: Array.from(new Set(dirs)),
     instrumentedPackageNames: getInstrumentedPackageNames(mergedConfig),
-    runtime: mergedConfig.runtime,
+    runtime,
   };
 }
 

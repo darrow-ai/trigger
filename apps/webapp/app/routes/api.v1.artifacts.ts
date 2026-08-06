@@ -4,7 +4,7 @@ import {
   CreateArtifactRequestBody,
   tryCatch,
 } from "@trigger.dev/core/v3";
-import { authenticateRequest } from "~/services/apiAuth.server";
+import { authenticateApiKeyWithScope } from "~/services/apiAuth.server";
 import { logger } from "~/services/logger.server";
 import { ArtifactsService } from "~/v3/services/artifacts.server";
 
@@ -13,79 +13,87 @@ export async function action({ request }: ActionFunctionArgs) {
     return json({ error: "Method Not Allowed" }, { status: 405 });
   }
 
-  const authenticationResult = await authenticateRequest(request, {
-    apiKey: true,
-    organizationAccessToken: false,
-    personalAccessToken: false,
-  });
+  try {
+    // Artifact uploads are part of the deploy flow (deployment context archive).
+    const authResult = await authenticateApiKeyWithScope(request, {
+      action: "write",
+      resource: { type: "deployments" },
+    });
 
-  if (!authenticationResult || !authenticationResult.result.ok) {
-    logger.info("Invalid or missing api key", { url: request.url });
-    return json({ error: "Invalid or Missing API key" }, { status: 401 });
-  }
+    if (!authResult.ok) {
+      logger.info("Invalid or missing api key", { url: request.url });
+      return json({ error: authResult.error }, { status: authResult.status });
+    }
 
-  const [, rawBody] = await tryCatch(request.json());
-  const body = CreateArtifactRequestBody.safeParse(rawBody ?? {});
+    const authenticationResult = { result: authResult.authentication };
 
-  if (!body.success) {
-    return json({ error: "Invalid request body", issues: body.error.issues }, { status: 400 });
-  }
+    const [, rawBody] = await tryCatch(request.json());
+    const body = CreateArtifactRequestBody.safeParse(rawBody ?? {});
 
-  const { environment: authenticatedEnv } = authenticationResult.result;
+    if (!body.success) {
+      return json({ error: "Invalid request body", issues: body.error.issues }, { status: 400 });
+    }
 
-  const service = new ArtifactsService();
-  return await service
-    .createArtifact(body.data.type, authenticatedEnv, body.data.contentLength)
-    .match(
-      (result) => {
-        return json(
-          {
-            artifactKey: result.artifactKey,
-            uploadUrl: result.uploadUrl,
-            uploadFields: result.uploadFields,
-            expiresAt: result.expiresAt.toISOString(),
-          } satisfies CreateArtifactResponseBody,
-          { status: 201 }
-        );
-      },
-      (error) => {
-        switch (error.type) {
-          case "artifact_size_exceeds_limit": {
-            logger.warn("Artifact size exceeds limit", { error });
-            const sizeMB = parseFloat((error.contentLength / (1024 * 1024)).toFixed(1));
-            const limitMB = parseFloat((error.sizeLimit / (1024 * 1024)).toFixed(1));
+    const { environment: authenticatedEnv } = authenticationResult.result;
 
-            let errorMessage;
+    const service = new ArtifactsService();
+    return await service
+      .createArtifact(body.data.type, authenticatedEnv, body.data.contentLength)
+      .match(
+        (result) => {
+          return json(
+            {
+              artifactKey: result.artifactKey,
+              uploadUrl: result.uploadUrl,
+              uploadFields: result.uploadFields,
+              expiresAt: result.expiresAt.toISOString(),
+            } satisfies CreateArtifactResponseBody,
+            { status: 201 }
+          );
+        },
+        (error) => {
+          switch (error.type) {
+            case "artifact_size_exceeds_limit": {
+              logger.warn("Artifact size exceeds limit", { error });
+              const sizeMB = parseFloat((error.contentLength / (1024 * 1024)).toFixed(1));
+              const limitMB = parseFloat((error.sizeLimit / (1024 * 1024)).toFixed(1));
 
-            switch (body.data.type) {
-              case "deployment_context":
-                errorMessage = `Artifact size (${sizeMB} MB) exceeds the allowed limit of ${limitMB} MB. Make sure you are in the correct directory of your Trigger.dev project. Reach out to us if you are seeing this error consistently.`;
-                break;
-              default:
-                body.data.type satisfies never;
-                errorMessage = `Artifact size (${sizeMB} MB) exceeds the allowed limit of ${limitMB} MB`;
+              let errorMessage;
+
+              switch (body.data.type) {
+                case "deployment_context":
+                  errorMessage = `Artifact size (${sizeMB} MB) exceeds the allowed limit of ${limitMB} MB. Make sure you are in the correct directory of your Trigger.dev project. Reach out to us if you are seeing this error consistently.`;
+                  break;
+                default:
+                  body.data.type satisfies never;
+                  errorMessage = `Artifact size (${sizeMB} MB) exceeds the allowed limit of ${limitMB} MB`;
+              }
+              return json(
+                {
+                  error: errorMessage,
+                },
+                { status: 400 }
+              );
             }
-            return json(
-              {
-                error: errorMessage,
-              },
-              { status: 400 }
-            );
-          }
-          case "failed_to_create_presigned_post": {
-            logger.error("Failed to create presigned POST", { error });
-            return json({ error: "Failed to generate artifact upload URL" }, { status: 500 });
-          }
-          case "artifacts_bucket_not_configured": {
-            logger.error("Artifacts bucket not configured", { error });
-            return json({ error: "Internal server error" }, { status: 500 });
-          }
-          default: {
-            error satisfies never;
-            logger.error("Failed creating artifact", { error });
-            return json({ error: "Internal server error" }, { status: 500 });
+            case "failed_to_create_presigned_post": {
+              logger.error("Failed to create presigned POST", { error });
+              return json({ error: "Failed to generate artifact upload URL" }, { status: 500 });
+            }
+            case "artifacts_bucket_not_configured": {
+              logger.error("Artifacts bucket not configured", { error });
+              return json({ error: "Internal server error" }, { status: 500 });
+            }
+            default: {
+              error satisfies never;
+              logger.error("Failed creating artifact", { error });
+              return json({ error: "Internal server error" }, { status: 500 });
+            }
           }
         }
-      }
-    );
+      );
+  } catch (error) {
+    if (error instanceof Response) throw error;
+    logger.error("Failed to create artifact", { error });
+    return json({ error: "Internal Server Error" }, { status: 500 });
+  }
 }

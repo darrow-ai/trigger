@@ -1,11 +1,11 @@
-import { LocalsKey, LocalsManager } from "./types.js";
+import type { LocalsKey, LocalsManager } from "./types.js";
 
 export class NoopLocalsManager implements LocalsManager {
   createLocal<T>(id: string): LocalsKey<T> {
     return {
       __type: Symbol(),
       id,
-    } as unknown as LocalsKey<T>;
+    };
   }
 
   getLocal<T>(key: LocalsKey<T>): T | undefined {
@@ -23,7 +23,7 @@ export class StandardLocalsManager implements LocalsManager {
     return {
       __type: key,
       id,
-    } as unknown as LocalsKey<T>;
+    };
   }
 
   getLocal<T>(key: LocalsKey<T>): T | undefined {

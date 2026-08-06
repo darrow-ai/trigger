@@ -1,12 +1,19 @@
 import { randomUUID } from "node:crypto";
-import { Metadata } from "./overrides.js";
+import type { Metadata } from "./overrides.js";
 import { z } from "zod";
-import { EnvObject } from "std-env";
+import type { EnvObject } from "std-env";
 
 const DateEnv = z
   .string()
   .transform((val) => new Date(parseInt(val, 10)))
   .pipe(z.date());
+
+const BoolEnv = z.preprocess((val) => {
+  if (typeof val !== "string") {
+    return val;
+  }
+  return ["true", "1"].includes(val.toLowerCase().trim());
+}, z.boolean());
 
 // All IDs are friendly IDs
 const Env = z.object({
@@ -20,6 +27,9 @@ const Env = z.object({
 
   // Set at runtime
   TRIGGER_DEPLOYMENT_ID: z.string(),
+  // Plain deployment friendlyId for telemetry. Optional: older supervisors don't set it, in which
+  // case we fall back to TRIGGER_DEPLOYMENT_ID.
+  TRIGGER_DEPLOYMENT_FRIENDLY_ID: z.string().optional(),
   TRIGGER_DEPLOYMENT_VERSION: z.string(),
   TRIGGER_WORKLOAD_CONTROLLER_ID: z.string().default(`controller_${randomUUID()}`),
   TRIGGER_ENV_ID: z.string(),
@@ -47,6 +57,9 @@ const Env = z.object({
   TRIGGER_SNAPSHOT_POLL_INTERVAL_SECONDS: z.coerce.number().default(5),
   TRIGGER_SUCCESS_EXIT_CODE: z.coerce.number().default(0),
   TRIGGER_FAILURE_EXIT_CODE: z.coerce.number().default(1),
+
+  // Gates the per-log-line debug-log POST to the supervisor; off by default
+  TRIGGER_SEND_RUN_DEBUG_LOGS: BoolEnv.default(false),
 });
 
 type Env = z.infer<typeof Env>;
@@ -62,6 +75,11 @@ export class RunnerEnv {
 
   get raw() {
     return this.env;
+  }
+
+  // TRIGGER_DEPLOYMENT_ID carries the deployment token; redact it before logging.
+  get rawForLogging() {
+    return { ...this.env, TRIGGER_DEPLOYMENT_ID: "[redacted]" };
   }
 
   // Base environment variables
@@ -82,6 +100,9 @@ export class RunnerEnv {
   }
   get TRIGGER_DEPLOYMENT_ID() {
     return this.env.TRIGGER_DEPLOYMENT_ID;
+  }
+  get TRIGGER_DEPLOYMENT_FRIENDLY_ID() {
+    return this.env.TRIGGER_DEPLOYMENT_FRIENDLY_ID;
   }
   get TRIGGER_DEPLOYMENT_VERSION() {
     return this.env.TRIGGER_DEPLOYMENT_VERSION;
@@ -135,6 +156,9 @@ export class RunnerEnv {
   }
   get TRIGGER_FAILURE_EXIT_CODE() {
     return this.env.TRIGGER_FAILURE_EXIT_CODE;
+  }
+  get TRIGGER_SEND_RUN_DEBUG_LOGS() {
+    return this.env.TRIGGER_SEND_RUN_DEBUG_LOGS;
   }
   get TRIGGER_HEARTBEAT_INTERVAL_SECONDS() {
     return this.env.TRIGGER_HEARTBEAT_INTERVAL_SECONDS;

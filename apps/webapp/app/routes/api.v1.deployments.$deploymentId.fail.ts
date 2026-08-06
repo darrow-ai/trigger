@@ -1,7 +1,8 @@
-import { ActionFunctionArgs, json } from "@remix-run/server-runtime";
+import type { ActionFunctionArgs } from "@remix-run/server-runtime";
+import { json } from "@remix-run/server-runtime";
 import { FailDeploymentRequestBody } from "@trigger.dev/core/v3";
 import { z } from "zod";
-import { authenticateApiRequest } from "~/services/apiAuth.server";
+import { authenticateApiKeyWithScope } from "~/services/apiAuth.server";
 import { logger } from "~/services/logger.server";
 import { FailDeploymentService } from "~/v3/services/failDeployment.server";
 
@@ -21,32 +22,46 @@ export async function action({ request, params }: ActionFunctionArgs) {
     return json({ error: "Invalid params" }, { status: 400 });
   }
 
-  // Next authenticate the request
-  const authenticationResult = await authenticateApiRequest(request);
+  try {
+    // Next authenticate the request
+    const authResult = await authenticateApiKeyWithScope(request, {
+      action: "write",
+      resource: { type: "deployments" },
+    });
 
-  if (!authenticationResult) {
-    logger.info("Invalid or missing api key", { url: request.url });
-    return json({ error: "Invalid or Missing API key" }, { status: 401 });
+    if (!authResult.ok) {
+      logger.info("Invalid or missing api key", { url: request.url });
+      return json({ error: authResult.error }, { status: authResult.status });
+    }
+
+    const authenticationResult = authResult.authentication;
+
+    const authenticatedEnv = authenticationResult.environment;
+
+    const { deploymentId } = parsedParams.data;
+
+    const rawBody = await request.json();
+    const body = FailDeploymentRequestBody.safeParse(rawBody);
+
+    if (!body.success) {
+      return json({ error: "Invalid body", issues: body.error.issues }, { status: 400 });
+    }
+
+    const service = new FailDeploymentService();
+    await service.call(authenticatedEnv, deploymentId, body.data);
+
+    return json(
+      {
+        id: deploymentId,
+      },
+      { status: 200 }
+    );
+  } catch (error) {
+    if (error instanceof Response) throw error;
+    if (error instanceof SyntaxError) {
+      return json({ error: "Invalid JSON body" }, { status: 400 });
+    }
+    logger.error("Failed to fail deployment", { error });
+    return json({ error: "Internal Server Error" }, { status: 500 });
   }
-
-  const authenticatedEnv = authenticationResult.environment;
-
-  const { deploymentId } = parsedParams.data;
-
-  const rawBody = await request.json();
-  const body = FailDeploymentRequestBody.safeParse(rawBody);
-
-  if (!body.success) {
-    return json({ error: "Invalid body", issues: body.error.issues }, { status: 400 });
-  }
-
-  const service = new FailDeploymentService();
-  await service.call(authenticatedEnv, deploymentId, body.data);
-
-  return json(
-    {
-      id: deploymentId,
-    },
-    { status: 200 }
-  );
 }

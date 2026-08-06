@@ -1,11 +1,11 @@
-import { Organization } from "@trigger.dev/database";
 import { z } from "zod";
 import { env } from "~/env.server";
 import {
-  RateLimiterConfig,
   createLimiterFromConfig,
+  RateLimiterConfig,
 } from "~/services/authorizationRateLimitMiddleware.server";
-import { createRedisRateLimitClient, Duration, RateLimiter } from "~/services/rateLimiter.server";
+import type { Duration } from "~/services/rateLimiter.server";
+import { createRedisRateLimitClient, RateLimiter } from "~/services/rateLimiter.server";
 import { singleton } from "~/utils/singleton";
 
 const BatchLimitsConfig = z.object({
@@ -32,7 +32,16 @@ function createBatchLimitsRedisClient() {
   return redisClient;
 }
 
-function createOrganizationRateLimiter(organization: Organization): RateLimiter {
+// Just the org fields this module reads. Compatible with both the full
+// Prisma `Organization` payload and the slim `AuthenticatedEnvironment`
+// `["organization"]` shape (when passed `batchRateLimitConfig` /
+// `batchQueueConcurrencyConfig` as `unknown`).
+type OrganizationForBatchLimits = {
+  batchRateLimitConfig?: unknown;
+  batchQueueConcurrencyConfig?: unknown;
+};
+
+function createOrganizationRateLimiter(organization: OrganizationForBatchLimits): RateLimiter {
   const limiterConfig = resolveBatchRateLimitConfig(organization.batchRateLimitConfig);
 
   const limiter = createLimiterFromConfig(limiterConfig);
@@ -72,7 +81,7 @@ function resolveBatchRateLimitConfig(batchRateLimitConfig?: unknown): RateLimite
  * Internally looks up the plan type, but doesn't expose it to callers.
  */
 export async function getBatchLimits(
-  organization: Organization
+  organization: OrganizationForBatchLimits
 ): Promise<{ rateLimiter: RateLimiter; config: BatchLimitsConfig }> {
   const rateLimiter = createOrganizationRateLimiter(organization);
   const config = resolveBatchLimitsConfig(organization.batchQueueConcurrencyConfig);

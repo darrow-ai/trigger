@@ -1,5 +1,6 @@
-import { lazy, Suspense, useState } from "react";
+import { Suspense, useState } from "react";
 import { CodeBlock } from "~/components/code/CodeBlock";
+import { StreamdownRenderer } from "~/components/code/StreamdownRenderer";
 import { Header3 } from "~/components/primitives/Headers";
 import { TextLink } from "~/components/primitives/TextLink";
 import { tryPrettyJson } from "./ai/aiHelpers";
@@ -11,16 +12,6 @@ import { v3PromptPath } from "~/utils/pathBuilder";
 import { TabButton, TabContainer } from "~/components/primitives/Tabs";
 import type { PromptSpanData } from "~/presenters/v3/SpanPresenter.server";
 import { SpanHorizontalTimeline } from "~/components/runs/v3/SpanHorizontalTimeline";
-
-const StreamdownRenderer = lazy(() =>
-  import("streamdown").then((mod) => ({
-    default: ({ children }: { children: string }) => (
-      <mod.ShikiThemeContext.Provider value={["one-dark-pro", "one-dark-pro"]}>
-        <mod.Streamdown isAnimating={false}>{children}</mod.Streamdown>
-      </mod.ShikiThemeContext.Provider>
-    ),
-  }))
-);
 
 type PromptTab = "overview" | "input" | "template";
 
@@ -61,7 +52,7 @@ export function PromptSpanDetails({
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
-      <div className="shrink-0 overflow-x-auto px-3 py-1 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-charcoal-600">
+      <div className="shrink-0 overflow-x-auto px-3 py-1 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-surface-control">
         <TabContainer>
           {availableTabs.map((t) => (
             <TabButton
@@ -79,10 +70,12 @@ export function PromptSpanDetails({
         </TabContainer>
       </div>
 
-      <div className="scrollbar-gutter-stable min-h-0 flex-1 overflow-y-auto scrollbar-thin scrollbar-track-transparent scrollbar-thumb-charcoal-600">
+      <div className="scrollbar-gutter-stable min-h-0 flex-1 overflow-y-auto scrollbar-thin scrollbar-track-transparent scrollbar-thumb-surface-control">
         {tab === "overview" && (
           <div className="flex flex-col px-3">
-            {startTime && <SpanHorizontalTimeline startTime={startTime} duration={duration ?? null} />}
+            {startTime && (
+              <SpanHorizontalTimeline startTime={startTime} duration={duration ?? null} />
+            )}
             <div className="flex flex-col gap-1 py-2.5">
               <div className="flex flex-col text-xs @container">
                 <MetricRow
@@ -104,7 +97,7 @@ export function PromptSpanDetails({
             {promptData.text && (
               <div className="flex flex-col gap-1.5 py-2.5">
                 <Header3>Resolved content</Header3>
-                <div className="rounded-md border border-grid-bright bg-charcoal-750/50 px-3.5 py-2">
+                <div className="rounded-md border border-grid-bright bg-background-hover/50 px-3.5 py-2">
                   <div className="font-sans text-sm font-normal text-text-dimmed streamdown-container">
                     <Suspense
                       fallback={
@@ -138,12 +131,10 @@ export function PromptSpanDetails({
 
         {tab === "template" && hasTemplate && (
           <div className="px-3 py-2.5">
-            <div className="rounded-md border border-grid-bright bg-charcoal-750/50 px-3.5 py-2">
+            <div className="rounded-md border border-grid-bright bg-background-hover/50 px-3.5 py-2">
               <div className="font-sans text-sm font-normal text-text-dimmed streamdown-container">
                 <Suspense
-                  fallback={
-                    <span className="whitespace-pre-wrap">{promptData.template!}</span>
-                  }
+                  fallback={<span className="whitespace-pre-wrap">{promptData.template!}</span>}
                 >
                   <StreamdownRenderer>{promptData.template!}</StreamdownRenderer>
                 </Suspense>
@@ -155,4 +146,3 @@ export function PromptSpanDetails({
     </div>
   );
 }
-

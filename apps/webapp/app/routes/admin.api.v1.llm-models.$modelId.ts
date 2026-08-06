@@ -1,24 +1,10 @@
 import { type ActionFunctionArgs, type LoaderFunctionArgs, json } from "@remix-run/server-runtime";
 import { z } from "zod";
 import { prisma } from "~/db.server";
-import { authenticateApiRequestWithPersonalAccessToken } from "~/services/personalAccessToken.server";
-
-async function requireAdmin(request: Request) {
-  const authResult = await authenticateApiRequestWithPersonalAccessToken(request);
-  if (!authResult) {
-    throw json({ error: "Invalid or Missing API key" }, { status: 401 });
-  }
-
-  const user = await prisma.user.findUnique({ where: { id: authResult.userId } });
-  if (!user?.admin) {
-    throw json({ error: "You must be an admin to perform this action" }, { status: 403 });
-  }
-
-  return user;
-}
+import { requireAdminApiRequest } from "~/services/personalAccessToken.server";
 
 export async function loader({ request, params }: LoaderFunctionArgs) {
-  await requireAdmin(request);
+  await requireAdminApiRequest(request);
 
   const model = await prisma.llmModel.findUnique({
     where: { id: params.modelId },
@@ -47,6 +33,7 @@ const UpdateModelSchema = z.object({
   maxOutputTokens: z.number().int().nullable().optional(),
   capabilities: z.array(z.string()).optional(),
   isHidden: z.boolean().optional(),
+  pricingUnit: z.string().nullable().optional(),
   pricingTiers: z
     .array(
       z.object({
@@ -69,7 +56,7 @@ const UpdateModelSchema = z.object({
 });
 
 export async function action({ request, params }: ActionFunctionArgs) {
-  await requireAdmin(request);
+  await requireAdminApiRequest(request);
 
   const modelId = params.modelId!;
 
@@ -100,7 +87,19 @@ export async function action({ request, params }: ActionFunctionArgs) {
     return json({ error: "Invalid request body", details: parsed.error.issues }, { status: 400 });
   }
 
-  const { modelName, matchPattern, startDate, pricingTiers, provider, description, contextWindow, maxOutputTokens, capabilities, isHidden } = parsed.data;
+  const {
+    modelName,
+    matchPattern,
+    startDate,
+    pricingTiers,
+    provider,
+    description,
+    contextWindow,
+    maxOutputTokens,
+    capabilities,
+    isHidden,
+    pricingUnit,
+  } = parsed.data;
 
   // Validate regex if provided — strip (?i) POSIX flag since our registry handles it
   if (matchPattern) {
@@ -126,6 +125,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
         ...(maxOutputTokens !== undefined && { maxOutputTokens }),
         ...(capabilities !== undefined && { capabilities }),
         ...(isHidden !== undefined && { isHidden }),
+        ...(pricingUnit !== undefined && { pricingUnit }),
       },
     });
 

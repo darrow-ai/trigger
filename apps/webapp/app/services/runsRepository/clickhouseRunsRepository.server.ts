@@ -4,12 +4,29 @@ import {
   type FilterRunsOptions,
   type IRunsRepository,
   type ListRunsOptions,
+  type RunIdsPage,
   type RunListInputOptions,
   type RunsRepositoryOptions,
   type TagListOptions,
   convertRunListInputOptionsToFilterRunsOptions,
 } from "./runsRepository.server";
 import parseDuration from "parse-duration";
+import { decodeRunsCursor, encodeRunsCursor } from "./runsCursor.server";
+import { runStore } from "~/v3/runStore.server";
+import { type PrismaClientOrTransaction } from "~/db.server";
+
+type RunCursorRow = { runId: string; createdAt: number };
+
+/**
+ * Hydrates a set of rows for a ClickHouse-derived run-id set against the given
+ * read client. The closure MUST select `id` so `#hydrateRunsByIds` can key
+ * set-membership and re-impose ordering; the call site projects `id` away if its
+ * result type excludes it.
+ */
+type HydrateFn<T extends { id: string }> = (
+  client: PrismaClientOrTransaction,
+  ids: string[]
+) => Promise<T[]>;
 
 export class ClickHouseRunsRepository implements IRunsRepository {
   constructor(private readonly options: RunsRepositoryOptions) {}
@@ -18,25 +35,88 @@ export class ClickHouseRunsRepository implements IRunsRepository {
     return "clickhouse";
   }
 
-  async listRunIds(options: ListRunsOptions) {
+  async runExistsInEnvironment(options: {
+    organizationId: string;
+    projectId: string;
+    environmentId: string;
+    createdAtLowerBoundMs?: number;
+  }): Promise<boolean> {
+    const queryBuilder = this.options.clickhouse.taskRuns.existsQueryBuilder();
+
+    queryBuilder
+      .where("organization_id = {organizationId: String}", {
+        organizationId: options.organizationId,
+      })
+      .where("project_id = {projectId: String}", { projectId: options.projectId })
+      .where("environment_id = {environmentId: String}", { environmentId: options.environmentId });
+
+    if (typeof options.createdAtLowerBoundMs === "number") {
+      queryBuilder.where("created_at >= fromUnixTimestamp64Milli({createdAtLowerBound: Int64})", {
+        createdAtLowerBound: options.createdAtLowerBoundMs,
+      });
+    }
+
+    queryBuilder.limit(1);
+
+    const [queryError, result] = await queryBuilder.execute();
+
+    if (queryError) {
+      throw queryError;
+    }
+
+    return (result?.length ?? 0) > 0;
+  }
+
+  /**
+   * Runs the keyset-paginated query and returns `{ runId, createdAt }` rows
+   * (one extra beyond `page.size` to signal "has more"). The ordering is always
+   * the composite `(created_at, run_id)`; the cursor predicate must match it.
+   *
+   * Composite cursors carry both components, so we cut on the
+   * `(created_at, run_id)` tuple — sound regardless of how run_id order relates
+   * to created_at order. Legacy bare-run_id cursors fall back to the old
+   * `run_id`-only predicate (knowingly unsound) for backwards compatibility
+   * with in-flight cursors.
+   */
+  private async listRunRows(options: ListRunsOptions): Promise<RunCursorRow[]> {
     const queryBuilder = this.options.clickhouse.taskRuns.queryBuilder();
     applyRunFiltersToQueryBuilder(
       queryBuilder,
-      await convertRunListInputOptionsToFilterRunsOptions(options, this.options.prisma)
+      await convertRunListInputOptionsToFilterRunsOptions(
+        options,
+        this.options.prisma,
+        this.options.runStore ?? runStore
+      )
     );
 
+    const forward = options.page.direction === "forward" || !options.page.direction;
+
     if (options.page.cursor) {
-      if (options.page.direction === "forward" || !options.page.direction) {
-        queryBuilder
-          .where("run_id < {runId: String}", { runId: options.page.cursor })
-          .orderBy("created_at DESC, run_id DESC")
-          .limit(options.page.size + 1);
+      const decoded = decodeRunsCursor(options.page.cursor);
+
+      if (forward) {
+        if (decoded.kind === "composite") {
+          queryBuilder.where(
+            "(created_at, run_id) < (fromUnixTimestamp64Milli({cursorCreatedAt: Int64}), {runId: String})",
+            { cursorCreatedAt: decoded.createdAt, runId: decoded.runId }
+          );
+        } else {
+          queryBuilder.where("run_id < {runId: String}", { runId: decoded.runId });
+        }
+        queryBuilder.orderBy("created_at DESC, run_id DESC");
       } else {
-        queryBuilder
-          .where("run_id > {runId: String}", { runId: options.page.cursor })
-          .orderBy("created_at ASC, run_id ASC")
-          .limit(options.page.size + 1);
+        if (decoded.kind === "composite") {
+          queryBuilder.where(
+            "(created_at, run_id) > (fromUnixTimestamp64Milli({cursorCreatedAt: Int64}), {runId: String})",
+            { cursorCreatedAt: decoded.createdAt, runId: decoded.runId }
+          );
+        } else {
+          queryBuilder.where("run_id > {runId: String}", { runId: decoded.runId });
+        }
+        queryBuilder.orderBy("created_at ASC, run_id ASC");
       }
+
+      queryBuilder.limit(options.page.size + 1);
     } else {
       // Initial page - no cursor provided
       queryBuilder.orderBy("created_at DESC, run_id DESC").limit(options.page.size + 1);
@@ -48,111 +128,186 @@ export class ClickHouseRunsRepository implements IRunsRepository {
       throw queryError;
     }
 
-    const runIds = result.map((row) => row.run_id);
-    return runIds;
+    return result.map((row) => ({ runId: row.run_id, createdAt: row.created_at_ms }));
+  }
+
+  /**
+   * A keyset-paginated page of run ids ordered by `(created_at, run_id)`, plus
+   * the cursors to page forward/backward. Cursors are composite tokens that
+   * match the ordering, so pagination can't duplicate or skip runs even when
+   * run_id order diverges from created_at order. This is the single source of
+   * cursor construction — `listRuns` and bulk actions both build on it.
+   */
+  async listRunIds(options: ListRunsOptions): Promise<RunIdsPage> {
+    const rows = await this.listRunRows(options);
+
+    // listRunRows fetches one extra row beyond page.size to detect "has more".
+    const hasMore = rows.length > options.page.size;
+
+    const cursorFor = (row: RunCursorRow | undefined): string | null =>
+      row ? encodeRunsCursor(row.createdAt, row.runId) : null;
+
+    let nextCursor: string | null = null;
+    let previousCursor: string | null = null;
+
+    const direction = options.page.direction ?? "forward";
+    switch (direction) {
+      case "forward": {
+        previousCursor = options.page.cursor ? cursorFor(rows.at(0)) : null;
+        if (hasMore) {
+          // The next cursor is the last run on this page.
+          nextCursor = cursorFor(rows[options.page.size - 1]);
+        }
+        break;
+      }
+      case "backward": {
+        const reversedRows = [...rows].reverse();
+        if (hasMore) {
+          previousCursor = cursorFor(reversedRows.at(1));
+          nextCursor = cursorFor(reversedRows.at(options.page.size));
+        } else {
+          // No newer rows, so there's no previous (newer) page. The next
+          // (older) cursor is the oldest row on this page = rows[0] (rows are
+          // ASC here). Index by the actual row count, not page.size — on a
+          // partial page (fewer than page.size rows) page.size-1 overshoots
+          // and would null the cursor, stranding forward navigation.
+          nextCursor = cursorFor(rows.at(0));
+        }
+        break;
+      }
+    }
+
+    // The page is always the first `page.size` rows of the result. listRunRows
+    // fetches one extra row only to detect `hasMore`; that extra row is the
+    // farthest from the cursor in BOTH directions (forward orders DESC, backward
+    // orders ASC), so it's always the trailing element to drop — never the
+    // leading one. (Slicing `[1, size+1]` for backward dropped the row closest
+    // to the cursor and kept the has-more sentinel, straddling two pages.)
+    const runIds = rows.slice(0, options.page.size).map((row) => row.runId);
+
+    return { runIds, pagination: { nextCursor, previousCursor } };
+  }
+
+  /**
+   * Hydrates a ClickHouse-derived run-id set from the run-ops store.
+   * Split ON: new run-ops client first, then the LEGACY RUN-OPS READ REPLICA ONLY
+   * for ids not known-migrated — never the legacy primary. The mixed-residency
+   * fan-out lives here because `RoutingRunStore.findRuns` punts it.
+   * Split OFF (single-DB / self-host): one plain `store.findRuns(args, prisma)`
+   * (passthrough) — no legacy read, no known-migrated probe, no second connection.
+   */
+  async #hydrateRunsByIds<T extends { id: string }>(
+    runIds: string[],
+    hydrate: HydrateFn<T>
+  ): Promise<T[]> {
+    if (runIds.length === 0) {
+      return [];
+    }
+
+    const splitEnabled = this.options.readThrough?.splitEnabled ?? false;
+
+    let rows: T[];
+    if (!splitEnabled) {
+      rows = await hydrate(this.options.prisma, runIds);
+    } else {
+      const newClient = this.options.readThrough?.newClient ?? this.options.prisma;
+      const legacyReplica = this.options.readThrough?.legacyReplica ?? this.options.prisma;
+
+      const newRows = await hydrate(newClient, runIds);
+      const foundIds = new Set(newRows.map((r) => r.id));
+      const missing = runIds.filter((id) => !foundIds.has(id));
+
+      // Any id not hydrated from the new store is probed on the legacy replica.
+      const toProbeLegacy = missing;
+
+      const legacyRows = toProbeLegacy.length ? await hydrate(legacyReplica, toProbeLegacy) : [];
+      rows = [...newRows, ...legacyRows];
+    }
+
+    // Preserve the ClickHouse keyset order (created_at desc, run_id desc) by re-ordering the
+    // hydrated rows to match the input `runIds`. Sorting by raw `id` was only ~chronological
+    // when every id was a time-prefixed cuid; a mixed cuid/run-ops id page sorts the two id-spaces
+    // into separate blocks, burying recent runs. Rows whose PG row is gone (e.g. past
+    // retention) drop out, exactly as before.
+    const byId = new Map(rows.map((r) => [r.id, r] as const));
+    return runIds.map((id) => byId.get(id)).filter((r): r is T => r !== undefined);
   }
 
   async listFriendlyRunIds(options: ListRunsOptions) {
     // First get internal IDs from ClickHouse
-    const internalIds = await this.listRunIds(options);
+    const { runIds } = await this.listRunIds(options);
 
-    if (internalIds.length === 0) {
+    if (runIds.length === 0) {
       return [];
     }
 
-    // Then get friendly IDs from Prisma
-    const runs = await this.options.prisma.taskRun.findMany({
-      where: {
-        id: {
-          in: internalIds,
+    const store = this.options.runStore ?? runStore;
+
+    // Then get friendly IDs from the run-ops store (id added for set-membership;
+    // projected away below so the returned shape stays `string[]`).
+    const runs = await this.#hydrateRunsByIds(runIds, (client, ids) =>
+      store.findRuns(
+        {
+          where: { id: { in: ids } },
+          select: { id: true, friendlyId: true },
         },
-      },
-      select: {
-        friendlyId: true,
-      },
-    });
+        client
+      )
+    );
 
     return runs.map((run) => run.friendlyId);
   }
 
   async listRuns(options: ListRunsOptions) {
-    const runIds = await this.listRunIds(options);
+    const { runIds, pagination } = await this.listRunIds(options);
 
-    // If there are more runs than the page size, we need to fetch the next page
-    const hasMore = runIds.length > options.page.size;
+    const store = this.options.runStore ?? runStore;
 
-    let nextCursor: string | null = null;
-    let previousCursor: string | null = null;
-
-    //get cursors for next and previous pages
-    const direction = options.page.direction ?? "forward";
-    switch (direction) {
-      case "forward": {
-        previousCursor = options.page.cursor ? runIds.at(0) ?? null : null;
-        if (hasMore) {
-          // The next cursor should be the last run ID from this page
-          nextCursor = runIds[options.page.size - 1];
-        }
-        break;
-      }
-      case "backward": {
-        const reversedRunIds = [...runIds].reverse();
-        if (hasMore) {
-          previousCursor = reversedRunIds.at(1) ?? null;
-          nextCursor = reversedRunIds.at(options.page.size) ?? null;
-        } else {
-          nextCursor = reversedRunIds.at(options.page.size - 1) ?? null;
-        }
-
-        break;
-      }
-    }
-
-    const runIdsToReturn =
-      options.page.direction === "backward" && hasMore
-        ? runIds.slice(1, options.page.size + 1)
-        : runIds.slice(0, options.page.size);
-
-    let runs = await this.options.prisma.taskRun.findMany({
-      where: {
-        id: {
-          in: runIdsToReturn,
+    let runs = await this.#hydrateRunsByIds(runIds, (client, ids) =>
+      store.findRuns(
+        {
+          where: {
+            id: {
+              in: ids,
+            },
+          },
+          select: {
+            id: true,
+            friendlyId: true,
+            taskIdentifier: true,
+            taskVersion: true,
+            runtimeEnvironmentId: true,
+            status: true,
+            createdAt: true,
+            startedAt: true,
+            lockedAt: true,
+            delayUntil: true,
+            updatedAt: true,
+            completedAt: true,
+            isTest: true,
+            spanId: true,
+            idempotencyKey: true,
+            ttl: true,
+            expiredAt: true,
+            costInCents: true,
+            baseCostInCents: true,
+            usageDurationMs: true,
+            runTags: true,
+            depth: true,
+            rootTaskRunId: true,
+            batchId: true,
+            metadata: true,
+            metadataType: true,
+            machinePreset: true,
+            queue: true,
+            workerQueue: true,
+            region: true,
+            annotations: true,
+          },
         },
-      },
-      orderBy: {
-        id: "desc",
-      },
-      select: {
-        id: true,
-        friendlyId: true,
-        taskIdentifier: true,
-        taskVersion: true,
-        runtimeEnvironmentId: true,
-        status: true,
-        createdAt: true,
-        startedAt: true,
-        lockedAt: true,
-        delayUntil: true,
-        updatedAt: true,
-        completedAt: true,
-        isTest: true,
-        spanId: true,
-        idempotencyKey: true,
-        ttl: true,
-        expiredAt: true,
-        costInCents: true,
-        baseCostInCents: true,
-        usageDurationMs: true,
-        runTags: true,
-        depth: true,
-        rootTaskRunId: true,
-        batchId: true,
-        metadata: true,
-        metadataType: true,
-        machinePreset: true,
-        queue: true,
-      },
-    });
+        client
+      )
+    );
 
     // ClickHouse is slightly delayed, so we're going to do in-memory status filtering too
     if (options.statuses && options.statuses.length > 0) {
@@ -161,10 +316,7 @@ export class ClickHouseRunsRepository implements IRunsRepository {
 
     return {
       runs,
-      pagination: {
-        nextCursor,
-        previousCursor,
-      },
+      pagination,
     };
   }
 
@@ -172,7 +324,11 @@ export class ClickHouseRunsRepository implements IRunsRepository {
     const queryBuilder = this.options.clickhouse.taskRuns.countQueryBuilder();
     applyRunFiltersToQueryBuilder(
       queryBuilder,
-      await convertRunListInputOptionsToFilterRunsOptions(options, this.options.prisma)
+      await convertRunListInputOptionsToFilterRunsOptions(
+        options,
+        this.options.prisma,
+        this.options.runStore ?? runStore
+      )
     );
 
     const [queryError, result] = await queryBuilder.execute();
@@ -201,7 +357,7 @@ export class ClickHouseRunsRepository implements IRunsRepository {
         environmentId: options.environmentId,
       });
 
-    const periodMs = options.period ? parseDuration(options.period) ?? undefined : undefined;
+    const periodMs = options.period ? (parseDuration(options.period) ?? undefined) : undefined;
     if (periodMs) {
       queryBuilder.where("created_at >= fromUnixTimestamp64Milli({period: Int64})", {
         period: new Date(Date.now() - periodMs).getTime(),
@@ -270,7 +426,9 @@ function applyRunFiltersToQueryBuilder<T>(
   }
 
   if (options.tags && options.tags.length > 0) {
-    queryBuilder.where("hasAny(tags, {tags: Array(String)})", { tags: options.tags });
+    // Both hasAny and hasAll are served by the tags bloom_filter skip index.
+    const tagsFn = options.tagsMatch === "all" ? "hasAll" : "hasAny";
+    queryBuilder.where(`${tagsFn}(tags, {tags: Array(String)})`, { tags: options.tags });
   }
 
   if (options.scheduleId) {
@@ -323,6 +481,12 @@ function applyRunFiltersToQueryBuilder<T>(
     queryBuilder.where("queue IN {queues: Array(String)}", { queues: options.queues });
   }
 
+  if (options.regions && options.regions.length > 0) {
+    queryBuilder.where("if(region != '', region, worker_queue) IN {regions: Array(String)}", {
+      regions: options.regions,
+    });
+  }
+
   if (options.machines && options.machines.length > 0) {
     queryBuilder.where("machine_preset IN {machines: Array(String)}", {
       machines: options.machines,
@@ -333,5 +497,21 @@ function applyRunFiltersToQueryBuilder<T>(
     queryBuilder.where("error_fingerprint = {errorFingerprint: String}", {
       errorFingerprint: ErrorId.toId(options.errorId),
     });
+  }
+
+  if (options.taskKinds && options.taskKinds.length > 0) {
+    const includesStandard = options.taskKinds.includes("STANDARD");
+    // Include empty string when filtering for STANDARD (default value for pre-existing runs)
+    const effectiveKinds = includesStandard ? [...options.taskKinds, ""] : options.taskKinds;
+
+    if (effectiveKinds.length === 1) {
+      queryBuilder.where("task_kind = {taskKind: String}", {
+        taskKind: effectiveKinds[0]!,
+      });
+    } else {
+      queryBuilder.where("task_kind IN {taskKinds: Array(String)}", {
+        taskKinds: effectiveKinds,
+      });
+    }
   }
 }

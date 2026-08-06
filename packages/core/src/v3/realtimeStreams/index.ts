@@ -1,10 +1,25 @@
 import { getGlobal, registerGlobal } from "../utils/globals.js";
 import { NoopRealtimeStreamsManager } from "./noopManager.js";
-import {
+import type {
   RealtimeStreamOperationOptions,
   RealtimeStreamInstance,
   RealtimeStreamsManager,
 } from "./types.js";
+
+// Re-export the session-scoped stream instance so the SDK's
+// `SessionOutputChannel.pipe` / `.writer` can construct it without reaching
+// into the core package's internals.
+export { SessionStreamInstance } from "./sessionStreamInstance.js";
+export type {
+  SessionStreamInstanceOptions,
+  InitializeSessionStreamResponseLike,
+} from "./sessionStreamInstance.js";
+export {
+  trimSessionStream,
+  writeSessionControlRecord,
+  writeTurnCompleteRecord,
+  writeUpgradeRequiredRecord,
+} from "./sessionStreamOneshot.js";
 
 const API_NAME = "realtime-streams";
 

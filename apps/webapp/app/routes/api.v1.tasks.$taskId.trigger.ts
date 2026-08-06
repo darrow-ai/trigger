@@ -5,11 +5,12 @@ import {
   RunEngineVersionSchema,
   TriggerTaskRequestBody,
 } from "@trigger.dev/core/v3";
-import { TaskRun } from "@trigger.dev/database";
+import type { TaskRun } from "@trigger.dev/database";
 import { z } from "zod";
 import { prisma } from "~/db.server";
 import { env } from "~/env.server";
-import { ApiAuthenticationResultSuccess, getOneTimeUseToken } from "~/services/apiAuth.server";
+import type { ApiAuthenticationResultSuccess } from "~/services/apiAuth.server";
+import { getOneTimeUseToken } from "~/services/apiAuth.server";
 import { logger } from "~/services/logger.server";
 import { extractJwtSigningSecretKey } from "~/services/realtime/jwtAuth.server";
 import { determineRealtimeStreamsVersion } from "~/services/realtime/v1StreamsGlobal.server";
@@ -19,7 +20,10 @@ import {
   handleRequestIdempotency,
   saveRequestIdempotency,
 } from "~/utils/requestIdempotency.server";
+import { scopeRequestIdempotencyKey } from "~/utils/requestIdempotencyKey";
+import { canWriteParentRun } from "~/utils/parentRunAuthorization.server";
 import { sanitizeTriggerSource } from "~/utils/triggerSource";
+import { runStore } from "~/v3/runStore.server";
 import { ServiceValidationError } from "~/v3/services/baseService.server";
 import { OutOfEntitlementError, TriggerTaskService } from "~/v3/services/triggerTask.server";
 
@@ -28,7 +32,10 @@ const ParamsSchema = z.object({
 });
 
 export const HeadersSchema = z.object({
-  "idempotency-key": z.string().nullish(),
+  "idempotency-key": z
+    .string()
+    .max(2048, "idempotency-key must be 2048 characters or less")
+    .nullish(),
   "idempotency-key-ttl": z.string().nullish(),
   "trigger-version": z.string().nullish(),
   "x-trigger-span-parent-as-link": z.coerce.number().nullish(),
@@ -51,12 +58,11 @@ const { action, loader } = createActionApiRoute(
     maxContentLength: env.TASK_PAYLOAD_MAXIMUM_SIZE,
     authorization: {
       action: "trigger",
-      resource: (params) => ({ tasks: params.taskId }),
-      superScopes: ["write:tasks", "admin"],
+      resource: (params) => ({ type: "tasks", id: params.taskId }),
     },
     corsStrategy: "all",
   },
-  async ({ body, headers, params, authentication }) => {
+  async ({ body, headers, params, authentication, ability }) => {
     const {
       "idempotency-key": idempotencyKey,
       "idempotency-key-ttl": idempotencyKeyTTL,
@@ -65,24 +71,42 @@ const { action, loader } = createActionApiRoute(
       traceparent,
       tracestate,
       "x-trigger-worker": isFromWorker,
-      "x-trigger-client": triggerClient,
+      "x-trigger-client": _triggerClient,
       "x-trigger-engine-version": engineVersion,
       "x-trigger-request-idempotency-key": requestIdempotencyKey,
       "x-trigger-realtime-streams-version": realtimeStreamsVersion,
       "x-trigger-source": triggerSourceHeader,
     } = headers;
 
-    const cachedResponse = await handleRequestIdempotency(requestIdempotencyKey, {
+    if (
+      !(await canWriteParentRun(
+        ability,
+        authentication.environment.id,
+        authentication.environment.organizationId,
+        body.options?.parentRunId
+      ))
+    ) {
+      return json({ error: "Unauthorized" }, { status: 403 });
+    }
+
+    const scopedIdempotencyKey = scopeRequestIdempotencyKey(requestIdempotencyKey, [
+      authentication.environment.id,
+      params.taskId,
+    ]);
+    const cachedResponse = await handleRequestIdempotency(scopedIdempotencyKey, {
       requestType: "trigger",
       findCachedEntity: async (cachedRequestId) => {
-        return await prisma.taskRun.findFirst({
-          where: {
+        return await runStore.findRun(
+          {
             id: cachedRequestId,
           },
-          select: {
-            friendlyId: true,
+          {
+            select: {
+              friendlyId: true,
+            },
           },
-        });
+          prisma
+        );
       },
       buildResponse: (cachedRun) => ({
         id: cachedRun.friendlyId,
@@ -122,7 +146,9 @@ const { action, loader } = createActionApiRoute(
           realtimeStreamsVersion: determineRealtimeStreamsVersion(
             realtimeStreamsVersion ?? undefined
           ),
-          triggerSource: isFromWorker ? "sdk" : sanitizeTriggerSource(triggerSourceHeader) ?? "api",
+          triggerSource: isFromWorker
+            ? "sdk"
+            : (sanitizeTriggerSource(triggerSourceHeader) ?? "api"),
           triggerAction: "trigger",
         },
         engineVersion ?? undefined
@@ -132,7 +158,20 @@ const { action, loader } = createActionApiRoute(
         return json({ error: "Task not found" }, { status: 404 });
       }
 
-      await saveRequestIdempotency(requestIdempotencyKey, "trigger", result.run.id);
+      // Skip request-idempotency caching when the gate diverted to the
+      // mollifier buffer. `result.run.id` is a synthesised cuid with no
+      // corresponding PG row, so a lost-response SDK retry that reaches
+      // `handleRequestIdempotency` would lookup that id, miss in PG, and
+      // fall through to a fresh trigger — producing a duplicate buffer
+      // entry for triggers without a task-level idempotency key (the
+      // task-level path still dedupes via the buffer's SETNX in
+      // `findBufferedRunWithIdempotency`). Accepting the retry-as-fresh-
+      // trigger semantics here is bounded by the drainer's eventual
+      // materialisation: once the run lands in PG, normal request-
+      // idempotency from that point forward works as usual.
+      if (!result.isMollified) {
+        await saveRequestIdempotency(scopedIdempotencyKey, "trigger", result.run.id);
+      }
 
       const $responseHeaders = await responseHeaders(result.run, authentication);
 
@@ -153,10 +192,9 @@ const { action, loader } = createActionApiRoute(
         return json({ error: error.message }, { status: error.status ?? 422 });
       } else if (error instanceof OutOfEntitlementError) {
         return json({ error: error.message }, { status: 422 });
-      } else if (error instanceof Error) {
-        return json({ error: error.message }, { status: 500 });
       }
 
+      logger.error("Trigger task failed", { error });
       return json({ error: "Something went wrong" }, { status: 500 });
     }
   }

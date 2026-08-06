@@ -7,16 +7,17 @@ vi.mock("~/db.server", () => ({
 }));
 
 import { ClickHouse } from "@internal/clickhouse";
-import { containerTest } from "@internal/testcontainers";
+import { replicationContainerTest } from "@internal/testcontainers";
 import { z } from "zod";
 import { RunsBackfillerService } from "~/services/runsBackfiller.server";
 import { RunsReplicationService } from "~/services/runsReplicationService.server";
 import { createInMemoryTracing } from "./utils/tracing";
+import { TestReplicationClickhouseFactory } from "./utils/testReplicationClickhouseFactory";
 
 vi.setConfig({ testTimeout: 60_000 });
 
 describe("RunsBackfillerService", () => {
-  containerTest(
+  replicationContainerTest(
     "should backfill completed runs to clickhouse",
     async ({ clickhouseContainer, redisOptions, postgresContainer, prisma }) => {
       const clickhouse = new ClickHouse({
@@ -27,10 +28,10 @@ describe("RunsBackfillerService", () => {
         },
       });
 
-      const { tracer, exporter } = createInMemoryTracing();
+      const { tracer, exporter: _exporter } = createInMemoryTracing();
 
       const runsReplicationService = new RunsReplicationService({
-        clickhouse,
+        clickhouseFactory: new TestReplicationClickhouseFactory(clickhouse),
         pgConnectionUrl: postgresContainer.getConnectionUri(),
         serviceName: "runs-replication",
         slotName: "task_runs_to_clickhouse_v1",

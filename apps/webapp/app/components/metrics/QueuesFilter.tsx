@@ -3,7 +3,7 @@ import { RectangleStackIcon } from "@heroicons/react/20/solid";
 import { useFetcher } from "@remix-run/react";
 import { matchSorter } from "match-sorter";
 import { type ReactNode, useMemo } from "react";
-import { TaskIcon } from "~/assets/icons/TaskIcon";
+import { TasksIcon } from "~/assets/icons/TasksIcon";
 import { AppliedFilter } from "~/components/primitives/AppliedFilter";
 import {
   ComboBox,
@@ -25,7 +25,7 @@ import { appliedSummary, FilterMenuProvider } from "~/components/runs/v3/SharedF
 const shortcut = { key: "q" };
 
 export function QueuesFilter() {
-  const { values, replace, del } = useSearchParams();
+  const { values, replace: _replace, del } = useSearchParams();
   const selectedQueues = values("queues");
 
   if (selectedQueues.length === 0 || selectedQueues.every((v) => v === "")) {
@@ -39,6 +39,7 @@ export function QueuesFilter() {
                 variant="secondary/small"
                 shortcut={shortcut}
                 tooltipTitle="Filter by queue"
+                className="pl-1.5"
               >
                 <span className="ml-1">Queues</span>
               </SelectTrigger>
@@ -190,9 +191,10 @@ function QueuesDropdown({
                 <SelectItem
                   key={queue.value}
                   value={queue.value}
+                  className="text-text-bright"
                   icon={
                     queue.type === "task" ? (
-                      <TaskIcon className="size-4 shrink-0 text-blue-500" />
+                      <TasksIcon className="size-4 shrink-0 text-blue-500" />
                     ) : (
                       <RectangleStackIcon className="size-4 shrink-0 text-purple-500" />
                     )

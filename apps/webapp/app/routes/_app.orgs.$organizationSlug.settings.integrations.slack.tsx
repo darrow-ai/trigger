@@ -5,7 +5,7 @@ import { typedjson, useTypedLoaderData } from "remix-typedjson";
 import { z } from "zod";
 import { DialogClose } from "@radix-ui/react-dialog";
 import { TrashIcon } from "@heroicons/react/20/solid";
-import { IconBugFilled } from "@tabler/icons-react";
+import { BugIcon } from "~/assets/icons/BugIcon";
 import { SlackMonoIcon } from "~/assets/icons/SlackMonoIcon";
 import { Button } from "~/components/primitives/Buttons";
 import { DateTime } from "~/components/primitives/DateTime";
@@ -196,12 +196,12 @@ export default function SlackIntegrationPage() {
         </NavBar>
         <PageBody>
           <div className="flex h-full flex-col items-center justify-center gap-3">
-            <SlackMonoIcon className="mb-2 size-16 text-charcoal-650" />
+            <SlackMonoIcon className="mb-2 size-16 text-secondary" />
             <Header2>No Slack integration found</Header2>
             <Paragraph className="max-w-md text-center text-text-dimmed">
               Your organization doesn't have a Slack integration configured. You can connect Slack
               when setting up alerts from the{" "}
-              <IconBugFilled className="-ml-0.5 mb-0.5 inline size-5 text-errors" />
+              <BugIcon className="-ml-0.5 mb-0.5 inline size-5 text-errors" />
               <span className="text-text-bright">Errors</span> page.
             </Paragraph>
           </div>

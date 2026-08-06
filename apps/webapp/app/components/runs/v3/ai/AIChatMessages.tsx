@@ -1,27 +1,21 @@
-import {
-  CheckIcon,
-  ChevronDownIcon,
-  ChevronUpIcon,
-  ClipboardDocumentIcon,
-  CodeBracketSquareIcon,
-} from "@heroicons/react/20/solid";
-import { lazy, Suspense, useState } from "react";
+import { ChevronDownIcon, ChevronUpIcon } from "@heroicons/react/20/solid";
+import { Clipboard, ClipboardCheck } from "lucide-react";
+import { Suspense, useEffect, useState } from "react";
+import { CodeSquareIcon } from "~/assets/icons/CodeSquareIcon";
+import { TextSquareIcon } from "~/assets/icons/TextSquareIcon";
 import { CodeBlock } from "~/components/code/CodeBlock";
+import { StreamdownRenderer } from "~/components/code/StreamdownRenderer";
 import { Button, LinkButton } from "~/components/primitives/Buttons";
 import { Header3 } from "~/components/primitives/Headers";
 import tablerSpritePath from "~/components/primitives/tabler-sprite.svg";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "~/components/primitives/Tooltip";
+import { cn } from "~/utils/cn";
 import type { DisplayItem, ToolUse } from "./types";
-
-// Lazy load streamdown to avoid SSR issues
-const StreamdownRenderer = lazy(() =>
-  import("streamdown").then((mod) => ({
-    default: ({ children }: { children: string }) => (
-      <mod.ShikiThemeContext.Provider value={["one-dark-pro", "one-dark-pro"]}>
-        <mod.Streamdown isAnimating={false}>{children}</mod.Streamdown>
-      </mod.ShikiThemeContext.Provider>
-    ),
-  }))
-);
 
 export type PromptLink = {
   slug: string;
@@ -69,7 +63,7 @@ function SectionHeader({ label, right }: { label: string; right?: React.ReactNod
 
 export function ChatBubble({ children }: { children: React.ReactNode }) {
   return (
-    <div className="rounded-md border border-grid-bright bg-charcoal-750/50 px-3.5 py-2">
+    <div className="rounded-md border border-grid-bright bg-background-hover/50 px-3.5 py-2">
       {children}
     </div>
   );
@@ -79,13 +73,7 @@ export function ChatBubble({ children }: { children: React.ReactNode }) {
 // System
 // ---------------------------------------------------------------------------
 
-function SystemSection({
-  text,
-  promptLink,
-}: {
-  text: string;
-  promptLink?: PromptLink;
-}) {
+function SystemSection({ text, promptLink }: { text: string; promptLink?: PromptLink }) {
   const [expanded, setExpanded] = useState(false);
   const isLong = text.length > 150;
   const preview = isLong ? text.slice(0, 150) + "..." : text;
@@ -119,7 +107,7 @@ function SystemSection({
         )}
       </div>
       <ChatBubble>
-        <div className="font-sans text-sm font-normal text-text-dimmed streamdown-container">
+        <div className="streamdown-container font-sans text-sm font-normal text-text-dimmed">
           <Suspense fallback={<span className="whitespace-pre-wrap">{displayText}</span>}>
             <StreamdownRenderer>{displayText}</StreamdownRenderer>
           </Suspense>
@@ -138,7 +126,7 @@ function UserSection({ text }: { text: string }) {
     <div className="flex flex-col gap-1.5 py-2.5">
       <SectionHeader label="User" />
       <ChatBubble>
-        <div className="font-sans text-sm font-normal text-text-dimmed streamdown-container">
+        <div className="streamdown-container font-sans text-sm font-normal text-text-dimmed">
           <Suspense fallback={<span className="whitespace-pre-wrap">{text}</span>}>
             <StreamdownRenderer>{text}</StreamdownRenderer>
           </Suspense>
@@ -200,28 +188,50 @@ export function AssistantResponse({
       <SectionHeader
         label={headerLabel}
         right={
-          <div className="flex items-center">
-            <Button
-              variant="minimal/small"
-              onClick={() => setMode(mode === "rendered" ? "raw" : "rendered")}
-              LeadingIcon={CodeBracketSquareIcon}
-            >
-              {mode === "rendered" ? "Raw" : "Rendered"}
-            </Button>
-            <Button
-              variant="minimal/small"
-              onClick={handleCopy}
-              LeadingIcon={copied ? CheckIcon : ClipboardDocumentIcon}
-              leadingIconClassName={copied ? "text-green-500" : undefined}
-            >
-              Copy
-            </Button>
+          <div className="flex items-center gap-2">
+            <TooltipProvider>
+              <Tooltip disableHoverableContent>
+                <TooltipTrigger
+                  onClick={() => setMode(mode === "rendered" ? "raw" : "rendered")}
+                  className="text-text-dimmed transition-colors duration-100 focus-custom hover:cursor-pointer hover:text-text-bright"
+                >
+                  {mode === "rendered" ? (
+                    <CodeSquareIcon className="size-4.5" />
+                  ) : (
+                    <TextSquareIcon className="size-4.5" />
+                  )}
+                </TooltipTrigger>
+                <TooltipContent side="top" className="text-xs">
+                  {mode === "rendered" ? "Show raw" : "Show rendered"}
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+            <TooltipProvider>
+              <Tooltip open={copied || undefined} disableHoverableContent>
+                <TooltipTrigger
+                  onClick={handleCopy}
+                  className={cn(
+                    "transition-colors duration-100 focus-custom hover:cursor-pointer",
+                    copied ? "text-success" : "text-text-dimmed hover:text-text-bright"
+                  )}
+                >
+                  {copied ? (
+                    <ClipboardCheck className="size-4" />
+                  ) : (
+                    <Clipboard className="size-4" />
+                  )}
+                </TooltipTrigger>
+                <TooltipContent side="top" className="text-xs">
+                  {copied ? "Copied" : "Copy"}
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
           </div>
         }
       />
       {mode === "rendered" ? (
         <ChatBubble>
-          <div className="font-sans text-sm font-normal text-text-dimmed streamdown-container">
+          <div className="streamdown-container min-w-0 font-sans text-sm font-normal text-text-dimmed wrap-anywhere">
             <Suspense fallback={<span className="whitespace-pre-wrap">{text}</span>}>
               <StreamdownRenderer>{text}</StreamdownRenderer>
             </Suspense>
@@ -257,30 +267,69 @@ function ToolUseSection({ tools }: { tools: ToolUse[] }) {
   );
 }
 
-type ToolTab = "input" | "output" | "details";
+type ToolTab = "input" | "output" | "details" | "agent";
 
-function ToolUseRow({ tool }: { tool: ToolUse }) {
+export function ToolUseRow({ tool }: { tool: ToolUse }) {
   const hasInput = tool.inputJson !== "{}";
   const hasResult = !!tool.resultOutput;
   const hasDetails = !!tool.description || !!tool.parametersJson;
+  const hasSubAgent = !!tool.subAgent;
 
   const availableTabs: ToolTab[] = [
+    ...(hasSubAgent ? (["agent"] as const) : []),
     ...(hasInput ? (["input"] as const) : []),
     ...(hasResult ? (["output"] as const) : []),
     ...(hasDetails ? (["details"] as const) : []),
   ];
 
-  const defaultTab: ToolTab | null = hasInput ? "input" : null;
-  const [activeTab, setActiveTab] = useState<ToolTab | null>(defaultTab);
+  const [activeTab, setActiveTab] = useState<ToolTab | null>(
+    hasSubAgent ? "agent" : hasInput ? "input" : null
+  );
+
+  // Auto-select input tab when input arrives after initial render (e.g. streaming tool calls)
+  useEffect(() => {
+    if (!hasSubAgent && hasInput && activeTab === null) {
+      setActiveTab("input");
+    }
+  }, [hasInput, hasSubAgent]);
 
   function handleTabClick(tab: ToolTab) {
     setActiveTab(activeTab === tab ? null : tab);
   }
 
   return (
-    <div className="rounded-sm border border-grid-bright bg-charcoal-800/40">
+    <div
+      className={`rounded-sm border bg-background-bright/40 ${
+        hasSubAgent ? "border-indigo-500/30" : "border-grid-bright"
+      }`}
+    >
       <div className="flex items-center gap-2 px-2.5 py-1.5">
-        <code className="font-mono text-xs text-text-bright">{tool.toolName}</code>
+        {hasSubAgent && (
+          <svg
+            className="size-3.5 text-indigo-400"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth={1.5}
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              d="M8.25 3v1.5M4.5 8.25H3m18 0h-1.5M4.5 12H3m18 0h-1.5m-15 3.75H3m18 0h-1.5M8.25 19.5V21M12 3v1.5m0 15V21m3.75-18v1.5m0 15V21m-9-1.5h10.5a2.25 2.25 0 0 0 2.25-2.25V6.75a2.25 2.25 0 0 0-2.25-2.25H6.75A2.25 2.25 0 0 0 4.5 6.75v10.5a2.25 2.25 0 0 0 2.25 2.25Zm.75-12h9v9h-9v-9Z"
+            />
+          </svg>
+        )}
+        <code
+          className={`font-mono text-xs ${hasSubAgent ? "text-indigo-300" : "text-text-bright"}`}
+        >
+          {tool.toolName}
+        </code>
+        {hasSubAgent && tool.subAgent?.isStreaming && (
+          <span className="flex items-center gap-1 text-[10px] text-indigo-400">
+            <span className="inline-block size-1.5 animate-pulse rounded-full bg-indigo-400" />
+            streaming
+          </span>
+        )}
         {tool.resultSummary && (
           <span className="ml-auto text-[10px] text-text-dimmed">{tool.resultSummary}</span>
         )}
@@ -288,14 +337,18 @@ function ToolUseRow({ tool }: { tool: ToolUse }) {
 
       {availableTabs.length > 0 && (
         <>
-          <div className="flex gap-0 border-t border-grid-bright">
+          <div
+            className={`flex gap-0 border-t ${
+              hasSubAgent ? "border-indigo-500/20" : "border-grid-bright"
+            }`}
+          >
             {availableTabs.map((tab) => (
               <button
                 key={tab}
                 onClick={() => handleTabClick(tab)}
                 className={`px-2.5 py-1 text-[11px] capitalize transition-colors ${
                   activeTab === tab
-                    ? "bg-charcoal-750 text-text-bright"
+                    ? "bg-background-hover text-text-bright"
                     : "text-text-dimmed hover:text-text-bright"
                 }`}
               >
@@ -304,6 +357,8 @@ function ToolUseRow({ tool }: { tool: ToolUse }) {
             ))}
           </div>
 
+          {activeTab === "agent" && hasSubAgent && <SubAgentContent parts={tool.subAgent!.parts} />}
+
           {activeTab === "input" && hasInput && (
             <div className="border-t border-grid-dimmed">
               <CodeBlock
@@ -311,18 +366,30 @@ function ToolUseRow({ tool }: { tool: ToolUse }) {
                 maxLines={12}
                 showLineNumbers={false}
                 showCopyButton
+                className="rounded-none border-0"
               />
             </div>
           )}
 
           {activeTab === "output" && hasResult && (
             <div className="border-t border-grid-dimmed">
-              <CodeBlock
-                code={tool.resultOutput!}
-                maxLines={16}
-                showLineNumbers={false}
-                showCopyButton
-              />
+              {isJsonString(tool.resultOutput!) ? (
+                <CodeBlock
+                  code={tool.resultOutput!}
+                  maxLines={16}
+                  showLineNumbers={false}
+                  showCopyButton
+                  className="rounded-none border-0"
+                />
+              ) : (
+                <div className="streamdown-container p-2.5 font-sans text-sm font-normal text-text-dimmed">
+                  <Suspense
+                    fallback={<span className="whitespace-pre-wrap">{tool.resultOutput}</span>}
+                  >
+                    <StreamdownRenderer>{tool.resultOutput!}</StreamdownRenderer>
+                  </Suspense>
+                </div>
+              )}
             </div>
           )}
 
@@ -341,6 +408,7 @@ function ToolUseRow({ tool }: { tool: ToolUse }) {
                     maxLines={16}
                     showLineNumbers={false}
                     showCopyButton
+                    className="rounded-none border-0"
                   />
                 </div>
               )}
@@ -348,6 +416,82 @@ function ToolUseRow({ tool }: { tool: ToolUse }) {
           )}
         </>
       )}
+    </div>
+  );
+}
+
+function SubAgentContent({ parts }: { parts: any[] }) {
+  // Extract sub-agent run ID from injected metadata part
+  const runPart = parts.find((p: any) => p.type === "data-subagent-run" && p.data?.runId);
+  const subAgentRunId = runPart?.data?.runId as string | undefined;
+
+  return (
+    <div className="space-y-2 border-t border-indigo-500/20 p-2.5">
+      {subAgentRunId && (
+        <div className="flex justify-end">
+          <LinkButton to={`/runs/${subAgentRunId}`} variant="tertiary/small" target="_blank">
+            View sub-agent run
+          </LinkButton>
+        </div>
+      )}
+      {parts.map((part: any, j: number) => {
+        const partType = part.type as string;
+
+        // Skip the injected metadata part — already rendered above
+        if (partType === "data-subagent-run") return null;
+
+        if (partType === "text" && part.text) {
+          return <AssistantResponse key={j} text={part.text} headerLabel="" />;
+        }
+
+        if (partType === "step-start") {
+          return (
+            <div key={j} className="flex items-center gap-2 py-0.5">
+              <div className="flex-1 border-t border-dashed border-border-bright" />
+              <span className="text-[10px] text-text-faint">step</span>
+              <div className="flex-1 border-t border-dashed border-border-bright" />
+            </div>
+          );
+        }
+
+        if (partType.startsWith("tool-")) {
+          const subToolName = partType.slice(5);
+          return (
+            <ToolUseRow
+              key={j}
+              tool={{
+                toolCallId: part.toolCallId ?? `sub-tool-${j}`,
+                toolName: subToolName,
+                inputJson: JSON.stringify(part.input ?? {}, null, 2),
+                resultOutput:
+                  part.output != null
+                    ? typeof part.output === "string"
+                      ? part.output
+                      : JSON.stringify(part.output, null, 2)
+                    : undefined,
+                resultSummary:
+                  part.state === "input-streaming" || part.state === "input-available"
+                    ? "calling..."
+                    : part.state === "output-error"
+                      ? `error: ${part.errorText ?? "unknown"}`
+                      : undefined,
+              }}
+            />
+          );
+        }
+
+        if (partType === "reasoning" && part.text) {
+          return (
+            <div key={j} className="border-l-2 border-amber-500/40 pl-2">
+              <div className="whitespace-pre-wrap text-xs italic text-amber-700 dark:text-amber-200/70">
+                {part.text}
+              </div>
+            </div>
+          );
+        }
+
+        return null;
+      })}
     </div>
   );
 }

@@ -1,10 +1,14 @@
-import { PrismaClientOrTransaction, sqlDatabaseSchema } from "~/db.server";
+import type { DataPoint } from "regression";
+// Default-import: regression is CJS and its named exports aren't statically
+// analyzable under ESM interop.
+import regression from "regression";
+const { linear } = regression;
+import type { PrismaClientOrTransaction } from "~/db.server";
 import { env } from "~/env.server";
-import { getUsage, getUsageSeries } from "~/services/platform.v3.server";
+import { clickhouseFactory } from "~/services/clickhouse/clickhouseFactoryInstance.server";
+import { getUsageSeries } from "~/services/platform.v3.server";
 import { createTimeSeriesData } from "~/utils/graphs";
 import { BasePresenter } from "./basePresenter.server";
-import { DataPoint, linear } from "regression";
-import { clickhouseClient } from "~/services/clickhouseInstance.server";
 
 type Options = {
   organizationId: string;
@@ -124,7 +128,11 @@ async function getTaskUsageByOrganization(
   endOfMonth: Date,
   replica: PrismaClientOrTransaction
 ) {
-  const [queryError, tasks] = await clickhouseClient.taskRuns.getTaskUsageByOrganization({
+  const clickhouse = await clickhouseFactory.getClickhouseForOrganization(
+    organizationId,
+    "standard"
+  );
+  const [queryError, tasks] = await clickhouse.taskRuns.getTaskUsageByOrganization({
     startTime: startOfMonth.getTime(),
     endTime: endOfMonth.getTime(),
     organizationId,

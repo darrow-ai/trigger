@@ -1,5 +1,433 @@
 # internal-platform
 
+## 4.5.9
+
+### Patch Changes
+
+- Ask whether an environment is healthy and get an answer instead of a wall of charts. `trigger report health` returns a verdict on three questions: is work flowing, are the runs that start succeeding, and is the telemetry fresh enough to trust either answer. When something looks wrong it names the most likely cause and a next action. ([#4131](https://github.com/triggerdotdev/trigger.dev/pull/4131))
+
+  ```bash
+  npx trigger.dev@latest report health --env prod --period 24h
+  ```
+
+  The verdict is computed server side, so the CLI, the new `get_report` MCP tool, and `GET /api/v1/reports/health` all return the same text with the same sparklines. In MCP hosts that support prompts, `report` is also available as a slash command.
+
+## 4.5.8
+
+### Patch Changes
+
+- Allow additional environment API keys to create scoped public access tokens through the Trigger.dev API. Use server-issued public access tokens for batch operations so environment-scoped API keys can read batch results. ([#4387](https://github.com/triggerdotdev/trigger.dev/pull/4387))
+
+## 4.5.7
+
+### Patch Changes
+
+- Add `node-24` and `node-26` as supported `runtime` options in `trigger.config.ts`. The `experimental-node-24` and `experimental-node-26` names are now deprecated aliases and emit a deprecation warning; switch to `node-24` / `node-26` instead. ([#4337](https://github.com/triggerdotdev/trigger.dev/pull/4337))
+
+  ```ts
+  import { defineConfig } from "@trigger.dev/sdk";
+
+  export default defineConfig({
+    runtime: "node-24",
+    project: "<your-project-ref>",
+  });
+  ```
+
+## 4.5.6
+
+### Patch Changes
+
+- Prevent prototype pollution when applying run metadata operations or reconstructing nested telemetry attributes, while preserving legitimate `constructor` and `prototype` fields. ([#4316](https://github.com/triggerdotdev/trigger.dev/pull/4316))
+- Require explicit browser approval for CLI and MCP login, with resilient polling while approval is pending. ([#4316](https://github.com/triggerdotdev/trigger.dev/pull/4316))
+- Add helpers to mint and verify the deployment-scoped token used to authenticate run controllers to the platform. ([#4316](https://github.com/triggerdotdev/trigger.dev/pull/4316))
+
+## 4.5.5
+
+### Patch Changes
+
+- Add experimental Node.js 24 and 26 task runtimes. Set `runtime` to `experimental-node-24` or `experimental-node-26` in `trigger.config.ts`. ([#4085](https://github.com/triggerdotdev/trigger.dev/pull/4085))
+- Add `defaultRegion` to the project GET and list API responses; null when unset. ([#4146](https://github.com/triggerdotdev/trigger.dev/pull/4146))
+
+## 4.5.4
+
+### Patch Changes
+
+- Removed the unused `ResourceMonitor` export from `@trigger.dev/core/v3/serverOnly`. It was a server-side logging helper with no remaining consumers. ([#4244](https://github.com/triggerdotdev/trigger.dev/pull/4244))
+- Removed the unused `@trigger.dev/core/v3/zodNamespace` export and the legacy v3 socket message schemas. These were only used by the now-retired v3 engine and have no v4 consumers. ([#4236](https://github.com/triggerdotdev/trigger.dev/pull/4236))
+
+## 4.5.3
+
+## 4.5.2
+
+### Patch Changes
+
+- Add SDK and API client helpers for run bulk actions. ([#4105](https://github.com/triggerdotdev/trigger.dev/pull/4105))
+- Large batch payloads now offload to object storage instead of riding inline in the trigger request. `batchTrigger` and `batchTriggerAndWait` (and the by-id and by-task variants) offload any per-item payload over 128KB before sending, the same way single `trigger` and `triggerAndWait` already do, so a big batch no longer blows past the API body limit. ([#4165](https://github.com/triggerdotdev/trigger.dev/pull/4165))
+- Removed internal helpers that were only used by the end-of-life v3 self-hosted compute providers. ([#4194](https://github.com/triggerdotdev/trigger.dev/pull/4194))
+
+## 4.5.1
+
+## 4.5.0
+
+### Patch Changes
+
+- Add Agent Skills for `chat.agent`. Drop a folder with a `SKILL.md` and any helper scripts/references next to your task code, register it with `skills.define({ id, path })`, and the CLI bundles it into the deploy image automatically — no `trigger.config.ts` changes. The agent gets a one-line summary in its system prompt and discovers full instructions on demand via `loadSkill`, with `bash` and `readFile` tools scoped per-skill (path-traversal guards, output caps, abort-signal propagation). ([#3543](https://github.com/triggerdotdev/trigger.dev/pull/3543))
+
+  ```ts
+  const pdfSkill = skills.define({
+    id: "pdf-extract",
+    path: "./skills/pdf-extract",
+  });
+
+  chat.skills.set([await pdfSkill.local()]);
+  ```
+
+  Built on the [AI SDK cookbook pattern](https://ai-sdk.dev/cookbook/guides/agent-skills) — portable across providers. SDK + CLI only for now; dashboard-editable `SKILL.md` text is on the roadmap.
+
+- Add optional `shouldPauseScaling` to the supervisor consumer pool scaling options to freeze scale-up while it returns true (scale-down stays allowed). ([#3836](https://github.com/triggerdotdev/trigger.dev/pull/3836))
+- Reject overlong `idempotencyKey` values at the API boundary so they no longer trip an internal size limit on the underlying unique index and surface as a generic 500. Inputs are capped at 2048 characters — well above what `idempotencyKeys.create()` produces (a 64-character hash) and above any realistic raw key. Applies to `tasks.trigger`, `tasks.batchTrigger`, `batch.create` (Phase 1 streaming batches), `wait.createToken`, `wait.forDuration`, and the input/session stream waitpoint endpoints. Over-limit requests now return a structured 400 instead. ([#3560](https://github.com/triggerdotdev/trigger.dev/pull/3560))
+- Reliability fixes for `chat.agent`. A user message sent while the agent is streaming is no longer delivered twice (which could run a duplicate turn), input appends now carry an idempotency key so a retried send can't duplicate a message, stopping a generation clears the streaming state so a page reload doesn't replay the stopped turn, and runs can now carry the full set of dashboard tags instead of being silently truncated. `onTurnComplete` now fires on errored turns (with the thrown error attached) and the failed turn's user message is persisted so it isn't lost on the next run. Custom agents and manual `chat.writeTurnComplete` callers now trim the output stream, sending a custom action no longer leaves a second stream reader running, and a long-lived `watch` subscription no longer grows its dedupe set without bound. ([#3891](https://github.com/triggerdotdev/trigger.dev/pull/3891))
+- **AI Agents** — run AI SDK chat completions as durable Trigger.dev agents instead of fragile API routes. Define an agent in one function, point `useChat` at it from React, and the conversation survives page refreshes, network blips, and process restarts. ([#3543](https://github.com/triggerdotdev/trigger.dev/pull/3543))
+
+  ```ts
+  import { chat } from "@trigger.dev/sdk/ai";
+  import { streamText } from "ai";
+  import { openai } from "@ai-sdk/openai";
+
+  export const myChat = chat.agent({
+    id: "my-chat",
+    run: async ({ messages, signal }) =>
+      streamText({ model: openai("gpt-4o"), messages, abortSignal: signal }),
+  });
+  ```
+
+  ```tsx
+  import { useChat } from "@ai-sdk/react";
+  import { useTriggerChatTransport } from "@trigger.dev/sdk/chat/react";
+
+  const transport = useTriggerChatTransport({
+    task: "my-chat",
+    accessToken,
+    startSession,
+  });
+  const { messages, sendMessage } = useChat({ transport });
+  ```
+
+  **What you get:**
+  - **AI SDK `useChat` integration** — a custom [`ChatTransport`](https://sdk.vercel.ai/docs/ai-sdk-ui/transport) (`useTriggerChatTransport`) plugs straight into Vercel AI SDK's `useChat` hook. Text streaming, tool calls, reasoning, and `data-*` parts all work natively over Trigger.dev's realtime streams. No custom API routes needed.
+  - **First-turn fast path (`chat.headStart`)** — opt-in handler that runs the first turn's `streamText` step in your warm server process while the agent run boots in parallel, cutting cold-start TTFC by roughly half (measured 2801ms → 1218ms on `claude-sonnet-4-6`). The agent owns step 2+ (tool execution, persistence, hooks) so heavy deps stay where they belong. Web Fetch handler works natively in Next.js, Hono, SvelteKit, Remix, Workers, etc.; bridge to Express/Fastify/Koa via `chat.toNodeListener`. New `@trigger.dev/sdk/chat-server` subpath.
+  - **Multi-turn durability via Sessions** — every chat is backed by a durable Session that outlives any individual run. Conversations resume across page refreshes, idle timeout, crashes, and deploys; `resume: true` reconnects via `lastEventId` so clients only see new chunks. `sessions.list` enumerates chats for inbox-style UIs.
+  - **Auto-accumulated history, delta-only wire** — the backend accumulates the full conversation across turns; clients only ship the new message each turn. Long chats never hit the 512 KiB body cap. Register `hydrateMessages` to be the source of truth yourself.
+  - **Lifecycle hooks** — `onPreload`, `onChatStart`, `onValidateMessages`, `hydrateMessages`, `onTurnStart`, `onBeforeTurnComplete`, `onTurnComplete`, `onChatSuspend`, `onChatResume` — for persistence, validation, and post-turn work.
+  - **Stop generation** — client-driven `transport.stopGeneration(chatId)` aborts mid-stream; the run stays alive for the next message, partial response is captured, and aborted parts (stuck `partial-call` tools, in-progress reasoning) are auto-cleaned.
+  - **Tool approvals (HITL)** — tools with `needsApproval: true` pause until the user approves or denies via `addToolApprovalResponse`. The runtime reconciles the updated assistant message by ID and continues `streamText`.
+  - **Steering and background injection** — `pendingMessages` injects user messages between tool-call steps so users can steer the agent mid-execution; `chat.inject()` + `chat.defer()` adds context from background work (self-review, RAG, safety checks) between turns.
+  - **Actions** — non-turn frontend commands (undo, rollback, regenerate, edit) sent via `transport.sendAction`. Fire `hydrateMessages` + `onAction` only — no turn hooks, no `run()`. `onAction` can return a `StreamTextResult` for a model response, or `void` for side-effect-only.
+  - **Typed state primitives** — `chat.local<T>` for per-run state accessible from hooks, `run()`, tools, and subtasks (auto-serialized through `ai.toolExecute`); `chat.store` for typed shared data between agent and client; `chat.history` for reading and mutating the message chain; `clientDataSchema` for typed `clientData` in every hook.
+  - **`chat.toStreamTextOptions()`** — one spread into `streamText` wires up versioned system [Prompts](https://trigger.dev/docs/ai/prompts), model resolution, telemetry metadata, compaction, steering, and background injection.
+  - **Multi-tab coordination** — `multiTab: true` + `useMultiTabChat` prevents duplicate sends and syncs state across browser tabs via `BroadcastChannel`. Non-active tabs go read-only with live updates.
+  - **Network resilience** — built-in indefinite retry with bounded backoff, reconnect on `online` / tab refocus / bfcache restore, `Last-Event-ID` mid-stream resume. No app code needed.
+
+  See [/docs/ai-chat](https://trigger.dev/docs/ai-chat/overview) for the full surface — quick start, three backend approaches (`chat.agent`, `chat.createSession`, raw task), persistence and code-sandbox patterns, type-level guides, and API reference.
+
+- Continuation chat boots no longer stall for around 10 seconds before the first turn. The `session.in` resume cursor is now found with a non-blocking records read instead of draining an SSE long-poll (which always waited out its full 5 second inactivity window, twice per boot), the boot reads run concurrently, and chat snapshots carry the cursor so subsequent boots skip the scan entirely. ([#3907](https://github.com/triggerdotdev/trigger.dev/pull/3907))
+- Stamp `gen_ai.conversation.id` (the chat id) on every span and metric emitted from inside a `chat.task` or `chat.agent` run. Lets you filter dashboard spans, runs, and metrics by the chat conversation that produced them — independent of the run boundary, so multi-run chats correlate cleanly. No code changes required on the user side. ([#3543](https://github.com/triggerdotdev/trigger.dev/pull/3543))
+- Coerce numeric `concurrencyKey` values to string at the API boundary across `tasks.trigger`, `tasks.batchTrigger`, and the Phase-2 streaming batch endpoint. ([#3789](https://github.com/triggerdotdev/trigger.dev/pull/3789))
+- Record client-side dequeue API latency in the supervisor consumer pool as a Prometheus histogram (`queue_consumer_pool_dequeue_duration_seconds`, labelled by `outcome`: success/empty/error). ([#3887](https://github.com/triggerdotdev/trigger.dev/pull/3887))
+- Add support for dev branches to the webapp and CLI. This allows humans (and agents) to run multiple local dev servers simultaneously, with a separate dashboard for each one. ([#4023](https://github.com/triggerdotdev/trigger.dev/pull/4023))
+- `dev` and `deploy` now fail with a clear error when two tasks are defined with the same id, including across different task types (e.g. a scheduled task and a regular task sharing an id). Previously the second definition silently overwrote the first, so one of the tasks would vanish with no warning. Task ids are detected as duplicates during indexing (naming each offending id and the files it was found in), and the same rule is enforced server-side when the background worker is registered. ([#3865](https://github.com/triggerdotdev/trigger.dev/pull/3865))
+- Fix `@trigger.dev/core` build: cast the underlying log record exporter when calling `forceFlush` so it typechecks against the updated OpenTelemetry `LogRecordExporter` type (which no longer declares `forceFlush`). ([#3829](https://github.com/triggerdotdev/trigger.dev/pull/3829))
+- `envvars.upload` now accepts an optional `isSecret` flag, letting you create the imported variables as secret (redacted) environment variables. When omitted, variables default to non-secret. ([#3809](https://github.com/triggerdotdev/trigger.dev/pull/3809))
+
+  ```ts
+  await envvars.upload("proj_1234", "prod", {
+    variables: { STRIPE_SECRET_KEY: "sk_live_..." },
+    isSecret: true,
+  });
+  ```
+
+- Add request and response schemas for the new Errors API (error groups). These back the env-scoped HTTP endpoints for listing error groups, retrieving a single group, and changing its state (resolve, ignore, unresolve), plus a `filter[error]` option on the runs list to fetch the runs behind a group. Exported from `@trigger.dev/core/v3` so the SDK can reuse them. ([#4005](https://github.com/triggerdotdev/trigger.dev/pull/4005))
+- Add an optional `skipBodyParsing` flag to the internal HTTP server route definition, letting a route respond without reading or parsing the request body. ([#4009](https://github.com/triggerdotdev/trigger.dev/pull/4009))
+- Fix idempotency key metadata (original key + scope) being silently dropped when a single run creates more than 1000 idempotency keys. The in-process catalog that maps a key's hash back to its original key/scope is no longer bounded to 1000 entries, so `idempotencyKeys.create()` results retain their metadata regardless of how many are created in a run. The catalog is now cleared at each run boundary so it does not accumulate across warm-start runs. ([#4094](https://github.com/triggerdotdev/trigger.dev/pull/4094))
+- Offload large trigger payloads to object storage before sending the trigger API request. The SDK uploads packets at or above the existing 128KB limit and sends an `application/store` pointer instead of embedding large JSON in the request body. `TriggerTaskRequestBody` now validates that `application/store` payloads are non-empty storage paths. ([#3785](https://github.com/triggerdotdev/trigger.dev/pull/3785))
+
+  Payload uploads use the same resolved `ApiClient` as the trigger call (including `requestOptions.clientConfig`), not only the global `apiClientManager.client` — so custom `baseURL`, access token, and preview branch apply to both presign and trigger.
+
+- Fix `LocalsKey<T>` type incompatibility across dual-package builds. The phantom value-type brand no longer uses a module-level `unique symbol`, so a single TypeScript compilation that resolves the type from both the ESM and CJS outputs (which can happen under certain pnpm hoisting layouts) no longer sees two structurally-incompatible variants of the same type. ([#3626](https://github.com/triggerdotdev/trigger.dev/pull/3626))
+- Unit-test `chat.agent` definitions offline with `mockChatAgent` from `@trigger.dev/sdk/ai/test`. Drives a real agent's turn loop in-process — no network, no task runtime — so you can send messages, actions, and stop signals via driver methods, inspect captured output chunks, and verify hooks fire. Pairs with `MockLanguageModelV3` from `ai/test` for model mocking. `setupLocals` lets you pre-seed `locals` (DB clients, service stubs) before `run()` starts. ([#3543](https://github.com/triggerdotdev/trigger.dev/pull/3543))
+
+  The broader `runInMockTaskContext` harness it's built on lives at `@trigger.dev/core/v3/test` — useful for unit-testing any task code, not just chat.
+
+- Update the bundled OpenTelemetry packages to their latest releases (`@opentelemetry/sdk-node` 0.218.0, `@opentelemetry/core` 2.7.1, `@opentelemetry/host-metrics` 0.38.3). ([#3810](https://github.com/triggerdotdev/trigger.dev/pull/3810))
+- Add `GetProjectEnvironmentsResponseBody` and `ProjectEnvironment` schemas for the new `GET /api/v1/projects/{projectRef}/environments` endpoint, which lists the parent environments (dev, staging, preview, prod) a personal access token can access for a project. Dev is scoped to the token owner and branch (preview child) environments are excluded. ([#3880](https://github.com/triggerdotdev/trigger.dev/pull/3880))
+- Fix `COULD_NOT_FIND_EXECUTOR` when a task's definition is loaded via `await import(...)` from inside another task's `run()`. The runtime workers now register such tasks with a sentinel file context, and the catalog logs a one-time warning per task id. ([#3688](https://github.com/triggerdotdev/trigger.dev/pull/3688))
+- Retry `TASK_MIDDLEWARE_ERROR` under the task's retry policy instead of failing the run on the first attempt. The error was already classified as retryable by `shouldRetryError`, but `shouldLookupRetrySettings` did not include it, so the retry flow fell through to `fail_run`. Fixes #3231. ([#3676](https://github.com/triggerdotdev/trigger.dev/pull/3676))
+- Retry `TASK_PROCESS_SIGSEGV` task crashes under the user's retry policy instead of failing the run on the first segfault. SIGSEGV in Node tasks is frequently non-deterministic (native addon races, JIT/GC interaction, near-OOM in native code, host issues), so retrying on a fresh process often succeeds. The retry is gated by the task's existing `retry` config + `maxAttempts` — same path `TASK_PROCESS_SIGTERM` and uncaught exceptions already use — so tasks without a retry policy still fail fast. ([#3552](https://github.com/triggerdotdev/trigger.dev/pull/3552))
+- Add `region` to the runs list / retrieve API: filter runs by region (`runs.list({ region: "..." })` / `filter[region]=<masterQueue>`) and read each run's executing region from the new `region` field on the response. ([#3612](https://github.com/triggerdotdev/trigger.dev/pull/3612))
+- Bump `@s2-dev/streamstore` to `0.22.10` to fix a `TASK_RUN_UNCAUGHT_EXCEPTION` ("Invalid state: Unable to enqueue") when a `chat.agent` turn is aborted mid-stream. ([#3792](https://github.com/triggerdotdev/trigger.dev/pull/3792))
+- **Sessions** — a durable, run-aware stream channel keyed on a stable `externalId`. A Session is the unit of state that owns a multi-run conversation: messages flow through `.in`, responses through `.out`, both survive run boundaries. Sessions back the new `chat.agent` runtime, and you can build on them directly for any pattern that needs durable bi-directional streaming across runs. ([#3542](https://github.com/triggerdotdev/trigger.dev/pull/3542))
+
+  ```ts
+  import { sessions, tasks } from "@trigger.dev/sdk";
+
+  // Trigger a task and subscribe to its session output in one call
+  const { runId, stream } = await tasks.triggerAndSubscribe(
+    "my-task",
+    payload,
+    {
+      externalId: "user-456",
+    },
+  );
+
+  for await (const chunk of stream) {
+    // ...
+  }
+
+  // Enumerate existing sessions (powers inbox-style UIs without a separate index)
+  for await (const s of sessions.list({
+    type: "chat.agent",
+    tag: "user:user-456",
+  })) {
+    console.log(s.id, s.externalId, s.createdAt, s.closedAt);
+  }
+  ```
+
+  See [/docs/ai-chat/overview](https://trigger.dev/docs/ai-chat/overview) for the full surface — Sessions powers the durable, resumable chat runtime described there.
+
+- The run span API response now includes `cachedCost` and `cacheCreationCost` on the `ai` object, alongside the existing `inputCost` / `outputCost` / `totalCost`. `inputCost` reflects only the non-cached input, so these fields let you reconstruct the full cost breakdown for prompt-cached calls. ([#3958](https://github.com/triggerdotdev/trigger.dev/pull/3958))
+- Redact credential-bearing flag values (e.g. `--password`, `--token`) from `Exec` command debug logs ([#4087](https://github.com/triggerdotdev/trigger.dev/pull/4087))
+- Fix `TypeError` in `unflattenAttributes` when the input attribute map contains conflicting dotted key paths (e.g. both `a.b` set to a scalar and `a.b.c` set to a value). The path-walk loop now applies last-write-wins when a prior key wrote a primitive, null, or array at an intermediate slot, matching the existing precedent in `AttributeFlattener.addAttribute`. Callers no longer crash when handed malformed external attribute inputs. ([#3762](https://github.com/triggerdotdev/trigger.dev/pull/3762))
+- Fix external trace context leaking across runs on warm-started workers with `processKeepAlive` enabled. Every subsequent run's attempt span was being exported with the first run's `traceId` and `parentSpanId`, breaking causal-chain navigation in external APM tools. Runs without an external trace context are unaffected. ([#3768](https://github.com/triggerdotdev/trigger.dev/pull/3768))
+
+## 4.5.0-rc.7
+
+### Patch Changes
+
+- The run span API response now includes `cachedCost` and `cacheCreationCost` on the `ai` object, alongside the existing `inputCost` / `outputCost` / `totalCost`. `inputCost` reflects only the non-cached input, so these fields let you reconstruct the full cost breakdown for prompt-cached calls. ([#3958](https://github.com/triggerdotdev/trigger.dev/pull/3958))
+
+## 4.5.0-rc.6
+
+### Patch Changes
+
+- Reliability fixes for `chat.agent`. A user message sent while the agent is streaming is no longer delivered twice (which could run a duplicate turn), input appends now carry an idempotency key so a retried send can't duplicate a message, stopping a generation clears the streaming state so a page reload doesn't replay the stopped turn, and runs can now carry the full set of dashboard tags instead of being silently truncated. `onTurnComplete` now fires on errored turns (with the thrown error attached) and the failed turn's user message is persisted so it isn't lost on the next run. Custom agents and manual `chat.writeTurnComplete` callers now trim the output stream, sending a custom action no longer leaves a second stream reader running, and a long-lived `watch` subscription no longer grows its dedupe set without bound. ([#3891](https://github.com/triggerdotdev/trigger.dev/pull/3891))
+- Continuation chat boots no longer stall for around 10 seconds before the first turn. The `session.in` resume cursor is now found with a non-blocking records read instead of draining an SSE long-poll (which always waited out its full 5 second inactivity window, twice per boot), the boot reads run concurrently, and chat snapshots carry the cursor so subsequent boots skip the scan entirely. ([#3907](https://github.com/triggerdotdev/trigger.dev/pull/3907))
+- Record client-side dequeue API latency in the supervisor consumer pool as a Prometheus histogram (`queue_consumer_pool_dequeue_duration_seconds`, labelled by `outcome`: success/empty/error). ([#3887](https://github.com/triggerdotdev/trigger.dev/pull/3887))
+- `dev` and `deploy` now fail with a clear error when two tasks are defined with the same id, including across different task types (e.g. a scheduled task and a regular task sharing an id). Previously the second definition silently overwrote the first, so one of the tasks would vanish with no warning. Task ids are detected as duplicates during indexing (naming each offending id and the files it was found in), and the same rule is enforced server-side when the background worker is registered. ([#3865](https://github.com/triggerdotdev/trigger.dev/pull/3865))
+- Add `GetProjectEnvironmentsResponseBody` and `ProjectEnvironment` schemas for the new `GET /api/v1/projects/{projectRef}/environments` endpoint, which lists the parent environments (dev, staging, preview, prod) a personal access token can access for a project. Dev is scoped to the token owner and branch (preview child) environments are excluded. ([#3880](https://github.com/triggerdotdev/trigger.dev/pull/3880))
+
+## 4.5.0-rc.5
+
+### Patch Changes
+
+- Add optional `shouldPauseScaling` to the supervisor consumer pool scaling options to freeze scale-up while it returns true (scale-down stays allowed). ([#3836](https://github.com/triggerdotdev/trigger.dev/pull/3836))
+- Fix `@trigger.dev/core` build: cast the underlying log record exporter when calling `forceFlush` so it typechecks against the updated OpenTelemetry `LogRecordExporter` type (which no longer declares `forceFlush`). ([#3829](https://github.com/triggerdotdev/trigger.dev/pull/3829))
+- `envvars.upload` now accepts an optional `isSecret` flag, letting you create the imported variables as secret (redacted) environment variables. When omitted, variables default to non-secret. ([#3809](https://github.com/triggerdotdev/trigger.dev/pull/3809))
+
+  ```ts
+  await envvars.upload("proj_1234", "prod", {
+    variables: { STRIPE_SECRET_KEY: "sk_live_..." },
+    isSecret: true,
+  });
+  ```
+
+- Offload large trigger payloads to object storage before sending the trigger API request. The SDK uploads packets at or above the existing 128KB limit and sends an `application/store` pointer instead of embedding large JSON in the request body. `TriggerTaskRequestBody` now validates that `application/store` payloads are non-empty storage paths. ([#3785](https://github.com/triggerdotdev/trigger.dev/pull/3785))
+
+  Payload uploads use the same resolved `ApiClient` as the trigger call (including `requestOptions.clientConfig`), not only the global `apiClientManager.client` — so custom `baseURL`, access token, and preview branch apply to both presign and trigger.
+
+- Update the bundled OpenTelemetry packages to their latest releases (`@opentelemetry/sdk-node` 0.218.0, `@opentelemetry/core` 2.7.1, `@opentelemetry/host-metrics` 0.38.3). ([#3810](https://github.com/triggerdotdev/trigger.dev/pull/3810))
+
+## 4.5.0-rc.4
+
+### Patch Changes
+
+- Coerce numeric `concurrencyKey` values to string at the API boundary across `tasks.trigger`, `tasks.batchTrigger`, and the Phase-2 streaming batch endpoint. ([#3789](https://github.com/triggerdotdev/trigger.dev/pull/3789))
+- Bump `@s2-dev/streamstore` to `0.22.10` to fix a `TASK_RUN_UNCAUGHT_EXCEPTION` ("Invalid state: Unable to enqueue") when a `chat.agent` turn is aborted mid-stream. ([#3792](https://github.com/triggerdotdev/trigger.dev/pull/3792))
+
+## 4.5.0-rc.3
+
+### Patch Changes
+
+- Retry `TASK_MIDDLEWARE_ERROR` under the task's retry policy instead of failing the run on the first attempt. The error was already classified as retryable by `shouldRetryError`, but `shouldLookupRetrySettings` did not include it, so the retry flow fell through to `fail_run`. Fixes #3231. ([#3676](https://github.com/triggerdotdev/trigger.dev/pull/3676))
+- Fix `TypeError` in `unflattenAttributes` when the input attribute map contains conflicting dotted key paths (e.g. both `a.b` set to a scalar and `a.b.c` set to a value). The path-walk loop now applies last-write-wins when a prior key wrote a primitive, null, or array at an intermediate slot, matching the existing precedent in `AttributeFlattener.addAttribute`. Callers no longer crash when handed malformed external attribute inputs. ([#3762](https://github.com/triggerdotdev/trigger.dev/pull/3762))
+- Fix external trace context leaking across runs on warm-started workers with `processKeepAlive` enabled. Every subsequent run's attempt span was being exported with the first run's `traceId` and `parentSpanId`, breaking causal-chain navigation in external APM tools. Runs without an external trace context are unaffected. ([#3768](https://github.com/triggerdotdev/trigger.dev/pull/3768))
+
+## 4.5.0-rc.2
+
+## 4.5.0-rc.1
+
+### Patch Changes
+
+- Fix `COULD_NOT_FIND_EXECUTOR` when a task's definition is loaded via `await import(...)` from inside another task's `run()`. The runtime workers now register such tasks with a sentinel file context, and the catalog logs a one-time warning per task id. ([#3688](https://github.com/triggerdotdev/trigger.dev/pull/3688))
+
+## 4.5.0-rc.0
+
+### Patch Changes
+
+- Add Agent Skills for `chat.agent`. Drop a folder with a `SKILL.md` and any helper scripts/references next to your task code, register it with `skills.define({ id, path })`, and the CLI bundles it into the deploy image automatically — no `trigger.config.ts` changes. The agent gets a one-line summary in its system prompt and discovers full instructions on demand via `loadSkill`, with `bash` and `readFile` tools scoped per-skill (path-traversal guards, output caps, abort-signal propagation). ([#3543](https://github.com/triggerdotdev/trigger.dev/pull/3543))
+
+  ```ts
+  const pdfSkill = skills.define({
+    id: "pdf-extract",
+    path: "./skills/pdf-extract",
+  });
+
+  chat.skills.set([await pdfSkill.local()]);
+  ```
+
+  Built on the [AI SDK cookbook pattern](https://ai-sdk.dev/cookbook/guides/agent-skills) — portable across providers. SDK + CLI only for now; dashboard-editable `SKILL.md` text is on the roadmap.
+
+- Reject overlong `idempotencyKey` values at the API boundary so they no longer trip an internal size limit on the underlying unique index and surface as a generic 500. Inputs are capped at 2048 characters — well above what `idempotencyKeys.create()` produces (a 64-character hash) and above any realistic raw key. Applies to `tasks.trigger`, `tasks.batchTrigger`, `batch.create` (Phase 1 streaming batches), `wait.createToken`, `wait.forDuration`, and the input/session stream waitpoint endpoints. Over-limit requests now return a structured 400 instead. ([#3560](https://github.com/triggerdotdev/trigger.dev/pull/3560))
+- **AI Agents** — run AI SDK chat completions as durable Trigger.dev agents instead of fragile API routes. Define an agent in one function, point `useChat` at it from React, and the conversation survives page refreshes, network blips, and process restarts. ([#3543](https://github.com/triggerdotdev/trigger.dev/pull/3543))
+
+  ```ts
+  import { chat } from "@trigger.dev/sdk/ai";
+  import { streamText } from "ai";
+  import { openai } from "@ai-sdk/openai";
+
+  export const myChat = chat.agent({
+    id: "my-chat",
+    run: async ({ messages, signal }) =>
+      streamText({ model: openai("gpt-4o"), messages, abortSignal: signal }),
+  });
+  ```
+
+  ```tsx
+  import { useChat } from "@ai-sdk/react";
+  import { useTriggerChatTransport } from "@trigger.dev/sdk/chat/react";
+
+  const transport = useTriggerChatTransport({
+    task: "my-chat",
+    accessToken,
+    startSession,
+  });
+  const { messages, sendMessage } = useChat({ transport });
+  ```
+
+  **What you get:**
+  - **AI SDK `useChat` integration** — a custom [`ChatTransport`](https://sdk.vercel.ai/docs/ai-sdk-ui/transport) (`useTriggerChatTransport`) plugs straight into Vercel AI SDK's `useChat` hook. Text streaming, tool calls, reasoning, and `data-*` parts all work natively over Trigger.dev's realtime streams. No custom API routes needed.
+  - **First-turn fast path (`chat.headStart`)** — opt-in handler that runs the first turn's `streamText` step in your warm server process while the agent run boots in parallel, cutting cold-start TTFC by roughly half (measured 2801ms → 1218ms on `claude-sonnet-4-6`). The agent owns step 2+ (tool execution, persistence, hooks) so heavy deps stay where they belong. Web Fetch handler works natively in Next.js, Hono, SvelteKit, Remix, Workers, etc.; bridge to Express/Fastify/Koa via `chat.toNodeListener`. New `@trigger.dev/sdk/chat-server` subpath.
+  - **Multi-turn durability via Sessions** — every chat is backed by a durable Session that outlives any individual run. Conversations resume across page refreshes, idle timeout, crashes, and deploys; `resume: true` reconnects via `lastEventId` so clients only see new chunks. `sessions.list` enumerates chats for inbox-style UIs.
+  - **Auto-accumulated history, delta-only wire** — the backend accumulates the full conversation across turns; clients only ship the new message each turn. Long chats never hit the 512 KiB body cap. Register `hydrateMessages` to be the source of truth yourself.
+  - **Lifecycle hooks** — `onPreload`, `onChatStart`, `onValidateMessages`, `hydrateMessages`, `onTurnStart`, `onBeforeTurnComplete`, `onTurnComplete`, `onChatSuspend`, `onChatResume` — for persistence, validation, and post-turn work.
+  - **Stop generation** — client-driven `transport.stopGeneration(chatId)` aborts mid-stream; the run stays alive for the next message, partial response is captured, and aborted parts (stuck `partial-call` tools, in-progress reasoning) are auto-cleaned.
+  - **Tool approvals (HITL)** — tools with `needsApproval: true` pause until the user approves or denies via `addToolApprovalResponse`. The runtime reconciles the updated assistant message by ID and continues `streamText`.
+  - **Steering and background injection** — `pendingMessages` injects user messages between tool-call steps so users can steer the agent mid-execution; `chat.inject()` + `chat.defer()` adds context from background work (self-review, RAG, safety checks) between turns.
+  - **Actions** — non-turn frontend commands (undo, rollback, regenerate, edit) sent via `transport.sendAction`. Fire `hydrateMessages` + `onAction` only — no turn hooks, no `run()`. `onAction` can return a `StreamTextResult` for a model response, or `void` for side-effect-only.
+  - **Typed state primitives** — `chat.local<T>` for per-run state accessible from hooks, `run()`, tools, and subtasks (auto-serialized through `ai.toolExecute`); `chat.store` for typed shared data between agent and client; `chat.history` for reading and mutating the message chain; `clientDataSchema` for typed `clientData` in every hook.
+  - **`chat.toStreamTextOptions()`** — one spread into `streamText` wires up versioned system [Prompts](https://trigger.dev/docs/ai/prompts), model resolution, telemetry metadata, compaction, steering, and background injection.
+  - **Multi-tab coordination** — `multiTab: true` + `useMultiTabChat` prevents duplicate sends and syncs state across browser tabs via `BroadcastChannel`. Non-active tabs go read-only with live updates.
+  - **Network resilience** — built-in indefinite retry with bounded backoff, reconnect on `online` / tab refocus / bfcache restore, `Last-Event-ID` mid-stream resume. No app code needed.
+
+  See [/docs/ai-chat](https://trigger.dev/docs/ai-chat/overview) for the full surface — quick start, three backend approaches (`chat.agent`, `chat.createSession`, raw task), persistence and code-sandbox patterns, type-level guides, and API reference.
+
+- Stamp `gen_ai.conversation.id` (the chat id) on every span and metric emitted from inside a `chat.task` or `chat.agent` run. Lets you filter dashboard spans, runs, and metrics by the chat conversation that produced them — independent of the run boundary, so multi-run chats correlate cleanly. No code changes required on the user side. ([#3543](https://github.com/triggerdotdev/trigger.dev/pull/3543))
+- Fix `LocalsKey<T>` type incompatibility across dual-package builds. The phantom value-type brand no longer uses a module-level `unique symbol`, so a single TypeScript compilation that resolves the type from both the ESM and CJS outputs (which can happen under certain pnpm hoisting layouts) no longer sees two structurally-incompatible variants of the same type. ([#3626](https://github.com/triggerdotdev/trigger.dev/pull/3626))
+- Unit-test `chat.agent` definitions offline with `mockChatAgent` from `@trigger.dev/sdk/ai/test`. Drives a real agent's turn loop in-process — no network, no task runtime — so you can send messages, actions, and stop signals via driver methods, inspect captured output chunks, and verify hooks fire. Pairs with `MockLanguageModelV3` from `ai/test` for model mocking. `setupLocals` lets you pre-seed `locals` (DB clients, service stubs) before `run()` starts. ([#3543](https://github.com/triggerdotdev/trigger.dev/pull/3543))
+
+  The broader `runInMockTaskContext` harness it's built on lives at `@trigger.dev/core/v3/test` — useful for unit-testing any task code, not just chat.
+
+- Retry `TASK_PROCESS_SIGSEGV` task crashes under the user's retry policy instead of failing the run on the first segfault. SIGSEGV in Node tasks is frequently non-deterministic (native addon races, JIT/GC interaction, near-OOM in native code, host issues), so retrying on a fresh process often succeeds. The retry is gated by the task's existing `retry` config + `maxAttempts` — same path `TASK_PROCESS_SIGTERM` and uncaught exceptions already use — so tasks without a retry policy still fail fast. ([#3552](https://github.com/triggerdotdev/trigger.dev/pull/3552))
+- Add `region` to the runs list / retrieve API: filter runs by region (`runs.list({ region: "..." })` / `filter[region]=<masterQueue>`) and read each run's executing region from the new `region` field on the response. ([#3612](https://github.com/triggerdotdev/trigger.dev/pull/3612))
+- **Sessions** — a durable, run-aware stream channel keyed on a stable `externalId`. A Session is the unit of state that owns a multi-run conversation: messages flow through `.in`, responses through `.out`, both survive run boundaries. Sessions back the new `chat.agent` runtime, and you can build on them directly for any pattern that needs durable bi-directional streaming across runs. ([#3542](https://github.com/triggerdotdev/trigger.dev/pull/3542))
+
+  ```ts
+  import { sessions, tasks } from "@trigger.dev/sdk";
+
+  // Trigger a task and subscribe to its session output in one call
+  const { runId, stream } = await tasks.triggerAndSubscribe(
+    "my-task",
+    payload,
+    {
+      externalId: "user-456",
+    },
+  );
+
+  for await (const chunk of stream) {
+    // ...
+  }
+
+  // Enumerate existing sessions (powers inbox-style UIs without a separate index)
+  for await (const s of sessions.list({
+    type: "chat.agent",
+    tag: "user:user-456",
+  })) {
+    console.log(s.id, s.externalId, s.createdAt, s.closedAt);
+  }
+  ```
+
+  See [/docs/ai-chat/overview](https://trigger.dev/docs/ai-chat/overview) for the full surface — Sessions powers the durable, resumable chat runtime described there.
+
+## 4.4.6
+
+### Patch Changes
+
+- Fix dev workers spinning at 100% CPU after the parent CLI disconnects. Orphaned `trigger-dev-run-worker` (and indexer) processes were caught in an `uncaughtException` feedback loop: a periodic IPC send via `process.send` would throw `ERR_IPC_CHANNEL_CLOSED` once the parent closed the channel, which re-entered the same handler that itself called `process.send`, scheduled via `setImmediate` and amplified by source-map-support's `prepareStackTrace`. Fixed by (1) silently dropping packets in `ZodIpcConnection` when the channel is disconnected, (2) adding a `process.on("disconnect", ...)` handler in dev workers so they exit cleanly when the CLI closes the IPC channel, and (3) wrapping all `uncaughtException`-path `process.send` calls in a `safeSend` guard that checks `process.connected` and swallows synchronous throws. ([#3491](https://github.com/triggerdotdev/trigger.dev/pull/3491))
+- Fail attempts on uncaught exceptions instead of hanging to `MAX_DURATION_EXCEEDED`. A Node `EventEmitter` (e.g. `node-redis`) emitting `"error"` with no `.on("error", ...)` listener escalates to `uncaughtException`, which the worker previously reported but did not act on — runs drifted to maxDuration with empty attempts. They now fail fast with the original error and status `FAILED`, and respect the task's normal retry policy. You should still attach `.on("error", ...)` listeners to long-lived clients to handle errors gracefully. ([#3529](https://github.com/triggerdotdev/trigger.dev/pull/3529))
+
+## 4.4.5
+
+### Patch Changes
+
+- Add `isReplay` boolean to the run context (`ctx.run.isReplay`), derived from the existing `replayedFromTaskRunFriendlyId` database field. Defaults to `false` for backwards compatibility. ([#3454](https://github.com/triggerdotdev/trigger.dev/pull/3454))
+- Redact the `resolveWaitpoint` runtime log so it only emits `id` and `type` instead of the full completed waitpoint. Previously the log printed the entire waitpoint (including `output`) to stdout in production runs, which could leak sensitive payloads. The value returned by `wait.forToken()` is unchanged. ([#3490](https://github.com/triggerdotdev/trigger.dev/pull/3490))
+- Add `SessionId` friendly ID generator and schemas for the new durable Session primitive. Exported from `@trigger.dev/core/v3/isomorphic` alongside `RunId`, `BatchId`, etc. Ships the `CreateSessionStreamWaitpoint` request/response schemas alongside the main Session CRUD. ([#3417](https://github.com/triggerdotdev/trigger.dev/pull/3417))
+- Truncate large error stacks and messages to prevent OOM crashes. Stack traces are capped at 50 frames (keeping top 5 + bottom 45 with an omission notice), individual stack lines at 1024 chars, and error messages at 1000 chars. Applied in parseError, sanitizeError, and OTel span recording. ([#3405](https://github.com/triggerdotdev/trigger.dev/pull/3405))
+
+## 4.4.4
+
+### Patch Changes
+
+- Fix `list_deploys` MCP tool failing when deployments have null `runtime` or `runtimeVersion` fields. ([#3224](https://github.com/triggerdotdev/trigger.dev/pull/3224))
+- Propagate run tags to span attributes so they can be extracted server-side for LLM cost attribution metadata. ([#3213](https://github.com/triggerdotdev/trigger.dev/pull/3213))
+- Add `get_span_details` MCP tool for inspecting individual spans within a run trace. ([#3255](https://github.com/triggerdotdev/trigger.dev/pull/3255))
+  - New `get_span_details` tool returns full span attributes, timing, events, and AI enrichment (model, tokens, cost, speed)
+  - Span IDs now shown in `get_run_details` trace output for easy discovery
+  - New API endpoint `GET /api/v1/runs/:runId/spans/:spanId`
+  - New `retrieveSpan()` method on the API client
+
+- MCP server improvements: new tools, bug fixes, and new flags. ([#3224](https://github.com/triggerdotdev/trigger.dev/pull/3224))
+
+  **New tools:**
+  - `get_query_schema` — discover available TRQL tables and columns
+  - `query` — execute TRQL queries against your data
+  - `list_dashboards` — list built-in dashboards and their widgets
+  - `run_dashboard_query` — execute a single dashboard widget query
+  - `whoami` — show current profile, user, and API URL
+  - `list_profiles` — list all configured CLI profiles
+  - `switch_profile` — switch active profile for the MCP session
+  - `start_dev_server` — start `trigger dev` in the background and stream output
+  - `stop_dev_server` — stop the running dev server
+  - `dev_server_status` — check dev server status and view recent logs
+
+  **New API endpoints:**
+  - `GET /api/v1/query/schema` — query table schema discovery
+  - `GET /api/v1/query/dashboards` — list built-in dashboards
+
+  **New features:**
+  - `--readonly` flag hides write tools (`deploy`, `trigger_task`, `cancel_run`) so the AI cannot make changes
+  - `read:query` JWT scope for query endpoint authorization
+  - `get_run_details` trace output is now paginated with cursor support
+  - MCP tool annotations (`readOnlyHint`, `destructiveHint`) for all tools
+
+  **Bug fixes:**
+  - Fixed `search_docs` tool failing due to renamed upstream Mintlify tool (`SearchTriggerDev` → `search_trigger_dev`)
+  - Fixed `list_deploys` failing when deployments have null `runtime`/`runtimeVersion` fields (#3139)
+  - Fixed `list_preview_branches` crashing due to incorrect response shape access
+  - Fixed `metrics` table column documented as `value` instead of `metric_value` in query docs
+  - Fixed dev CLI leaking build directories on rebuild — deprecated workers now clean up their build dirs when their last run completes
+
+  **Context optimizations:**
+  - `get_query_schema` now requires a table name and returns only one table's schema (was returning all tables)
+  - `get_current_worker` no longer inlines payload schemas; use new `get_task_schema` tool instead
+  - Query results formatted as text tables instead of JSON (~50% fewer tokens)
+  - `cancel_run`, `list_deploys`, `list_preview_branches` formatted as text instead of raw JSON
+  - Schema and dashboard API responses cached to avoid redundant fetches
+
+- Large run outputs can use the new API which allows switching object storage providers. ([#3275](https://github.com/triggerdotdev/trigger.dev/pull/3275))
+- Add optional `hasPrivateLink` field to the dequeue message organization object for private networking support ([#3264](https://github.com/triggerdotdev/trigger.dev/pull/3264))
+- Add support for setting TTL (time-to-live) defaults at the task level and globally in trigger.config.ts, with per-trigger overrides still taking precedence ([#3196](https://github.com/triggerdotdev/trigger.dev/pull/3196))
+- Adapted the CLI API client to propagate the trigger source via http headers. ([#3241](https://github.com/triggerdotdev/trigger.dev/pull/3241))
+
 ## 4.4.3
 
 ### Patch Changes
@@ -38,7 +466,6 @@
 ### Patch Changes
 
 - Add support for AI SDK v6 (Vercel AI SDK) ([#2919](https://github.com/triggerdotdev/trigger.dev/pull/2919))
-
   - Updated peer dependency to allow `ai@^6.0.0` alongside v4 and v5
   - Updated internal code to handle async validation from AI SDK v6's Schema type
 
@@ -340,8 +767,14 @@
   await childTask.trigger({ message: "Hello, world!" });
 
   // This will override the task's machine preset and any defaults. Works with all trigger functions.
-  await childTask.trigger({ message: "Hello, world!" }, { machine: "small-2x" });
-  await childTask.triggerAndWait({ message: "Hello, world!" }, { machine: "small-2x" });
+  await childTask.trigger(
+    { message: "Hello, world!" },
+    { machine: "small-2x" },
+  );
+  await childTask.triggerAndWait(
+    { message: "Hello, world!" },
+    { machine: "small-2x" },
+  );
 
   await childTask.batchTrigger([
     { payload: { message: "Hello, world!" }, options: { machine: "micro" } },
@@ -355,7 +788,7 @@
   await tasks.trigger<typeof childTask>(
     "child",
     { message: "Hello, world!" },
-    { machine: "small-2x" }
+    { machine: "small-2x" },
   );
   await tasks.batchTrigger<typeof childTask>("child", [
     { payload: { message: "Hello, world!" }, options: { machine: "micro" } },
@@ -417,7 +850,6 @@
 ### Minor Changes
 
 - Improved Batch Triggering: ([#1502](https://github.com/triggerdotdev/trigger.dev/pull/1502))
-
   - The new Batch Trigger endpoint is now asynchronous and supports up to 500 runs per request.
   - The new endpoint also supports triggering multiple different tasks in a single batch request (support in the SDK coming soon).
   - The existing `batchTrigger` method now supports the new endpoint, and shouldn't require any changes to your code.
@@ -431,14 +863,19 @@
   });
   // Works for individual items as well:
   await myTask.batchTrigger([
-    { payload: { foo: "bar" }, options: { idempotencyKey: "my-key", idempotencyKeyTTL: "60s" } },
+    {
+      payload: { foo: "bar" },
+      options: { idempotencyKey: "my-key", idempotencyKeyTTL: "60s" },
+    },
   ]);
   // And `trigger`:
-  await myTask.trigger({ foo: "bar" }, { idempotencyKey: "my-key", idempotencyKeyTTL: "60s" });
+  await myTask.trigger(
+    { foo: "bar" },
+    { idempotencyKey: "my-key", idempotencyKeyTTL: "60s" },
+  );
   ```
 
   ### Breaking Changes
-
   - We've removed the `idempotencyKey` option from `triggerAndWait` and `batchTriggerAndWait`, because it can lead to permanently frozen runs in deployed tasks. We're working on upgrading our entire system to support idempotency keys on these methods, and we'll re-add the option once that's complete.
 
 ### Patch Changes
@@ -670,7 +1107,6 @@
   All important socket.io RPCs will now be retried with backoff. Actions relying on checkpoints will be replayed if we haven't been checkpointed and restored as expected, e.g. after reconnect.
 
   Other changes:
-
   - Fix retry check in shared queue
   - Fix env var sync spinner
   - Heartbeat between retries
@@ -792,7 +1228,10 @@
   Before:
 
   ```ts
-  await yourTask.trigger({ payload: { foo: "bar" }, options: { idempotencyKey: "key_1234" } });
+  await yourTask.trigger({
+    payload: { foo: "bar" },
+    options: { idempotencyKey: "key_1234" },
+  });
   await yourTask.triggerAndWait({
     payload: { foo: "bar" },
     options: { idempotencyKey: "key_1234" },
@@ -812,8 +1251,14 @@
   await yourTask.trigger({ foo: "bar" }, { idempotencyKey: "key_1234" });
   await yourTask.triggerAndWait({ foo: "bar" }, { idempotencyKey: "key_1234" });
 
-  await yourTask.batchTrigger([{ payload: { foo: "bar" } }, { payload: { foo: "baz" } }]);
-  await yourTask.batchTriggerAndWait([{ payload: { foo: "bar" } }, { payload: { foo: "baz" } }]);
+  await yourTask.batchTrigger([
+    { payload: { foo: "bar" } },
+    { payload: { foo: "baz" } },
+  ]);
+  await yourTask.batchTriggerAndWait([
+    { payload: { foo: "bar" } },
+    { payload: { foo: "baz" } },
+  ]);
   ```
 
   We've also changed the API of the `triggerAndWait` result. Before, if the subtask that was triggered finished with an error, we would automatically "rethrow" the error in the parent task.
@@ -847,7 +1292,6 @@
 
 - e04d44866: v3: sanitize errors with null unicode characters in some places
 - 26093896d: When using idempotency keys, triggerAndWait and batchTriggerAndWait will still work even if the existing runs have already been completed (or even partially completed, in the case of batchTriggerAndWait)
-
   - TaskRunExecutionResult.id is now the run friendlyId, not the attempt friendlyId
   - A single TaskRun can now have many batchItems, in the case of batchTriggerAndWait while using idempotency keys
   - A run’s idempotencyKey is now added to the ctx as well as the TaskEvent and displayed in the span view
@@ -966,7 +1410,6 @@
   All important socket.io RPCs will now be retried with backoff. Actions relying on checkpoints will be replayed if we haven't been checkpointed and restored as expected, e.g. after reconnect.
 
   Other changes:
-
   - Fix retry check in shared queue
   - Fix env var sync spinner
   - Heartbeat between retries
@@ -1242,7 +1685,10 @@
   Before:
 
   ```ts
-  await yourTask.trigger({ payload: { foo: "bar" }, options: { idempotencyKey: "key_1234" } });
+  await yourTask.trigger({
+    payload: { foo: "bar" },
+    options: { idempotencyKey: "key_1234" },
+  });
   await yourTask.triggerAndWait({
     payload: { foo: "bar" },
     options: { idempotencyKey: "key_1234" },
@@ -1262,8 +1708,14 @@
   await yourTask.trigger({ foo: "bar" }, { idempotencyKey: "key_1234" });
   await yourTask.triggerAndWait({ foo: "bar" }, { idempotencyKey: "key_1234" });
 
-  await yourTask.batchTrigger([{ payload: { foo: "bar" } }, { payload: { foo: "baz" } }]);
-  await yourTask.batchTriggerAndWait([{ payload: { foo: "bar" } }, { payload: { foo: "baz" } }]);
+  await yourTask.batchTrigger([
+    { payload: { foo: "bar" } },
+    { payload: { foo: "baz" } },
+  ]);
+  await yourTask.batchTriggerAndWait([
+    { payload: { foo: "bar" } },
+    { payload: { foo: "baz" } },
+  ]);
   ```
 
   We've also changed the API of the `triggerAndWait` result. Before, if the subtask that was triggered finished with an error, we would automatically "rethrow" the error in the parent task.
@@ -1296,7 +1748,6 @@
   ```
 
 - 26093896d: When using idempotency keys, triggerAndWait and batchTriggerAndWait will still work even if the existing runs have already been completed (or even partially completed, in the case of batchTriggerAndWait)
-
   - TaskRunExecutionResult.id is now the run friendlyId, not the attempt friendlyId
   - A single TaskRun can now have many batchItems, in the case of batchTriggerAndWait while using idempotency keys
   - A run’s idempotencyKey is now added to the ctx as well as the TaskEvent and displayed in the span view

@@ -1,6 +1,6 @@
-import { ClickHouseSettings } from "@clickhouse/client";
+import type { ClickHouseSettings } from "@clickhouse/client";
 import { z } from "zod";
-import { ClickhouseReader, ClickhouseWriter } from "./client/types.js";
+import type { ClickhouseReader, ClickhouseWriter } from "./client/types.js";
 
 export const TaskRunV2 = z.object({
   environment_id: z.string(),
@@ -48,9 +48,12 @@ export const TaskRunV2 = z.object({
   concurrency_key: z.string().default(""),
   bulk_action_group_ids: z.array(z.string()).default([]),
   worker_queue: z.string().default(""),
+  region: z.string().default(""),
+  plan_type: z.string().default(""),
   max_duration_in_seconds: z.number().int().nullish(),
   trigger_source: z.string().default(""),
   root_trigger_source: z.string().default(""),
+  task_kind: z.string().default(""),
   is_warm_start: z.boolean().nullish(),
   _version: z.string(),
   _is_deleted: z.number().int().default(0),
@@ -107,9 +110,12 @@ export const TASK_RUN_COLUMNS = [
   "concurrency_key",
   "bulk_action_group_ids",
   "worker_queue",
+  "region",
+  "plan_type",
   "max_duration_in_seconds",
   "trigger_source",
   "root_trigger_source",
+  "task_kind",
   "is_warm_start",
 ] as const;
 
@@ -173,9 +179,12 @@ export type TaskRunFieldTypes = {
   concurrency_key: string;
   bulk_action_group_ids: string[];
   worker_queue: string;
+  region: string;
+  plan_type: string;
   max_duration_in_seconds: number | null;
   trigger_source: string;
   root_trigger_source: string;
+  task_kind: string;
   is_warm_start: boolean | null;
 };
 
@@ -194,6 +203,32 @@ export function getTaskRunField<K extends TaskRunColumnName>(
   return run[TASK_RUN_INDEX[field]] as TaskRunFieldTypes[K];
 }
 
+/**
+ * Compose a globally-comparable ReplacingMergeTree version for task_runs_v2
+ * when the same run can be replicated from more than one Postgres producer.
+ *
+ * Each producer has its own, mutually-incomparable LSN space, so the raw
+ * LSN-derived version cannot be compared across producers. We reserve the top
+ * 8 bits for an `originGeneration` epoch (monotonic across producers: the more
+ * authoritative / later-cutover producer gets the higher generation) and keep
+ * the producer's own LSN in the low 56 bits to preserve in-producer ordering.
+ *
+ * Self-host single-DB never calls this (one producer => generation is constant
+ * and the existing raw LSN path is sufficient); the split gate skips it.
+ */
+export function composeTaskRunVersion(opts: {
+  originGeneration: number;
+  lsnVersion: bigint;
+}): bigint {
+  const gen = BigInt(opts.originGeneration);
+  if (gen < BigInt(0) || gen > BigInt(0xff)) {
+    throw new Error(`originGeneration out of range (0-255): ${opts.originGeneration}`);
+  }
+  const LSN_BITS = BigInt(56);
+  const LSN_MASK = (BigInt(1) << LSN_BITS) - BigInt(1); // low 56 bits
+  return (gen << LSN_BITS) | (opts.lsnVersion & LSN_MASK);
+}
+
 export function insertTaskRunsCompactArrays(ch: ClickhouseWriter, settings?: ClickHouseSettings) {
   return ch.insertCompactRaw({
     name: "insertTaskRunsCompactArrays",
@@ -202,6 +237,7 @@ export function insertTaskRunsCompactArrays(ch: ClickhouseWriter, settings?: Cli
     settings: {
       enable_json_type: 1,
       type_json_skip_duplicated_paths: 1,
+      input_format_json_infer_array_of_dynamic_from_array_of_different_types: 1,
       ...settings,
     },
   });
@@ -216,6 +252,7 @@ export function insertTaskRuns(ch: ClickhouseWriter, settings?: ClickHouseSettin
     settings: {
       enable_json_type: 1,
       type_json_skip_duplicated_paths: 1,
+      input_format_json_infer_array_of_dynamic_from_array_of_different_types: 1,
       ...settings,
     },
   });
@@ -310,9 +347,12 @@ export type TaskRunInsertArray = [
   concurrency_key: string,
   bulk_action_group_ids: string[],
   worker_queue: string,
+  region: string,
+  plan_type: string,
   max_duration_in_seconds: number | null,
   trigger_source: string,
   root_trigger_source: string,
+  task_kind: string,
   is_warm_start: boolean | null,
 ];
 
@@ -337,6 +377,7 @@ export function insertRawTaskRunPayloadsCompactArrays(
       async_insert_busy_timeout_ms: 1000,
       enable_json_type: 1,
       type_json_skip_duplicated_paths: 1,
+      input_format_json_infer_array_of_dynamic_from_array_of_different_types: 1,
       ...settings,
     },
   });
@@ -355,6 +396,7 @@ export function insertRawTaskRunPayloads(ch: ClickhouseWriter, settings?: ClickH
       async_insert_busy_timeout_ms: 1000,
       enable_json_type: 1,
       type_json_skip_duplicated_paths: 1,
+      input_format_json_infer_array_of_dynamic_from_array_of_different_types: 1,
       ...settings,
     },
   });
@@ -366,10 +408,43 @@ export const TaskRunV2QueryResult = z.object({
 
 export type TaskRunV2QueryResult = z.infer<typeof TaskRunV2QueryResult>;
 
+// Adds the created_at timestamp (ms since epoch) needed to build composite
+// keyset cursors over (created_at, run_id) — see runsRepository.server.ts.
+// Returned as a JSON number because the client sets
+// output_format_json_quote_64bit_integers: 0. Kept separate from
+// TaskRunV2QueryResult so run_id-only consumers (e.g. the pending-version
+// lookup) aren't forced to select a column they don't need.
+export const TaskRunListQueryResult = z.object({
+  run_id: z.string(),
+  created_at_ms: z.number().int(),
+});
+
+export type TaskRunListQueryResult = z.infer<typeof TaskRunListQueryResult>;
+
 export function getTaskRunsQueryBuilder(ch: ClickhouseReader, settings?: ClickHouseSettings) {
   return ch.queryBuilder({
     name: "getTaskRuns",
-    baseQuery: "SELECT run_id FROM trigger_dev.task_runs_v2 FINAL",
+    baseQuery:
+      "SELECT run_id, toUnixTimestamp64Milli(created_at) AS created_at_ms FROM trigger_dev.task_runs_v2 FINAL",
+    schema: TaskRunListQueryResult,
+    settings,
+  });
+}
+
+/**
+ * Lookup builder for the run-engine `PendingVersionSystem`. Returns just
+ * `run_id` from `task_runs_v2`. No `FINAL` — the run-engine re-validates
+ * each candidate against Postgres by primary key, so a stale
+ * `PENDING_VERSION` row from a not-yet-merged part is harmless and
+ * `FINAL` would be too expensive for this hot path.
+ */
+export function getPendingVersionIdsQueryBuilder(
+  ch: ClickhouseReader,
+  settings?: ClickHouseSettings
+) {
+  return ch.queryBuilder({
+    name: "getPendingVersionIds",
+    baseQuery: "SELECT run_id FROM trigger_dev.task_runs_v2",
     schema: TaskRunV2QueryResult,
     settings,
   });
@@ -382,6 +457,23 @@ export function getTaskRunsCountQueryBuilder(ch: ClickhouseReader, settings?: Cl
     schema: z.object({
       count: z.number().int(),
     }),
+    settings,
+  });
+}
+
+export const TaskRunExistsQueryResult = z.object({
+  run_exists: z.number().int(),
+});
+
+export type TaskRunExistsQueryResult = z.infer<typeof TaskRunExistsQueryResult>;
+
+// Empty-state existence probe. No FINAL (a stale/dup row still answers "a run exists").
+// Callers must filter organization_id + project_id + environment_id (the sort-key prefix).
+export function getTaskRunExistsQueryBuilder(ch: ClickhouseReader, settings?: ClickHouseSettings) {
+  return ch.queryBuilder({
+    name: "getTaskRunExists",
+    baseQuery: "SELECT 1 AS run_exists FROM trigger_dev.task_runs_v2",
+    schema: TaskRunExistsQueryResult,
     settings,
   });
 }
@@ -487,6 +579,51 @@ export function getCurrentRunningStats(ch: ClickhouseReader, settings?: ClickHou
     `,
     schema: CurrentRunningStatsQueryResult,
     params: CurrentRunningStatsQueryParams,
+    settings,
+  });
+}
+
+export const ChildRunStatusCountsQueryResult = z.object({
+  root_run_id: z.string(),
+  status: z.string(),
+  count: z.number().int(),
+});
+
+export type ChildRunStatusCountsQueryResult = z.infer<typeof ChildRunStatusCountsQueryResult>;
+
+export const ChildRunStatusCountsQueryParams = z.object({
+  organizationId: z.string(),
+  projectId: z.string(),
+  environmentId: z.string(),
+  rootRunIds: z.array(z.string()).min(1),
+  since: z.number().int(),
+});
+
+export function getChildRunStatusCounts(ch: ClickhouseReader, settings?: ClickHouseSettings) {
+  return ch.query({
+    name: "getChildRunStatusCounts",
+    query: `
+    SELECT
+        root_run_id,
+        status,
+        count() as count
+    FROM trigger_dev.task_runs_v2 FINAL
+    WHERE
+        organization_id = {organizationId: String}
+        AND project_id = {projectId: String}
+        AND environment_id = {environmentId: String}
+        AND root_run_id IN {rootRunIds: Array(String)}
+        AND created_at >= fromUnixTimestamp64Milli({since: Int64})
+        AND _is_deleted = 0
+    GROUP BY
+        root_run_id,
+        status
+    ORDER BY
+        root_run_id ASC,
+        status ASC
+    `,
+    schema: ChildRunStatusCountsQueryResult,
+    params: ChildRunStatusCountsQueryParams,
     settings,
   });
 }

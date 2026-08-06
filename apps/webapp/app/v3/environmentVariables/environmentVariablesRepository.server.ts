@@ -1,9 +1,14 @@
+import type { AuthenticatedEnvironment } from "@trigger.dev/core/v3/auth/environment";
 import { Prisma, type PrismaClient, type RuntimeEnvironmentType } from "@trigger.dev/database";
 import { z } from "zod";
 import { environmentFullTitle } from "~/components/environments/EnvironmentLabel";
-import { $transaction, prisma } from "~/db.server";
+import { $replica, $transaction, prisma, type PrismaReplicaClient } from "~/db.server";
 import { env } from "~/env.server";
 import { getSecretStore } from "~/services/secrets/secretStore.server";
+import { deduplicateVariableArray } from "../deduplicateVariableArray.server";
+import { removeBlacklistedVariables } from "../environmentVariableRules.server";
+import { FEATURE_FLAG, resolveInternalApiOriginEnabled } from "../featureFlags";
+import { globalFlagsRegistry } from "../globalFlagsRegistry.server";
 import { generateFriendlyId } from "../friendlyIdentifiers";
 import {
   type CreateEnvironmentVariables,
@@ -18,9 +23,6 @@ import {
   type Repository,
   type Result,
 } from "./repository";
-import { removeBlacklistedVariables } from "../environmentVariableRules.server";
-import { deduplicateVariableArray } from "../deduplicateVariableArray.server";
-import { logger } from "~/services/logger.server";
 
 function secretKeyProjectPrefix(projectId: string) {
   return `environmentvariable:${projectId}:`;
@@ -46,7 +48,10 @@ function parseSecretKey(key: string) {
 const SecretValue = z.object({ secret: z.string() });
 
 export class EnvironmentVariablesRepository implements Repository {
-  constructor(private prismaClient: PrismaClient = prisma) {}
+  constructor(
+    private prismaClient: PrismaClient = prisma,
+    private replicaClient: PrismaReplicaClient = $replica
+  ) {}
 
   async create(projectId: string, options: CreateEnvironmentVariables): Promise<CreateResult> {
     const project = await this.prismaClient.project.findFirst({
@@ -79,7 +84,10 @@ export class EnvironmentVariablesRepository implements Repository {
       return { success: false as const, error: "Project not found" };
     }
 
-    if (options.environmentIds.every((v) => !project.environments.some((e) => e.id === v))) {
+    // Reject if ANY supplied environmentId is outside the caller's project.
+    // `.some` (not `.every`) so one in-project id can't let a mixed array
+    // through.
+    if (options.environmentIds.some((v) => !project.environments.some((e) => e.id === v))) {
       return { success: false as const, error: `Environment not found` };
     }
 
@@ -132,7 +140,7 @@ export class EnvironmentVariablesRepository implements Repository {
 
     try {
       for (const variable of values) {
-        const result = await $transaction(this.prismaClient, "create env var", async (tx) => {
+        const _result = await $transaction(this.prismaClient, "create env var", async (tx) => {
           const environmentVariable = await tx.environmentVariable.upsert({
             where: {
               projectId_key: {
@@ -193,8 +201,7 @@ export class EnvironmentVariablesRepository implements Repository {
               existingSecret &&
               existingSecret.secret === variable.value &&
               existingValueRecord &&
-              (options.isSecret === undefined ||
-                existingValueRecord.isSecret === options.isSecret);
+              (options.isSecret === undefined || existingValueRecord.isSecret === options.isSecret);
             if (canSkip) {
               continue;
             }
@@ -289,7 +296,9 @@ export class EnvironmentVariablesRepository implements Repository {
       return { success: false as const, error: "Project not found" };
     }
 
-    if (options.values.every((v) => !project.environments.some((e) => e.id === v.environmentId))) {
+    // Same guard as `create()`: reject if ANY supplied environmentId is
+    // outside the caller's project (`.some`, not `.every`).
+    if (options.values.some((v) => !project.environments.some((e) => e.id === v.environmentId))) {
       return { success: false as const, error: `Environment not found` };
     }
 
@@ -386,7 +395,7 @@ export class EnvironmentVariablesRepository implements Repository {
             },
           });
 
-          const variableValue = await tx.environmentVariableValue.create({
+          const _variableValue = await tx.environmentVariableValue.create({
             data: {
               variableId: environmentVariable.id,
               environmentId: value.environmentId,
@@ -573,6 +582,42 @@ export class EnvironmentVariablesRepository implements Repository {
     return results;
   }
 
+  async getVariableValuesForKeys(
+    projectId: string,
+    items: Array<{ environmentId: string; key: string }>
+  ): Promise<Map<string, string>> {
+    if (items.length === 0) {
+      return new Map();
+    }
+
+    const uniqueItems = new Map<string, { environmentId: string; key: string }>();
+    for (const item of items) {
+      uniqueItems.set(`${item.environmentId}:${item.key}`, item);
+    }
+
+    const secretStore = getSecretStore("DATABASE", {
+      prismaClient: this.replicaClient,
+    });
+
+    const storeKeys = Array.from(uniqueItems.values()).map((item) =>
+      secretKey(projectId, item.environmentId, item.key)
+    );
+
+    const secrets = await secretStore.getSecretsByKeys(SecretValue, storeKeys);
+    const secretsByStoreKey = new Map(secrets.map((secret) => [secret.key, secret.value.secret]));
+
+    const values = new Map<string, string>();
+    for (const item of uniqueItems.values()) {
+      const storeKey = secretKey(projectId, item.environmentId, item.key);
+      const value = secretsByStoreKey.get(storeKey);
+      if (value !== undefined) {
+        values.set(`${item.environmentId}:${item.key}`, value);
+      }
+    }
+
+    return values;
+  }
+
   async getEnvironmentWithRedactedSecrets(
     projectId: string,
     environmentId: string,
@@ -581,7 +626,7 @@ export class EnvironmentVariablesRepository implements Repository {
     const variables = await this.getEnvironment(projectId, environmentId, parentEnvironmentId);
 
     // Get the keys of all secret variables
-    const secretValues = await this.prismaClient.environmentVariableValue.findMany({
+    const secretValues = await this.replicaClient.environmentVariableValue.findMany({
       where: {
         environmentId: parentEnvironmentId
           ? { in: [environmentId, parentEnvironmentId] }
@@ -876,9 +921,22 @@ export const RuntimeEnvironmentForEnvRepoPayload = {
   },
 } as const;
 
-export type RuntimeEnvironmentForEnvRepo = Prisma.RuntimeEnvironmentGetPayload<
-  typeof RuntimeEnvironmentForEnvRepoPayload
->;
+// Derived from the slim AuthenticatedEnvironment so a full AE satisfies
+// this type — the legacy Prisma payload had `builtInEnvironmentVariableOverrides`
+// as Prisma's JsonValue, which is a subtype of `unknown` in the slim
+// shape, causing assignability errors in the JWT/queue paths that pass
+// AE values straight through. Using Pick<AE, ...> aligns them.
+export type RuntimeEnvironmentForEnvRepo = Pick<
+  AuthenticatedEnvironment,
+  | "id"
+  | "slug"
+  | "type"
+  | "projectId"
+  | "apiKey"
+  | "organizationId"
+  | "branchName"
+  | "builtInEnvironmentVariableOverrides"
+> & { organization?: { featureFlags: unknown } | null };
 
 export const environmentVariablesRepository = new EnvironmentVariablesRepository();
 
@@ -1061,6 +1119,17 @@ async function resolveBuiltInDevVariables(runtimeEnvironment: RuntimeEnvironment
     ]);
   }
 
+  // Dev branches set branchName too, so carry it to the task via the same
+  // TRIGGER_PREVIEW_BRANCH var the prod path uses.
+  if (runtimeEnvironment.branchName) {
+    result = result.concat([
+      {
+        key: "TRIGGER_PREVIEW_BRANCH",
+        value: runtimeEnvironment.branchName,
+      },
+    ]);
+  }
+
   const commonVariables = await resolveCommonBuiltInVariables(runtimeEnvironment);
 
   return [...result, ...commonVariables];
@@ -1079,10 +1148,35 @@ async function resolveOverridableOtelDevVariables(
   return result;
 }
 
+// Deployed runs normally get the public API origin. When INTERNAL_API_ORIGIN is
+// set and the org's internalApiOriginEnabled flag resolves on (org override wins
+// in both directions; INTERNAL_API_ORIGIN_ENABLED is the global default applied
+// only when the org has not set it), they get the internal origin instead. The
+// global default is the cached DB flag with INTERNAL_API_ORIGIN_ENABLED as the
+// fallback; org flags are read in-memory, so a flip applies on the next attempt.
+function resolveProdApiOrigin(runtimeEnvironment: RuntimeEnvironmentForEnvRepo): string {
+  const publicOrigin = env.API_ORIGIN ?? env.APP_ORIGIN;
+
+  if (!env.INTERNAL_API_ORIGIN) {
+    return publicOrigin;
+  }
+
+  const enabled = resolveInternalApiOriginEnabled({
+    orgFeatureFlags: runtimeEnvironment.organization?.featureFlags,
+    globalDefault:
+      globalFlagsRegistry.current()?.[FEATURE_FLAG.internalApiOriginEnabled] ??
+      env.INTERNAL_API_ORIGIN_ENABLED === "1",
+  });
+
+  return enabled ? env.INTERNAL_API_ORIGIN : publicOrigin;
+}
+
 async function resolveBuiltInProdVariables(
   runtimeEnvironment: RuntimeEnvironmentForEnvRepo,
   parentEnvironment?: RuntimeEnvironmentForEnvRepo
 ) {
+  const apiOrigin = resolveProdApiOrigin(runtimeEnvironment);
+
   let result: Array<EnvironmentVariable> = [
     {
       key: "TRIGGER_SECRET_KEY",
@@ -1090,9 +1184,11 @@ async function resolveBuiltInProdVariables(
     },
     {
       key: "TRIGGER_API_URL",
-      value: env.API_ORIGIN ?? env.APP_ORIGIN,
+      value: apiOrigin,
     },
     {
+      // Deliberately not switched by internalApiOriginEnabled: streams are
+      // long-lived connections served on their own path.
       key: "TRIGGER_STREAM_URL",
       value: env.STREAM_ORIGIN ?? env.API_ORIGIN ?? env.APP_ORIGIN,
     },
@@ -1333,10 +1429,13 @@ function resolveBuiltInEnvironmentVariableOverrides(
   if (
     !Array.isArray(overrides) &&
     typeof overrides === "object" &&
-    key in overrides &&
-    typeof overrides[key] === "string"
+    overrides !== null &&
+    key in overrides
   ) {
-    return overrides[key];
+    const value = (overrides as Record<string, unknown>)[key];
+    if (typeof value === "string") {
+      return value;
+    }
   }
 
   return defaultValue;

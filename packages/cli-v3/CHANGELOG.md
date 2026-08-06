@@ -1,5 +1,352 @@
 # trigger.dev
 
+## 4.5.9
+
+### Patch Changes
+
+- `trigger mcp` now always starts the MCP server, and the interactive install wizard has moved behind `trigger mcp --install`. Previously the wizard opened whenever stdout was a terminal, so any MCP host that spawns the command over a pseudo-terminal waited on a server that never started and eventually timed out. ([#4131](https://github.com/triggerdotdev/trigger.dev/pull/4131))
+- Ask whether an environment is healthy and get an answer instead of a wall of charts. `trigger report health` returns a verdict on three questions: is work flowing, are the runs that start succeeding, and is the telemetry fresh enough to trust either answer. When something looks wrong it names the most likely cause and a next action. ([#4131](https://github.com/triggerdotdev/trigger.dev/pull/4131))
+
+  ```bash
+  npx trigger.dev@latest report health --env prod --period 24h
+  ```
+
+  The verdict is computed server side, so the CLI, the new `get_report` MCP tool, and `GET /api/v1/reports/health` all return the same text with the same sparklines. In MCP hosts that support prompts, `report` is also available as a slash command.
+
+- Prevent build debug logs from including environment variable values. ([#4420](https://github.com/triggerdotdev/trigger.dev/pull/4420))
+- Send the running CLI version when checking for platform notifications so notices can be limited to compatible CLI releases. ([#4407](https://github.com/triggerdotdev/trigger.dev/pull/4407))
+- Updated dependencies:
+  - `@trigger.dev/core@4.5.9`
+  - `@trigger.dev/build@4.5.9`
+  - `@trigger.dev/schema-to-json@4.5.9`
+
+## 4.5.8
+
+### Patch Changes
+
+- Updated dependencies:
+  - `@trigger.dev/core@4.5.8`
+  - `@trigger.dev/build@4.5.8`
+  - `@trigger.dev/schema-to-json@4.5.8`
+
+## 4.5.7
+
+### Patch Changes
+
+- Fixes intermittent `trigger dev` run crashes where a run could fail at boot with a cryptic `Cannot find module .../dev-run-worker.mjs` after a rebuild had cleaned up the build directory the run was launched against. Dev runs now retry cleanly instead of hard-crashing when their build directory is missing, the dev watchdog no longer removes the build tree of a still-running session, and a run assigned to a worker version that was superseded by a rebuild now fails fast with a clear message instead of silently hanging until it times out. ([#4276](https://github.com/triggerdotdev/trigger.dev/pull/4276))
+- Add `node-24` and `node-26` as supported `runtime` options in `trigger.config.ts`. The `experimental-node-24` and `experimental-node-26` names are now deprecated aliases and emit a deprecation warning; switch to `node-24` / `node-26` instead. ([#4337](https://github.com/triggerdotdev/trigger.dev/pull/4337))
+
+  ```ts
+  import { defineConfig } from "@trigger.dev/sdk";
+
+  export default defineConfig({
+    runtime: "node-24",
+    project: "<your-project-ref>",
+  });
+  ```
+
+- Avoid logging task run environment variable values at debug level ([#4336](https://github.com/triggerdotdev/trigger.dev/pull/4336))
+- Updated dependencies:
+  - `@trigger.dev/core@4.5.7`
+  - `@trigger.dev/build@4.5.7`
+  - `@trigger.dev/schema-to-json@4.5.7`
+
+## 4.5.6
+
+### Patch Changes
+
+- Require explicit browser approval for CLI and MCP login, with resilient polling while approval is pending. ([#4316](https://github.com/triggerdotdev/trigger.dev/pull/4316))
+- Deployed task telemetry now reports the deployment identifier (e.g. `deployment_abc123`) in the `worker.id` attribute, instead of an opaque internal value. Upgrade to get the readable identifier in your own OpenTelemetry exporters. ([#4316](https://github.com/triggerdotdev/trigger.dev/pull/4316))
+- Updated dependencies:
+  - `@trigger.dev/core@4.5.6`
+  - `@trigger.dev/build@4.5.6`
+  - `@trigger.dev/schema-to-json@4.5.6`
+
+## 4.5.5
+
+### Patch Changes
+
+- Add experimental Node.js 24 and 26 task runtimes. Set `runtime` to `experimental-node-24` or `experimental-node-26` in `trigger.config.ts`. ([#4085](https://github.com/triggerdotdev/trigger.dev/pull/4085))
+- Updated dependencies:
+  - `@trigger.dev/core@4.5.5`
+  - `@trigger.dev/build@4.5.5`
+  - `@trigger.dev/schema-to-json@4.5.5`
+
+## 4.5.4
+
+### Patch Changes
+
+- Remove the legacy `--mcp` and `--mcp-port` options from the `dev` command. Run the dedicated `trigger mcp` command to start the Trigger.dev MCP server. ([#4246](https://github.com/triggerdotdev/trigger.dev/pull/4246))
+- Updated dependencies:
+  - `@trigger.dev/core@4.5.4`
+  - `@trigger.dev/build@4.5.4`
+  - `@trigger.dev/schema-to-json@4.5.4`
+
+## 4.5.3
+
+### Patch Changes
+
+- Updated dependencies:
+  - `@trigger.dev/build@4.5.3`
+  - `@trigger.dev/core@4.5.3`
+  - `@trigger.dev/schema-to-json@4.5.3`
+
+## 4.5.2
+
+### Patch Changes
+
+- fix(cli): honor the MCP server's `--dev-only` flag ([#4199](https://github.com/triggerdotdev/trigger.dev/pull/4199))
+- Updated dependencies:
+  - `@trigger.dev/core@4.5.2`
+  - `@trigger.dev/build@4.5.2`
+  - `@trigger.dev/schema-to-json@4.5.2`
+
+## 4.5.1
+
+### Patch Changes
+
+- Updated dependencies:
+  - `@trigger.dev/build@4.5.1`
+  - `@trigger.dev/core@4.5.1`
+  - `@trigger.dev/schema-to-json@4.5.1`
+
+## 4.5.0
+
+### Patch Changes
+
+- `@trigger.dev/sdk` now bundles the Trigger.dev agent skills and a curated snapshot of the docs those skills reference. The skills that `trigger skills` installs into your coding agent read this content from node_modules, so the guidance your AI assistant follows is pinned to the SDK version installed in your project and stays current across upgrades instead of going stale until the next reinstall. ([#3937](https://github.com/triggerdotdev/trigger.dev/pull/3937))
+- Add Agent Skills for `chat.agent`. Drop a folder with a `SKILL.md` and any helper scripts/references next to your task code, register it with `skills.define({ id, path })`, and the CLI bundles it into the deploy image automatically — no `trigger.config.ts` changes. The agent gets a one-line summary in its system prompt and discovers full instructions on demand via `loadSkill`, with `bash` and `readFile` tools scoped per-skill (path-traversal guards, output caps, abort-signal propagation). ([#3543](https://github.com/triggerdotdev/trigger.dev/pull/3543))
+
+  ```ts
+  const pdfSkill = skills.define({
+    id: "pdf-extract",
+    path: "./skills/pdf-extract",
+  });
+
+  chat.skills.set([await pdfSkill.local()]);
+  ```
+
+  Built on the [AI SDK cookbook pattern](https://ai-sdk.dev/cookbook/guides/agent-skills) — portable across providers. SDK + CLI only for now; dashboard-editable `SKILL.md` text is on the roadmap.
+
+- Fix `chat.agent` skills silently missing in `trigger dev` for projects whose task files read `process.env` at module top level (e.g. a third-party SDK client initialized at import). Skill folders now bundle into `.trigger/skills/` reliably regardless of which env vars are set when the CLI launches. ([#3690](https://github.com/triggerdotdev/trigger.dev/pull/3690))
+- Add `TRIGGER_BUILD_SKIP_REWRITE_TIMESTAMP=1` escape hatch for local self-hosted builds whose buildx driver doesn't support `rewrite-timestamp` alongside push (e.g. orbstack's default `docker` driver). ([#3618](https://github.com/triggerdotdev/trigger.dev/pull/3618))
+- Running a CLI command like `dev`, `deploy`, `preview`, or `update` before initializing a project no longer crashes with a raw `Cannot find matching package.json` stack trace. The CLI now detects the missing project and points you to `npx trigger.dev@latest init` instead. ([#3929](https://github.com/triggerdotdev/trigger.dev/pull/3929))
+- `trigger init` now sets up your AI coding assistant as part of project setup: pick the MCP server, the agent skills, or both, then scaffold with the CLI or hand off to your assistant. Adds a new `getting-started` agent skill that teaches assistants how to bootstrap Trigger.dev (install the SDK, write `trigger.config.ts`, create a first task, run `trigger dev`), so the AI-driven setup path works end to end. It ships in the CLI alongside the existing skills, version-matched to your SDK. ([#3872](https://github.com/triggerdotdev/trigger.dev/pull/3872))
+- Add support for dev branches to the webapp and CLI. This allows humans (and agents) to run multiple local dev servers simultaneously, with a separate dashboard for each one. ([#4023](https://github.com/triggerdotdev/trigger.dev/pull/4023))
+- `dev` and `deploy` now fail with a clear error when two tasks are defined with the same id, including across different task types (e.g. a scheduled task and a regular task sharing an id). Previously the second definition silently overwrote the first, so one of the tasks would vanish with no warning. Task ids are detected as duplicates during indexing (naming each offending id and the files it was found in), and the same rule is enforced server-side when the background worker is registered. ([#3865](https://github.com/triggerdotdev/trigger.dev/pull/3865))
+- Fix idempotency key metadata (original key + scope) being silently dropped when a single run creates more than 1000 idempotency keys. The in-process catalog that maps a key's hash back to its original key/scope is no longer bounded to 1000 entries, so `idempotencyKeys.create()` results retain their metadata regardless of how many are created in a run. The catalog is now cleared at each run boundary so it does not accumulate across warm-start runs. ([#4094](https://github.com/triggerdotdev/trigger.dev/pull/4094))
+- The CLI MCP server's agent-chat tools (`start_agent_chat`, `send_agent_message`, `close_agent_chat`) now run on the new Sessions primitive, so AI assistants driving a `chat.agent` get the same idempotent-by-`chatId`, durable-across-runs behavior the browser transport gets. Required PAT scopes go from `write:inputStreams` to `read:sessions` + `write:sessions`. ([#3546](https://github.com/triggerdotdev/trigger.dev/pull/3546))
+- MCP `list_runs` tool: add a `region` filter input and surface each run's executing region in the formatted summary. ([#3612](https://github.com/triggerdotdev/trigger.dev/pull/3612))
+- The MCP server no longer tells the AI agent to wait for a run to complete after every `trigger_task` call. Waiting is now opt-in: the agent only waits when you ask it to (for example "trigger and then wait for it to finish"). This avoids burning tokens polling runs you didn't need to block on and keeps responses clearer. ([#3838](https://github.com/triggerdotdev/trigger.dev/pull/3838))
+- Adds `trigger.dev mint-token`, which mints a short-lived delegated token from your stored personal access token. The token authenticates against the API as you, can be narrowed with `--cap` and given a lifetime with `--ttl`, and prints to stdout so it can be captured. ([#3997](https://github.com/triggerdotdev/trigger.dev/pull/3997))
+
+  ```bash
+  UAT=$(trigger.dev mint-token --ttl 3600 --cap read:runs)
+  ```
+
+- Update the bundled OpenTelemetry packages to their latest releases (`@opentelemetry/sdk-node` 0.218.0, `@opentelemetry/core` 2.7.1, `@opentelemetry/host-metrics` 0.38.3). ([#3810](https://github.com/triggerdotdev/trigger.dev/pull/3810))
+- Fix `COULD_NOT_FIND_EXECUTOR` when a task's definition is loaded via `await import(...)` from inside another task's `run()`. The runtime workers now register such tasks with a sentinel file context, and the catalog logs a one-time warning per task id. ([#3688](https://github.com/triggerdotdev/trigger.dev/pull/3688))
+- Runner debug logs are now disabled by default. Set `SEND_RUN_DEBUG_LOGS=true` on the supervisor to re-enable them. ([#3992](https://github.com/triggerdotdev/trigger.dev/pull/3992))
+- Bump `@s2-dev/streamstore` to `0.22.10` to fix a `TASK_RUN_UNCAUGHT_EXCEPTION` ("Invalid state: Unable to enqueue") when a `chat.agent` turn is aborted mid-stream. ([#3792](https://github.com/triggerdotdev/trigger.dev/pull/3792))
+- The agent skills installed by `trigger skills` are now namespaced with a `trigger-` prefix (e.g. `trigger-authoring-tasks`, `trigger-getting-started`) so they don't collide with unrelated skills in your coding agent's skills directory. Adds a `trigger-cost-savings` skill for auditing and reducing compute spend (right-sizing machines, `maxDuration`, batching, debounce), and `@trigger.dev/sdk` now bundles the full Trigger.dev documentation so your agent can read the complete, version-pinned reference directly from node_modules. ([#3970](https://github.com/triggerdotdev/trigger.dev/pull/3970))
+- `trigger skills` installs Trigger.dev agent skills into your coding agent so it knows how to write tasks, schedules, realtime, and chat.agent code. The skills ship with the CLI and are copied into each tool's native skills directory (Claude Code, Cursor, GitHub Copilot, and Codex / AGENTS.md), and `trigger dev` offers to install them on first run. ([#3868](https://github.com/triggerdotdev/trigger.dev/pull/3868))
+
+  ```bash
+  trigger skills --target claude-code
+  ```
+
+  Replaces the previous `install-rules` command, which stays as an alias.
+
+- Updated dependencies:
+  - `@trigger.dev/core@4.5.0`
+  - `@trigger.dev/build@4.5.0`
+  - `@trigger.dev/schema-to-json@4.5.0`
+
+## 4.5.0-rc.7
+
+### Patch Changes
+
+- `@trigger.dev/sdk` now bundles the Trigger.dev agent skills and a curated snapshot of the docs those skills reference. The skills that `trigger skills` installs into your coding agent read this content from node_modules, so the guidance your AI assistant follows is pinned to the SDK version installed in your project and stays current across upgrades instead of going stale until the next reinstall. ([#3937](https://github.com/triggerdotdev/trigger.dev/pull/3937))
+- Running a CLI command like `dev`, `deploy`, `preview`, or `update` before initializing a project no longer crashes with a raw `Cannot find matching package.json` stack trace. The CLI now detects the missing project and points you to `npx trigger.dev@latest init` instead. ([#3929](https://github.com/triggerdotdev/trigger.dev/pull/3929))
+- The agent skills installed by `trigger skills` are now namespaced with a `trigger-` prefix (e.g. `trigger-authoring-tasks`, `trigger-getting-started`) so they don't collide with unrelated skills in your coding agent's skills directory. Adds a `trigger-cost-savings` skill for auditing and reducing compute spend (right-sizing machines, `maxDuration`, batching, debounce), and `@trigger.dev/sdk` now bundles the full Trigger.dev documentation so your agent can read the complete, version-pinned reference directly from node_modules. ([#3970](https://github.com/triggerdotdev/trigger.dev/pull/3970))
+- Updated dependencies:
+  - `@trigger.dev/core@4.5.0-rc.7`
+  - `@trigger.dev/build@4.5.0-rc.7`
+  - `@trigger.dev/schema-to-json@4.5.0-rc.7`
+
+## 4.5.0-rc.6
+
+### Patch Changes
+
+- `trigger init` now sets up your AI coding assistant as part of project setup: pick the MCP server, the agent skills, or both, then scaffold with the CLI or hand off to your assistant. Adds a new `getting-started` agent skill that teaches assistants how to bootstrap Trigger.dev (install the SDK, write `trigger.config.ts`, create a first task, run `trigger dev`), so the AI-driven setup path works end to end. It ships in the CLI alongside the existing skills, version-matched to your SDK. ([#3872](https://github.com/triggerdotdev/trigger.dev/pull/3872))
+- `dev` and `deploy` now fail with a clear error when two tasks are defined with the same id, including across different task types (e.g. a scheduled task and a regular task sharing an id). Previously the second definition silently overwrote the first, so one of the tasks would vanish with no warning. Task ids are detected as duplicates during indexing (naming each offending id and the files it was found in), and the same rule is enforced server-side when the background worker is registered. ([#3865](https://github.com/triggerdotdev/trigger.dev/pull/3865))
+- `trigger skills` installs Trigger.dev agent skills into your coding agent so it knows how to write tasks, schedules, realtime, and chat.agent code. The skills ship with the CLI and are copied into each tool's native skills directory (Claude Code, Cursor, GitHub Copilot, and Codex / AGENTS.md), and `trigger dev` offers to install them on first run. ([#3868](https://github.com/triggerdotdev/trigger.dev/pull/3868))
+
+  ```bash
+  trigger skills --target claude-code
+  ```
+
+  Replaces the previous `install-rules` command, which stays as an alias.
+
+- Updated dependencies:
+  - `@trigger.dev/core@4.5.0-rc.6`
+  - `@trigger.dev/build@4.5.0-rc.6`
+  - `@trigger.dev/schema-to-json@4.5.0-rc.6`
+
+## 4.5.0-rc.5
+
+### Patch Changes
+
+- The MCP server no longer tells the AI agent to wait for a run to complete after every `trigger_task` call. Waiting is now opt-in: the agent only waits when you ask it to (for example "trigger and then wait for it to finish"). This avoids burning tokens polling runs you didn't need to block on and keeps responses clearer. ([#3838](https://github.com/triggerdotdev/trigger.dev/pull/3838))
+- Update the bundled OpenTelemetry packages to their latest releases (`@opentelemetry/sdk-node` 0.218.0, `@opentelemetry/core` 2.7.1, `@opentelemetry/host-metrics` 0.38.3). ([#3810](https://github.com/triggerdotdev/trigger.dev/pull/3810))
+- Updated dependencies:
+  - `@trigger.dev/core@4.5.0-rc.5`
+  - `@trigger.dev/build@4.5.0-rc.5`
+  - `@trigger.dev/schema-to-json@4.5.0-rc.5`
+
+## 4.5.0-rc.4
+
+### Patch Changes
+
+- Bump `@s2-dev/streamstore` to `0.22.10` to fix a `TASK_RUN_UNCAUGHT_EXCEPTION` ("Invalid state: Unable to enqueue") when a `chat.agent` turn is aborted mid-stream. ([#3792](https://github.com/triggerdotdev/trigger.dev/pull/3792))
+- Updated dependencies:
+  - `@trigger.dev/core@4.5.0-rc.4`
+  - `@trigger.dev/build@4.5.0-rc.4`
+  - `@trigger.dev/schema-to-json@4.5.0-rc.4`
+
+## 4.5.0-rc.3
+
+### Patch Changes
+
+- Updated dependencies:
+  - `@trigger.dev/core@4.5.0-rc.3`
+  - `@trigger.dev/build@4.5.0-rc.3`
+  - `@trigger.dev/schema-to-json@4.5.0-rc.3`
+
+## 4.5.0-rc.2
+
+### Patch Changes
+
+- Updated dependencies:
+  - `@trigger.dev/build@4.5.0-rc.2`
+  - `@trigger.dev/core@4.5.0-rc.2`
+  - `@trigger.dev/schema-to-json@4.5.0-rc.2`
+
+## 4.5.0-rc.1
+
+### Patch Changes
+
+- Fix `chat.agent` skills silently missing in `trigger dev` for projects whose task files read `process.env` at module top level (e.g. a third-party SDK client initialized at import). Skill folders now bundle into `.trigger/skills/` reliably regardless of which env vars are set when the CLI launches. ([#3690](https://github.com/triggerdotdev/trigger.dev/pull/3690))
+- Fix `COULD_NOT_FIND_EXECUTOR` when a task's definition is loaded via `await import(...)` from inside another task's `run()`. The runtime workers now register such tasks with a sentinel file context, and the catalog logs a one-time warning per task id. ([#3688](https://github.com/triggerdotdev/trigger.dev/pull/3688))
+- Updated dependencies:
+  - `@trigger.dev/core@4.5.0-rc.1`
+  - `@trigger.dev/build@4.5.0-rc.1`
+  - `@trigger.dev/schema-to-json@4.5.0-rc.1`
+
+## 4.5.0-rc.0
+
+### Patch Changes
+
+- Add Agent Skills for `chat.agent`. Drop a folder with a `SKILL.md` and any helper scripts/references next to your task code, register it with `skills.define({ id, path })`, and the CLI bundles it into the deploy image automatically — no `trigger.config.ts` changes. The agent gets a one-line summary in its system prompt and discovers full instructions on demand via `loadSkill`, with `bash` and `readFile` tools scoped per-skill (path-traversal guards, output caps, abort-signal propagation). ([#3543](https://github.com/triggerdotdev/trigger.dev/pull/3543))
+
+  ```ts
+  const pdfSkill = skills.define({
+    id: "pdf-extract",
+    path: "./skills/pdf-extract",
+  });
+
+  chat.skills.set([await pdfSkill.local()]);
+  ```
+
+  Built on the [AI SDK cookbook pattern](https://ai-sdk.dev/cookbook/guides/agent-skills) — portable across providers. SDK + CLI only for now; dashboard-editable `SKILL.md` text is on the roadmap.
+
+- Add `TRIGGER_BUILD_SKIP_REWRITE_TIMESTAMP=1` escape hatch for local self-hosted builds whose buildx driver doesn't support `rewrite-timestamp` alongside push (e.g. orbstack's default `docker` driver). ([#3618](https://github.com/triggerdotdev/trigger.dev/pull/3618))
+- The CLI MCP server's agent-chat tools (`start_agent_chat`, `send_agent_message`, `close_agent_chat`) now run on the new Sessions primitive, so AI assistants driving a `chat.agent` get the same idempotent-by-`chatId`, durable-across-runs behavior the browser transport gets. Required PAT scopes go from `write:inputStreams` to `read:sessions` + `write:sessions`. ([#3546](https://github.com/triggerdotdev/trigger.dev/pull/3546))
+- MCP `list_runs` tool: add a `region` filter input and surface each run's executing region in the formatted summary. ([#3612](https://github.com/triggerdotdev/trigger.dev/pull/3612))
+- Updated dependencies:
+  - `@trigger.dev/core@4.5.0-rc.0`
+  - `@trigger.dev/build@4.5.0-rc.0`
+  - `@trigger.dev/schema-to-json@4.5.0-rc.0`
+
+## 4.4.6
+
+### Patch Changes
+
+- Fix dev workers spinning at 100% CPU after the parent CLI disconnects. Orphaned `trigger-dev-run-worker` (and indexer) processes were caught in an `uncaughtException` feedback loop: a periodic IPC send via `process.send` would throw `ERR_IPC_CHANNEL_CLOSED` once the parent closed the channel, which re-entered the same handler that itself called `process.send`, scheduled via `setImmediate` and amplified by source-map-support's `prepareStackTrace`. Fixed by (1) silently dropping packets in `ZodIpcConnection` when the channel is disconnected, (2) adding a `process.on("disconnect", ...)` handler in dev workers so they exit cleanly when the CLI closes the IPC channel, and (3) wrapping all `uncaughtException`-path `process.send` calls in a `safeSend` guard that checks `process.connected` and swallows synchronous throws. ([#3491](https://github.com/triggerdotdev/trigger.dev/pull/3491))
+- Fail attempts on uncaught exceptions instead of hanging to `MAX_DURATION_EXCEEDED`. A Node `EventEmitter` (e.g. `node-redis`) emitting `"error"` with no `.on("error", ...)` listener escalates to `uncaughtException`, which the worker previously reported but did not act on — runs drifted to maxDuration with empty attempts. They now fail fast with the original error and status `FAILED`, and respect the task's normal retry policy. You should still attach `.on("error", ...)` listeners to long-lived clients to handle errors gracefully. ([#3529](https://github.com/triggerdotdev/trigger.dev/pull/3529))
+- Updated dependencies:
+  - `@trigger.dev/core@4.4.6`
+  - `@trigger.dev/build@4.4.6`
+  - `@trigger.dev/schema-to-json@4.4.6`
+
+## 4.4.5
+
+### Patch Changes
+
+- Add `--no-browser` flag to `init` and `login` to skip auto-opening the browser during authentication. Also error loudly when `init` is run without `--yes` under non-TTY stdin (previously default-and-exited silently, leaving the project half-initialized). Both commands now show an `Examples` section in `--help`. ([#3483](https://github.com/triggerdotdev/trigger.dev/pull/3483))
+- Updated dependencies:
+  - `@trigger.dev/core@4.4.5`
+  - `@trigger.dev/build@4.4.5`
+  - `@trigger.dev/schema-to-json@4.4.5`
+
+## 4.4.4
+
+### Patch Changes
+
+- Add platform notifications support to the CLI. The `trigger dev` and `trigger login` commands now fetch and display platform notifications (info, warn, error, success) from the server. Includes discovery-based filtering to conditionally show notifications based on project file patterns, color markup rendering for styled terminal output, and a non-blocking display flow with a spinner fallback for slow fetches. Use `--skip-platform-notifications` flag with `trigger dev` to disable the notification check. ([#3254](https://github.com/triggerdotdev/trigger.dev/pull/3254))
+- Fix dev CLI leaking build directories on rebuild, causing disk space accumulation. Deprecated workers are now pruned (capped at 2 retained) when no active runs reference them. The watchdog process also cleans up `.trigger/tmp/` when the dev CLI is killed ungracefully (e.g. SIGKILL from pnpm). ([#3224](https://github.com/triggerdotdev/trigger.dev/pull/3224))
+- Fix `--load` flag being silently ignored on local/self-hosted builds. ([#3114](https://github.com/triggerdotdev/trigger.dev/pull/3114))
+- Add `get_span_details` MCP tool for inspecting individual spans within a run trace. ([#3255](https://github.com/triggerdotdev/trigger.dev/pull/3255))
+  - New `get_span_details` tool returns full span attributes, timing, events, and AI enrichment (model, tokens, cost, speed)
+  - Span IDs now shown in `get_run_details` trace output for easy discovery
+  - New API endpoint `GET /api/v1/runs/:runId/spans/:spanId`
+  - New `retrieveSpan()` method on the API client
+
+- MCP server improvements: new tools, bug fixes, and new flags. ([#3224](https://github.com/triggerdotdev/trigger.dev/pull/3224))
+
+  **New tools:**
+  - `get_query_schema` — discover available TRQL tables and columns
+  - `query` — execute TRQL queries against your data
+  - `list_dashboards` — list built-in dashboards and their widgets
+  - `run_dashboard_query` — execute a single dashboard widget query
+  - `whoami` — show current profile, user, and API URL
+  - `list_profiles` — list all configured CLI profiles
+  - `switch_profile` — switch active profile for the MCP session
+  - `start_dev_server` — start `trigger dev` in the background and stream output
+  - `stop_dev_server` — stop the running dev server
+  - `dev_server_status` — check dev server status and view recent logs
+
+  **New API endpoints:**
+  - `GET /api/v1/query/schema` — query table schema discovery
+  - `GET /api/v1/query/dashboards` — list built-in dashboards
+
+  **New features:**
+  - `--readonly` flag hides write tools (`deploy`, `trigger_task`, `cancel_run`) so the AI cannot make changes
+  - `read:query` JWT scope for query endpoint authorization
+  - `get_run_details` trace output is now paginated with cursor support
+  - MCP tool annotations (`readOnlyHint`, `destructiveHint`) for all tools
+
+  **Bug fixes:**
+  - Fixed `search_docs` tool failing due to renamed upstream Mintlify tool (`SearchTriggerDev` → `search_trigger_dev`)
+  - Fixed `list_deploys` failing when deployments have null `runtime`/`runtimeVersion` fields (#3139)
+  - Fixed `list_preview_branches` crashing due to incorrect response shape access
+  - Fixed `metrics` table column documented as `value` instead of `metric_value` in query docs
+  - Fixed dev CLI leaking build directories on rebuild — deprecated workers now clean up their build dirs when their last run completes
+
+  **Context optimizations:**
+  - `get_query_schema` now requires a table name and returns only one table's schema (was returning all tables)
+  - `get_current_worker` no longer inlines payload schemas; use new `get_task_schema` tool instead
+  - Query results formatted as text tables instead of JSON (~50% fewer tokens)
+  - `cancel_run`, `list_deploys`, `list_preview_branches` formatted as text instead of raw JSON
+  - Schema and dashboard API responses cached to avoid redundant fetches
+
+- Add support for setting TTL (time-to-live) defaults at the task level and globally in trigger.config.ts, with per-trigger overrides still taking precedence ([#3196](https://github.com/triggerdotdev/trigger.dev/pull/3196))
+- Adapted the CLI API client to propagate the trigger source via http headers. ([#3241](https://github.com/triggerdotdev/trigger.dev/pull/3241))
+- Updated dependencies:
+  - `@trigger.dev/core@4.4.4`
+  - `@trigger.dev/build@4.4.4`
+  - `@trigger.dev/schema-to-json@4.4.4`
+
 ## 4.4.3
 
 ### Patch Changes
@@ -1110,7 +1457,6 @@
   All important socket.io RPCs will now be retried with backoff. Actions relying on checkpoints will be replayed if we haven't been checkpointed and restored as expected, e.g. after reconnect.
 
   Other changes:
-
   - Fix retry check in shared queue
   - Fix env var sync spinner
   - Heartbeat between retries
@@ -1238,7 +1584,6 @@
 - e9a63a486: Lock SDK and CLI deps on exact core version
 - 8757fdcee: v3: [prod] force flush timeout should be 1s
 - 26093896d: When using idempotency keys, triggerAndWait and batchTriggerAndWait will still work even if the existing runs have already been completed (or even partially completed, in the case of batchTriggerAndWait)
-
   - TaskRunExecutionResult.id is now the run friendlyId, not the attempt friendlyId
   - A single TaskRun can now have many batchItems, in the case of batchTriggerAndWait while using idempotency keys
   - A run’s idempotencyKey is now added to the ctx as well as the TaskEvent and displayed in the span view
@@ -1495,7 +1840,6 @@
   All important socket.io RPCs will now be retried with backoff. Actions relying on checkpoints will be replayed if we haven't been checkpointed and restored as expected, e.g. after reconnect.
 
   Other changes:
-
   - Fix retry check in shared queue
   - Fix env var sync spinner
   - Heartbeat between retries
@@ -1900,7 +2244,6 @@
 ### Patch Changes
 
 - 26093896d: When using idempotency keys, triggerAndWait and batchTriggerAndWait will still work even if the existing runs have already been completed (or even partially completed, in the case of batchTriggerAndWait)
-
   - TaskRunExecutionResult.id is now the run friendlyId, not the attempt friendlyId
   - A single TaskRun can now have many batchItems, in the case of batchTriggerAndWait while using idempotency keys
   - A run’s idempotencyKey is now added to the ctx as well as the TaskEvent and displayed in the span view

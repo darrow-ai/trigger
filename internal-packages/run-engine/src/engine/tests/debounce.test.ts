@@ -4,6 +4,7 @@ import { expect } from "vitest";
 import { RunEngine } from "../index.js";
 import { setTimeout } from "timers/promises";
 import { setupAuthenticatedEnvironment, setupBackgroundWorker } from "./setup.js";
+import { createRedisClient } from "@internal/redis";
 
 vi.setConfig({ testTimeout: 60_000 });
 
@@ -95,117 +96,114 @@ describe("RunEngine debounce", () => {
     }
   });
 
-  containerTest(
-    "Debounce: multiple triggers return same run",
-    async ({ prisma, redisOptions }) => {
-      const authenticatedEnvironment = await setupAuthenticatedEnvironment(prisma, "PRODUCTION");
+  containerTest("Debounce: multiple triggers return same run", async ({ prisma, redisOptions }) => {
+    const authenticatedEnvironment = await setupAuthenticatedEnvironment(prisma, "PRODUCTION");
 
-      const engine = new RunEngine({
-        prisma,
-        worker: {
-          redis: redisOptions,
-          workers: 1,
-          tasksPerWorker: 10,
-          pollIntervalMs: 100,
-        },
-        queue: {
-          redis: redisOptions,
-        },
-        runLock: {
-          redis: redisOptions,
-        },
+    const engine = new RunEngine({
+      prisma,
+      worker: {
+        redis: redisOptions,
+        workers: 1,
+        tasksPerWorker: 10,
+        pollIntervalMs: 100,
+      },
+      queue: {
+        redis: redisOptions,
+      },
+      runLock: {
+        redis: redisOptions,
+      },
+      machines: {
+        defaultMachine: "small-1x",
         machines: {
-          defaultMachine: "small-1x",
-          machines: {
-            "small-1x": {
-              name: "small-1x" as const,
-              cpu: 0.5,
-              memory: 0.5,
-              centsPerMs: 0.0001,
-            },
+          "small-1x": {
+            name: "small-1x" as const,
+            cpu: 0.5,
+            memory: 0.5,
+            centsPerMs: 0.0001,
           },
-          baseCostInCents: 0.0001,
         },
-        debounce: {
-          maxDebounceDurationMs: 60_000,
+        baseCostInCents: 0.0001,
+      },
+      debounce: {
+        maxDebounceDurationMs: 60_000,
+      },
+      tracer: trace.getTracer("test", "0.0.0"),
+    });
+
+    try {
+      const taskIdentifier = "test-task";
+
+      await setupBackgroundWorker(engine, authenticatedEnvironment, taskIdentifier);
+
+      // First trigger creates run
+      const run1 = await engine.trigger(
+        {
+          number: 1,
+          friendlyId: "run_deb1",
+          environment: authenticatedEnvironment,
+          taskIdentifier,
+          payload: '{"data": "first"}',
+          payloadType: "application/json",
+          context: {},
+          traceContext: {},
+          traceId: "t12345",
+          spanId: "s12345",
+          workerQueue: "main",
+          queue: "task/test-task",
+          isTest: false,
+          tags: [],
+          delayUntil: new Date(Date.now() + 5000),
+          debounce: {
+            key: "user-123",
+            delay: "5s",
+          },
         },
-        tracer: trace.getTracer("test", "0.0.0"),
+        prisma
+      );
+
+      // Second trigger should return same run
+      const run2 = await engine.trigger(
+        {
+          number: 2,
+          friendlyId: "run_deb2",
+          environment: authenticatedEnvironment,
+          taskIdentifier,
+          payload: '{"data": "second"}',
+          payloadType: "application/json",
+          context: {},
+          traceContext: {},
+          traceId: "t12346",
+          spanId: "s12346",
+          workerQueue: "main",
+          queue: "task/test-task",
+          isTest: false,
+          tags: [],
+          delayUntil: new Date(Date.now() + 5000),
+          debounce: {
+            key: "user-123",
+            delay: "5s",
+          },
+        },
+        prisma
+      );
+
+      // Both should return the same run (first run wins)
+      expect(run2.id).toBe(run1.id);
+      expect(run2.friendlyId).toBe(run1.friendlyId);
+
+      // Only one run should exist in DB
+      const runs = await prisma.taskRun.findMany({
+        where: {
+          taskIdentifier,
+          runtimeEnvironmentId: authenticatedEnvironment.id,
+        },
       });
-
-      try {
-        const taskIdentifier = "test-task";
-
-        await setupBackgroundWorker(engine, authenticatedEnvironment, taskIdentifier);
-
-        // First trigger creates run
-        const run1 = await engine.trigger(
-          {
-            number: 1,
-            friendlyId: "run_deb1",
-            environment: authenticatedEnvironment,
-            taskIdentifier,
-            payload: '{"data": "first"}',
-            payloadType: "application/json",
-            context: {},
-            traceContext: {},
-            traceId: "t12345",
-            spanId: "s12345",
-            workerQueue: "main",
-            queue: "task/test-task",
-            isTest: false,
-            tags: [],
-            delayUntil: new Date(Date.now() + 5000),
-            debounce: {
-              key: "user-123",
-              delay: "5s",
-            },
-          },
-          prisma
-        );
-
-        // Second trigger should return same run
-        const run2 = await engine.trigger(
-          {
-            number: 2,
-            friendlyId: "run_deb2",
-            environment: authenticatedEnvironment,
-            taskIdentifier,
-            payload: '{"data": "second"}',
-            payloadType: "application/json",
-            context: {},
-            traceContext: {},
-            traceId: "t12346",
-            spanId: "s12346",
-            workerQueue: "main",
-            queue: "task/test-task",
-            isTest: false,
-            tags: [],
-            delayUntil: new Date(Date.now() + 5000),
-            debounce: {
-              key: "user-123",
-              delay: "5s",
-            },
-          },
-          prisma
-        );
-
-        // Both should return the same run (first run wins)
-        expect(run2.id).toBe(run1.id);
-        expect(run2.friendlyId).toBe(run1.friendlyId);
-
-        // Only one run should exist in DB
-        const runs = await prisma.taskRun.findMany({
-          where: {
-            taskIdentifier,
-            runtimeEnvironmentId: authenticatedEnvironment.id,
-          },
-        });
-        expect(runs.length).toBe(1);
-      } finally {
-        await engine.quit();
-      }
+      expect(runs.length).toBe(1);
+    } finally {
+      await engine.quit();
     }
-  );
+  });
 
   containerTest(
     "Debounce: delay extension on subsequent triggers",
@@ -240,6 +238,8 @@ describe("RunEngine debounce", () => {
         },
         debounce: {
           maxDebounceDurationMs: 60_000,
+          // Disable quantization so this test can observe sub-second extensions.
+          quantizeNewDelayUntilMs: 0,
         },
         tracer: trace.getTracer("test", "0.0.0"),
       });
@@ -438,91 +438,88 @@ describe("RunEngine debounce", () => {
     }
   );
 
-  containerTest(
-    "Debounce: run executes after final delay",
-    async ({ prisma, redisOptions }) => {
-      const authenticatedEnvironment = await setupAuthenticatedEnvironment(prisma, "PRODUCTION");
+  containerTest("Debounce: run executes after final delay", async ({ prisma, redisOptions }) => {
+    const authenticatedEnvironment = await setupAuthenticatedEnvironment(prisma, "PRODUCTION");
 
-      const engine = new RunEngine({
-        prisma,
-        worker: {
-          redis: redisOptions,
-          workers: 1,
-          tasksPerWorker: 10,
-          pollIntervalMs: 100,
-        },
-        queue: {
-          redis: redisOptions,
-        },
-        runLock: {
-          redis: redisOptions,
-        },
+    const engine = new RunEngine({
+      prisma,
+      worker: {
+        redis: redisOptions,
+        workers: 1,
+        tasksPerWorker: 10,
+        pollIntervalMs: 100,
+      },
+      queue: {
+        redis: redisOptions,
+      },
+      runLock: {
+        redis: redisOptions,
+      },
+      machines: {
+        defaultMachine: "small-1x",
         machines: {
-          defaultMachine: "small-1x",
-          machines: {
-            "small-1x": {
-              name: "small-1x" as const,
-              cpu: 0.5,
-              memory: 0.5,
-              centsPerMs: 0.0001,
-            },
+          "small-1x": {
+            name: "small-1x" as const,
+            cpu: 0.5,
+            memory: 0.5,
+            centsPerMs: 0.0001,
           },
-          baseCostInCents: 0.0001,
         },
-        debounce: {
-          maxDebounceDurationMs: 60_000,
-        },
-        tracer: trace.getTracer("test", "0.0.0"),
-      });
+        baseCostInCents: 0.0001,
+      },
+      debounce: {
+        maxDebounceDurationMs: 60_000,
+      },
+      tracer: trace.getTracer("test", "0.0.0"),
+    });
 
-      try {
-        const taskIdentifier = "test-task";
+    try {
+      const taskIdentifier = "test-task";
 
-        await setupBackgroundWorker(engine, authenticatedEnvironment, taskIdentifier);
+      await setupBackgroundWorker(engine, authenticatedEnvironment, taskIdentifier);
 
-        // First trigger with 1s delay
-        const run = await engine.trigger(
-          {
-            number: 1,
-            friendlyId: "run_deb1",
-            environment: authenticatedEnvironment,
-            taskIdentifier,
-            payload: '{"data": "first"}',
-            payloadType: "application/json",
-            context: {},
-            traceContext: {},
-            traceId: "t12345",
-            spanId: "s12345",
-            workerQueue: "main",
-            queue: "task/test-task",
-            isTest: false,
-            tags: [],
-            delayUntil: new Date(Date.now() + 1000),
-            debounce: {
-              key: "user-123",
-              delay: "1s",
-            },
+      // First trigger with 1s delay
+      const run = await engine.trigger(
+        {
+          number: 1,
+          friendlyId: "run_deb1",
+          environment: authenticatedEnvironment,
+          taskIdentifier,
+          payload: '{"data": "first"}',
+          payloadType: "application/json",
+          context: {},
+          traceContext: {},
+          traceId: "t12345",
+          spanId: "s12345",
+          workerQueue: "main",
+          queue: "task/test-task",
+          isTest: false,
+          tags: [],
+          delayUntil: new Date(Date.now() + 1000),
+          debounce: {
+            key: "user-123",
+            delay: "1s",
           },
-          prisma
-        );
+        },
+        prisma
+      );
 
-        // Verify it's in DELAYED status
-        let executionData = await engine.getRunExecutionData({ runId: run.id });
-        assertNonNullable(executionData);
-        expect(executionData.snapshot.executionStatus).toBe("DELAYED");
+      // Verify it's in DELAYED status
+      let executionData = await engine.getRunExecutionData({ runId: run.id });
+      assertNonNullable(executionData);
+      expect(executionData.snapshot.executionStatus).toBe("DELAYED");
 
-        // Wait for delay to pass
-        await setTimeout(1500);
+      // Wait for delay to pass
+      await setTimeout(1500);
 
-        // Should now be QUEUED
-        executionData = await engine.getRunExecutionData({ runId: run.id });
-        assertNonNullable(executionData);
-        expect(executionData.snapshot.executionStatus).toBe("QUEUED");
-      } finally {
-        await engine.quit();
-      }
+      // Should now be QUEUED
+      executionData = await engine.getRunExecutionData({ runId: run.id });
+      assertNonNullable(executionData);
+      expect(executionData.snapshot.executionStatus).toBe("QUEUED");
+    } finally {
+      await engine.quit();
     }
-  );
+  });
 
   containerTest(
     "Debounce: no longer works after run is enqueued",
@@ -740,111 +737,108 @@ describe("RunEngine debounce", () => {
     }
   );
 
-  containerTest(
-    "Debounce keys are scoped to task identifier",
-    async ({ prisma, redisOptions }) => {
-      const authenticatedEnvironment = await setupAuthenticatedEnvironment(prisma, "PRODUCTION");
+  containerTest("Debounce keys are scoped to task identifier", async ({ prisma, redisOptions }) => {
+    const authenticatedEnvironment = await setupAuthenticatedEnvironment(prisma, "PRODUCTION");
 
-      const engine = new RunEngine({
-        prisma,
-        worker: {
-          redis: redisOptions,
-          workers: 1,
-          tasksPerWorker: 10,
-          pollIntervalMs: 100,
-        },
-        queue: {
-          redis: redisOptions,
-        },
-        runLock: {
-          redis: redisOptions,
-        },
+    const engine = new RunEngine({
+      prisma,
+      worker: {
+        redis: redisOptions,
+        workers: 1,
+        tasksPerWorker: 10,
+        pollIntervalMs: 100,
+      },
+      queue: {
+        redis: redisOptions,
+      },
+      runLock: {
+        redis: redisOptions,
+      },
+      machines: {
+        defaultMachine: "small-1x",
         machines: {
-          defaultMachine: "small-1x",
-          machines: {
-            "small-1x": {
-              name: "small-1x" as const,
-              cpu: 0.5,
-              memory: 0.5,
-              centsPerMs: 0.0001,
-            },
+          "small-1x": {
+            name: "small-1x" as const,
+            cpu: 0.5,
+            memory: 0.5,
+            centsPerMs: 0.0001,
           },
-          baseCostInCents: 0.0001,
         },
-        debounce: {
-          maxDebounceDurationMs: 60_000,
+        baseCostInCents: 0.0001,
+      },
+      debounce: {
+        maxDebounceDurationMs: 60_000,
+      },
+      tracer: trace.getTracer("test", "0.0.0"),
+    });
+
+    try {
+      const taskIdentifier1 = "test-task-1";
+      const taskIdentifier2 = "test-task-2";
+
+      await setupBackgroundWorker(engine, authenticatedEnvironment, taskIdentifier1);
+      await setupBackgroundWorker(engine, authenticatedEnvironment, taskIdentifier2);
+
+      // Trigger task 1 with debounce key
+      const run1 = await engine.trigger(
+        {
+          number: 1,
+          friendlyId: "run_task1",
+          environment: authenticatedEnvironment,
+          taskIdentifier: taskIdentifier1,
+          payload: '{"data": "task1"}',
+          payloadType: "application/json",
+          context: {},
+          traceContext: {},
+          traceId: "t12345",
+          spanId: "s12345",
+          workerQueue: "main",
+          queue: `task/${taskIdentifier1}`,
+          isTest: false,
+          tags: [],
+          delayUntil: new Date(Date.now() + 5000),
+          debounce: {
+            key: "shared-key",
+            delay: "5s",
+          },
         },
-        tracer: trace.getTracer("test", "0.0.0"),
-      });
+        prisma
+      );
 
-      try {
-        const taskIdentifier1 = "test-task-1";
-        const taskIdentifier2 = "test-task-2";
-
-        await setupBackgroundWorker(engine, authenticatedEnvironment, taskIdentifier1);
-        await setupBackgroundWorker(engine, authenticatedEnvironment, taskIdentifier2);
-
-        // Trigger task 1 with debounce key
-        const run1 = await engine.trigger(
-          {
-            number: 1,
-            friendlyId: "run_task1",
-            environment: authenticatedEnvironment,
-            taskIdentifier: taskIdentifier1,
-            payload: '{"data": "task1"}',
-            payloadType: "application/json",
-            context: {},
-            traceContext: {},
-            traceId: "t12345",
-            spanId: "s12345",
-            workerQueue: "main",
-            queue: `task/${taskIdentifier1}`,
-            isTest: false,
-            tags: [],
-            delayUntil: new Date(Date.now() + 5000),
-            debounce: {
-              key: "shared-key",
-              delay: "5s",
-            },
+      // Trigger task 2 with same debounce key - should create separate run
+      const run2 = await engine.trigger(
+        {
+          number: 2,
+          friendlyId: "run_task2",
+          environment: authenticatedEnvironment,
+          taskIdentifier: taskIdentifier2,
+          payload: '{"data": "task2"}',
+          payloadType: "application/json",
+          context: {},
+          traceContext: {},
+          traceId: "t12346",
+          spanId: "s12346",
+          workerQueue: "main",
+          queue: `task/${taskIdentifier2}`,
+          isTest: false,
+          tags: [],
+          delayUntil: new Date(Date.now() + 5000),
+          debounce: {
+            key: "shared-key",
+            delay: "5s",
           },
-          prisma
-        );
+        },
+        prisma
+      );
 
-        // Trigger task 2 with same debounce key - should create separate run
-        const run2 = await engine.trigger(
-          {
-            number: 2,
-            friendlyId: "run_task2",
-            environment: authenticatedEnvironment,
-            taskIdentifier: taskIdentifier2,
-            payload: '{"data": "task2"}',
-            payloadType: "application/json",
-            context: {},
-            traceContext: {},
-            traceId: "t12346",
-            spanId: "s12346",
-            workerQueue: "main",
-            queue: `task/${taskIdentifier2}`,
-            isTest: false,
-            tags: [],
-            delayUntil: new Date(Date.now() + 5000),
-            debounce: {
-              key: "shared-key",
-              delay: "5s",
-            },
-          },
-          prisma
-        );
-
-        // Should be different runs (debounce scoped to task)
-        expect(run2.id).not.toBe(run1.id);
-        expect(run1.taskIdentifier).toBe(taskIdentifier1);
-        expect(run2.taskIdentifier).toBe(taskIdentifier2);
-      } finally {
-        await engine.quit();
-      }
+      // Should be different runs (debounce scoped to task)
+      expect(run2.id).not.toBe(run1.id);
+      expect(run1.taskIdentifier).toBe(taskIdentifier1);
+      expect(run2.taskIdentifier).toBe(taskIdentifier2);
+    } finally {
+      await engine.quit();
     }
-  );
+  });
 
   containerTest(
     "Debounce with triggerAndWait: parent blocked by debounced child run",
@@ -1216,130 +1210,127 @@ describe("RunEngine debounce", () => {
     }
   );
 
-  containerTest(
-    "Debounce: keys scoped to environment",
-    async ({ prisma, redisOptions }) => {
-      // Create production environment (also creates org and project)
-      const prodEnvironment = await setupAuthenticatedEnvironment(prisma, "PRODUCTION");
+  containerTest("Debounce: keys scoped to environment", async ({ prisma, redisOptions }) => {
+    // Create production environment (also creates org and project)
+    const prodEnvironment = await setupAuthenticatedEnvironment(prisma, "PRODUCTION");
 
-      // Create a second environment (development) within the same org/project
-      const devEnvironment = await prisma.runtimeEnvironment.create({
-        data: {
-          type: "DEVELOPMENT",
-          slug: "dev-slug",
-          projectId: prodEnvironment.projectId,
-          organizationId: prodEnvironment.organizationId,
-          apiKey: "dev_api_key",
-          pkApiKey: "dev_pk_api_key",
-          shortcode: "dev_short",
-          maximumConcurrencyLimit: 10,
-        },
-        include: {
-          project: true,
-          organization: true,
-          orgMember: true,
-        },
-      });
+    // Create a second environment (development) within the same org/project
+    const devEnvironment = await prisma.runtimeEnvironment.create({
+      data: {
+        type: "DEVELOPMENT",
+        slug: "dev-slug",
+        projectId: prodEnvironment.projectId,
+        organizationId: prodEnvironment.organizationId,
+        apiKey: "dev_api_key",
+        pkApiKey: "dev_pk_api_key",
+        shortcode: "dev_short",
+        maximumConcurrencyLimit: 10,
+      },
+      include: {
+        project: true,
+        organization: true,
+        orgMember: true,
+      },
+    });
 
-      const engine = new RunEngine({
-        prisma,
-        worker: {
-          redis: redisOptions,
-          workers: 1,
-          tasksPerWorker: 10,
-          pollIntervalMs: 100,
-        },
-        queue: {
-          redis: redisOptions,
-        },
-        runLock: {
-          redis: redisOptions,
-        },
+    const engine = new RunEngine({
+      prisma,
+      worker: {
+        redis: redisOptions,
+        workers: 1,
+        tasksPerWorker: 10,
+        pollIntervalMs: 100,
+      },
+      queue: {
+        redis: redisOptions,
+      },
+      runLock: {
+        redis: redisOptions,
+      },
+      machines: {
+        defaultMachine: "small-1x",
         machines: {
-          defaultMachine: "small-1x",
-          machines: {
-            "small-1x": {
-              name: "small-1x" as const,
-              cpu: 0.5,
-              memory: 0.5,
-              centsPerMs: 0.0001,
-            },
+          "small-1x": {
+            name: "small-1x" as const,
+            cpu: 0.5,
+            memory: 0.5,
+            centsPerMs: 0.0001,
           },
-          baseCostInCents: 0.0001,
         },
-        debounce: {
-          maxDebounceDurationMs: 60_000,
+        baseCostInCents: 0.0001,
+      },
+      debounce: {
+        maxDebounceDurationMs: 60_000,
+      },
+      tracer: trace.getTracer("test", "0.0.0"),
+    });
+
+    try {
+      const taskIdentifier = "test-task";
+
+      await setupBackgroundWorker(engine, prodEnvironment, taskIdentifier);
+      await setupBackgroundWorker(engine, devEnvironment, taskIdentifier);
+
+      // Trigger in production environment
+      const runProd = await engine.trigger(
+        {
+          number: 1,
+          friendlyId: "run_prod1",
+          environment: prodEnvironment,
+          taskIdentifier,
+          payload: '{"env": "prod"}',
+          payloadType: "application/json",
+          context: {},
+          traceContext: {},
+          traceId: "t12345",
+          spanId: "s12345",
+          workerQueue: "main",
+          queue: `task/${taskIdentifier}`,
+          isTest: false,
+          tags: [],
+          delayUntil: new Date(Date.now() + 5000),
+          debounce: {
+            key: "same-key",
+            delay: "5s",
+          },
         },
-        tracer: trace.getTracer("test", "0.0.0"),
-      });
+        prisma
+      );
 
-      try {
-        const taskIdentifier = "test-task";
-
-        await setupBackgroundWorker(engine, prodEnvironment, taskIdentifier);
-        await setupBackgroundWorker(engine, devEnvironment, taskIdentifier);
-
-        // Trigger in production environment
-        const runProd = await engine.trigger(
-          {
-            number: 1,
-            friendlyId: "run_prod1",
-            environment: prodEnvironment,
-            taskIdentifier,
-            payload: '{"env": "prod"}',
-            payloadType: "application/json",
-            context: {},
-            traceContext: {},
-            traceId: "t12345",
-            spanId: "s12345",
-            workerQueue: "main",
-            queue: `task/${taskIdentifier}`,
-            isTest: false,
-            tags: [],
-            delayUntil: new Date(Date.now() + 5000),
-            debounce: {
-              key: "same-key",
-              delay: "5s",
-            },
+      // Trigger in development environment with same key - should create separate run
+      const runDev = await engine.trigger(
+        {
+          number: 2,
+          friendlyId: "run_dev1",
+          environment: devEnvironment,
+          taskIdentifier,
+          payload: '{"env": "dev"}',
+          payloadType: "application/json",
+          context: {},
+          traceContext: {},
+          traceId: "t12346",
+          spanId: "s12346",
+          workerQueue: "main",
+          queue: `task/${taskIdentifier}`,
+          isTest: false,
+          tags: [],
+          delayUntil: new Date(Date.now() + 5000),
+          debounce: {
+            key: "same-key",
+            delay: "5s",
           },
-          prisma
-        );
+        },
+        prisma
+      );
 
-        // Trigger in development environment with same key - should create separate run
-        const runDev = await engine.trigger(
-          {
-            number: 2,
-            friendlyId: "run_dev1",
-            environment: devEnvironment,
-            taskIdentifier,
-            payload: '{"env": "dev"}',
-            payloadType: "application/json",
-            context: {},
-            traceContext: {},
-            traceId: "t12346",
-            spanId: "s12346",
-            workerQueue: "main",
-            queue: `task/${taskIdentifier}`,
-            isTest: false,
-            tags: [],
-            delayUntil: new Date(Date.now() + 5000),
-            debounce: {
-              key: "same-key",
-              delay: "5s",
-            },
-          },
-          prisma
-        );
-
-        // Should be different runs (debounce scoped to environment)
-        expect(runDev.id).not.toBe(runProd.id);
-        expect(runProd.runtimeEnvironmentId).toBe(prodEnvironment.id);
-        expect(runDev.runtimeEnvironmentId).toBe(devEnvironment.id);
-      } finally {
-        await engine.quit();
-      }
+      // Should be different runs (debounce scoped to environment)
+      expect(runDev.id).not.toBe(runProd.id);
+      expect(runProd.runtimeEnvironmentId).toBe(prodEnvironment.id);
+      expect(runDev.runtimeEnvironmentId).toBe(devEnvironment.id);
+    } finally {
+      await engine.quit();
     }
-  );
+  });
 
   containerTest(
     "Debounce: concurrent triggers only create one run (distributed race protection)",
@@ -2004,11 +1995,11 @@ describe("RunEngine debounce", () => {
         // Construct the Redis key (same format as DebounceSystem.getDebounceRedisKey)
         const redisKey = `${environmentId}:${taskIdentifier}:${debounceKey}`;
 
-        // Step 1: Server A claims the key with claimId-A
+        // Server A claims the key with claimId-A
         const claimIdA = "claim-server-A";
         await simulatedServerRedis.set(redisKey, `pending:${claimIdA}`, "PX", 60_000);
 
-        // Step 2 & 3: Simulate Server B claiming and registering (after A's claim "expires")
+        // Simulate Server B claiming and registering (after A's claim "expires")
         // In reality, this simulates the race where B's claim overwrites A's pending claim
         const runIdB = "run_server_B";
         await simulatedServerRedis.set(redisKey, runIdB, "PX", 60_000);
@@ -2017,7 +2008,7 @@ describe("RunEngine debounce", () => {
         const valueAfterB = await simulatedServerRedis.get(redisKey);
         expect(valueAfterB).toBe(runIdB);
 
-        // Step 4: Server A attempts to register with its stale claimId-A
+        // Server A attempts to register with its stale claimId-A
         // This should FAIL because the key no longer contains "pending:claim-server-A"
         const runIdA = "run_server_A";
         const registered = await engine.debounceSystem.registerDebouncedRun({
@@ -2029,10 +2020,10 @@ describe("RunEngine debounce", () => {
           claimId: claimIdA, // Stale claim ID
         });
 
-        // Step 5: Verify Server A's registration failed
+        // Verify Server A's registration failed
         expect(registered).toBe(false);
 
-        // Step 6: Verify Redis still contains runId-B (not overwritten by Server A)
+        // Verify Redis still contains runId-B (not overwritten by Server A)
         const finalValue = await simulatedServerRedis.get(redisKey);
         expect(finalValue).toBe(runIdB);
       } finally {
@@ -2106,14 +2097,14 @@ describe("RunEngine debounce", () => {
         // Construct the Redis key (same format as DebounceSystem.getDebounceRedisKey)
         const redisKey = `${environmentId}:${taskIdentifier}:${debounceKey}`;
 
-        // Step 1: Server A claims the key with a pending claim
+        // Server A claims the key with a pending claim
         const claimIdA = "claim-server-A";
         await simulatedServerRedis.set(redisKey, `pending:${claimIdA}`, "PX", 60_000);
 
-        // Step 2: Delete the key to simulate Server A's claim expiring
+        // Delete the key to simulate Server A's claim expiring
         await simulatedServerRedis.del(redisKey);
 
-        // Step 3: Server B calls handleDebounce - since key is gone, it should atomically claim
+        // Server B calls handleDebounce - since key is gone, it should atomically claim
         const debounceResult = await engine.debounceSystem.handleDebounce({
           environmentId,
           taskIdentifier,
@@ -2123,18 +2114,18 @@ describe("RunEngine debounce", () => {
           },
         });
 
-        // Step 4: Verify result is { status: "new" } WITH a claimId
+        // Verify result is { status: "new" } WITH a claimId
         expect(debounceResult.status).toBe("new");
         if (debounceResult.status === "new") {
           expect(debounceResult.claimId).toBeDefined();
           expect(typeof debounceResult.claimId).toBe("string");
           expect(debounceResult.claimId!.length).toBeGreaterThan(0);
 
-          // Step 5: Verify the key now contains Server B's pending claim
+          // Verify the key now contains Server B's pending claim
           const valueAfterB = await simulatedServerRedis.get(redisKey);
           expect(valueAfterB).toBe(`pending:${debounceResult.claimId}`);
 
-          // Step 6: Server C tries to claim the same key - should fail
+          // Server C tries to claim the same key - should fail
           const claimIdC = "claim-server-C";
           const claimResultC = await simulatedServerRedis.set(
             redisKey,
@@ -2145,7 +2136,7 @@ describe("RunEngine debounce", () => {
           );
           expect(claimResultC).toBeNull(); // NX fails because key exists
 
-          // Step 7: Server B registers its run using its claimId
+          // Server B registers its run using its claimId
           const runIdB = "run_server_B";
           const delayUntil = new Date(Date.now() + 60_000);
           const registered = await engine.debounceSystem.registerDebouncedRun({
@@ -2157,10 +2148,10 @@ describe("RunEngine debounce", () => {
             claimId: debounceResult.claimId,
           });
 
-          // Step 8: Verify Server B's registration succeeded
+          // Verify Server B's registration succeeded
           expect(registered).toBe(true);
 
-          // Step 9: Verify Redis contains Server B's run ID
+          // Verify Redis contains Server B's run ID
           const finalValue = await simulatedServerRedis.get(redisKey);
           expect(finalValue).toBe(runIdB);
         }
@@ -2497,5 +2488,693 @@ describe("RunEngine debounce", () => {
       }
     }
   );
-});
 
+  containerTest(
+    "Debounce fast-path: subsequent triggers within the same quantization bucket skip the lock",
+    async ({ prisma, redisOptions }) => {
+      const authenticatedEnvironment = await setupAuthenticatedEnvironment(prisma, "PRODUCTION");
+
+      const engine = new RunEngine({
+        prisma,
+        worker: {
+          redis: redisOptions,
+          workers: 1,
+          tasksPerWorker: 10,
+          pollIntervalMs: 100,
+        },
+        queue: {
+          redis: redisOptions,
+        },
+        runLock: {
+          redis: redisOptions,
+        },
+        machines: {
+          defaultMachine: "small-1x",
+          machines: {
+            "small-1x": {
+              name: "small-1x" as const,
+              cpu: 0.5,
+              memory: 0.5,
+              centsPerMs: 0.0001,
+            },
+          },
+          baseCostInCents: 0.0001,
+        },
+        debounce: {
+          maxDebounceDurationMs: 60_000,
+          // Wide bucket so the second trigger is guaranteed to land in the same one.
+          quantizeNewDelayUntilMs: 60_000,
+        },
+        tracer: trace.getTracer("test", "0.0.0"),
+      });
+
+      try {
+        const taskIdentifier = "test-task";
+
+        await setupBackgroundWorker(engine, authenticatedEnvironment, taskIdentifier);
+
+        const run1 = await engine.trigger(
+          {
+            number: 1,
+            friendlyId: "run_fp1",
+            environment: authenticatedEnvironment,
+            taskIdentifier,
+            payload: '{"data": "first"}',
+            payloadType: "application/json",
+            context: {},
+            traceContext: {},
+            traceId: "t_fp_1",
+            spanId: "s_fp_1",
+            workerQueue: "main",
+            queue: "task/test-task",
+            isTest: false,
+            tags: [],
+            delayUntil: new Date(Date.now() + 5000),
+            debounce: {
+              key: "fast-path-key",
+              delay: "5s",
+            },
+          },
+          prisma
+        );
+
+        const originalDelayUntil = run1.delayUntil;
+        assertNonNullable(originalDelayUntil);
+
+        // Update the delayUntil directly to a far-future value, simulating a
+        // previous trigger that already pushed the bucket forward. The next
+        // call's quantized newDelayUntil will land at-or-before this, so the
+        // fast-path should skip the lock and leave delayUntil untouched.
+        const farFuture = new Date(Date.now() + 10 * 60_000);
+        await prisma.taskRun.update({
+          where: { id: run1.id },
+          data: { delayUntil: farFuture },
+        });
+
+        const run2 = await engine.trigger(
+          {
+            number: 2,
+            friendlyId: "run_fp2",
+            environment: authenticatedEnvironment,
+            taskIdentifier,
+            payload: '{"data": "second"}',
+            payloadType: "application/json",
+            context: {},
+            traceContext: {},
+            traceId: "t_fp_2",
+            spanId: "s_fp_2",
+            workerQueue: "main",
+            queue: "task/test-task",
+            isTest: false,
+            tags: [],
+            delayUntil: new Date(Date.now() + 5000),
+            debounce: {
+              key: "fast-path-key",
+              delay: "5s",
+            },
+          },
+          prisma
+        );
+
+        expect(run2.id).toBe(run1.id);
+
+        const updatedRun = await prisma.taskRun.findFirst({
+          where: { id: run1.id },
+        });
+        assertNonNullable(updatedRun);
+        assertNonNullable(updatedRun.delayUntil);
+
+        // delayUntil must NOT have been bumped backward by the second trigger,
+        // proving we short-circuited before taking the lock or rescheduling.
+        expect(updatedRun.delayUntil.getTime()).toBe(farFuture.getTime());
+      } finally {
+        await engine.quit();
+      }
+    }
+  );
+
+  containerTest(
+    "Debounce fast-path: trailing mode with updateData still takes the lock",
+    async ({ prisma, redisOptions }) => {
+      const authenticatedEnvironment = await setupAuthenticatedEnvironment(prisma, "PRODUCTION");
+
+      const engine = new RunEngine({
+        prisma,
+        worker: {
+          redis: redisOptions,
+          workers: 1,
+          tasksPerWorker: 10,
+          pollIntervalMs: 100,
+        },
+        queue: {
+          redis: redisOptions,
+        },
+        runLock: {
+          redis: redisOptions,
+        },
+        machines: {
+          defaultMachine: "small-1x",
+          machines: {
+            "small-1x": {
+              name: "small-1x" as const,
+              cpu: 0.5,
+              memory: 0.5,
+              centsPerMs: 0.0001,
+            },
+          },
+          baseCostInCents: 0.0001,
+        },
+        debounce: {
+          maxDebounceDurationMs: 60_000,
+          quantizeNewDelayUntilMs: 60_000,
+        },
+        tracer: trace.getTracer("test", "0.0.0"),
+      });
+
+      try {
+        const taskIdentifier = "test-task";
+
+        await setupBackgroundWorker(engine, authenticatedEnvironment, taskIdentifier);
+
+        const run1 = await engine.trigger(
+          {
+            number: 1,
+            friendlyId: "run_trfp1",
+            environment: authenticatedEnvironment,
+            taskIdentifier,
+            payload: '{"data": "first"}',
+            payloadType: "application/json",
+            context: {},
+            traceContext: {},
+            traceId: "t_trfp_1",
+            spanId: "s_trfp_1",
+            workerQueue: "main",
+            queue: "task/test-task",
+            isTest: false,
+            tags: [],
+            delayUntil: new Date(Date.now() + 5000),
+            debounce: {
+              key: "trailing-fast-path-key",
+              delay: "5s",
+              mode: "trailing",
+            },
+          },
+          prisma
+        );
+
+        // Push delayUntil far forward so the fast-path *would* short-circuit
+        // for leading mode. Trailing-mode triggers with updateData must still
+        // take the lock so the data update is applied.
+        const farFuture = new Date(Date.now() + 10 * 60_000);
+        await prisma.taskRun.update({
+          where: { id: run1.id },
+          data: { delayUntil: farFuture },
+        });
+
+        const run2 = await engine.trigger(
+          {
+            number: 2,
+            friendlyId: "run_trfp2",
+            environment: authenticatedEnvironment,
+            taskIdentifier,
+            payload: '{"data": "second"}',
+            payloadType: "application/json",
+            context: {},
+            traceContext: {},
+            traceId: "t_trfp_2",
+            spanId: "s_trfp_2",
+            workerQueue: "main",
+            queue: "task/test-task",
+            isTest: false,
+            tags: [],
+            delayUntil: new Date(Date.now() + 5000),
+            debounce: {
+              key: "trailing-fast-path-key",
+              delay: "5s",
+              mode: "trailing",
+              updateData: {
+                payload: '{"data": "second"}',
+                payloadType: "application/json",
+              },
+            },
+          },
+          prisma
+        );
+
+        expect(run2.id).toBe(run1.id);
+
+        const updatedRun = await prisma.taskRun.findFirst({
+          where: { id: run1.id },
+        });
+        assertNonNullable(updatedRun);
+        // Trailing-mode update went through the lock and rewrote the payload.
+        expect(updatedRun.payload).toBe('{"data": "second"}');
+      } finally {
+        await engine.quit();
+      }
+    }
+  );
+
+  containerTest(
+    "Debounce: quantized newDelayUntil falls on a bucket boundary",
+    async ({ prisma, redisOptions }) => {
+      const authenticatedEnvironment = await setupAuthenticatedEnvironment(prisma, "PRODUCTION");
+
+      const engine = new RunEngine({
+        prisma,
+        worker: {
+          redis: redisOptions,
+          workers: 1,
+          tasksPerWorker: 10,
+          pollIntervalMs: 100,
+        },
+        queue: {
+          redis: redisOptions,
+        },
+        runLock: {
+          redis: redisOptions,
+        },
+        machines: {
+          defaultMachine: "small-1x",
+          machines: {
+            "small-1x": {
+              name: "small-1x" as const,
+              cpu: 0.5,
+              memory: 0.5,
+              centsPerMs: 0.0001,
+            },
+          },
+          baseCostInCents: 0.0001,
+        },
+        debounce: {
+          maxDebounceDurationMs: 60_000,
+          quantizeNewDelayUntilMs: 1000,
+        },
+        tracer: trace.getTracer("test", "0.0.0"),
+      });
+
+      try {
+        const taskIdentifier = "test-task";
+
+        await setupBackgroundWorker(engine, authenticatedEnvironment, taskIdentifier);
+
+        const run1 = await engine.trigger(
+          {
+            number: 1,
+            friendlyId: "run_q1",
+            environment: authenticatedEnvironment,
+            taskIdentifier,
+            payload: '{"data": "first"}',
+            payloadType: "application/json",
+            context: {},
+            traceContext: {},
+            traceId: "t_q_1",
+            spanId: "s_q_1",
+            workerQueue: "main",
+            queue: "task/test-task",
+            isTest: false,
+            tags: [],
+            delayUntil: new Date(Date.now() + 5000),
+            debounce: {
+              key: "quantize-key",
+              delay: "5s",
+            },
+          },
+          prisma
+        );
+
+        // Force a meaningfully-later bucket so the second trigger pushes
+        // delayUntil forward through the lock.
+        await prisma.taskRun.update({
+          where: { id: run1.id },
+          data: { delayUntil: new Date(Date.now() - 1000) },
+        });
+
+        await engine.trigger(
+          {
+            number: 2,
+            friendlyId: "run_q2",
+            environment: authenticatedEnvironment,
+            taskIdentifier,
+            payload: '{"data": "second"}',
+            payloadType: "application/json",
+            context: {},
+            traceContext: {},
+            traceId: "t_q_2",
+            spanId: "s_q_2",
+            workerQueue: "main",
+            queue: "task/test-task",
+            isTest: false,
+            tags: [],
+            delayUntil: new Date(Date.now() + 5000),
+            debounce: {
+              key: "quantize-key",
+              delay: "5s",
+            },
+          },
+          prisma
+        );
+
+        const updatedRun = await prisma.taskRun.findFirst({
+          where: { id: run1.id },
+        });
+        assertNonNullable(updatedRun);
+        assertNonNullable(updatedRun.delayUntil);
+
+        // The new delayUntil should be aligned to a 1s bucket boundary.
+        expect(updatedRun.delayUntil.getTime() % 1000).toBe(0);
+      } finally {
+        await engine.quit();
+      }
+    }
+  );
+
+  containerTest(
+    "Debounce: lock contention falls back to returning existing run",
+    async ({ prisma, redisOptions }) => {
+      const authenticatedEnvironment = await setupAuthenticatedEnvironment(prisma, "PRODUCTION");
+
+      const engine = new RunEngine({
+        prisma,
+        worker: {
+          redis: redisOptions,
+          workers: 1,
+          tasksPerWorker: 10,
+          pollIntervalMs: 100,
+        },
+        queue: {
+          redis: redisOptions,
+        },
+        runLock: {
+          redis: redisOptions,
+          // Force lock acquisition to fail almost immediately so we can
+          // exercise the contention safety net deterministically.
+          retryConfig: {
+            maxAttempts: 0,
+            baseDelay: 1,
+            maxDelay: 1,
+            maxTotalWaitTime: 1,
+          },
+          duration: 30_000,
+        },
+        machines: {
+          defaultMachine: "small-1x",
+          machines: {
+            "small-1x": {
+              name: "small-1x" as const,
+              cpu: 0.5,
+              memory: 0.5,
+              centsPerMs: 0.0001,
+            },
+          },
+          baseCostInCents: 0.0001,
+        },
+        debounce: {
+          maxDebounceDurationMs: 60_000,
+          // Disable fast-path so the request is forced through the lock and
+          // we can prove the contention fallback handles 5xx prevention.
+          fastPathSkipEnabled: false,
+          quantizeNewDelayUntilMs: 0,
+        },
+        tracer: trace.getTracer("test", "0.0.0"),
+      });
+
+      try {
+        const taskIdentifier = "test-task";
+
+        await setupBackgroundWorker(engine, authenticatedEnvironment, taskIdentifier);
+
+        const run1 = await engine.trigger(
+          {
+            number: 1,
+            friendlyId: "run_lc1",
+            environment: authenticatedEnvironment,
+            taskIdentifier,
+            payload: '{"data": "first"}',
+            payloadType: "application/json",
+            context: {},
+            traceContext: {},
+            traceId: "t_lc_1",
+            spanId: "s_lc_1",
+            workerQueue: "main",
+            queue: "task/test-task",
+            isTest: false,
+            tags: [],
+            delayUntil: new Date(Date.now() + 5000),
+            debounce: {
+              key: "contention-key",
+              delay: "5s",
+            },
+          },
+          prisma
+        );
+
+        // Hold the underlying redlock key from a separate Redis connection so
+        // the engine's runLock cannot acquire it. Since we configured
+        // `retryConfig.maxAttempts: 0` and `maxTotalWaitTime: 1`, the second
+        // trigger should hit the contention fallback rather than bubble a 5xx.
+        // Note: the prefix template here intentionally matches what the engine
+        // builds at index.ts:120 (no `?? ""` fallback) so that the keys line up
+        // even when redisOptions.keyPrefix is undefined.
+        const blockingRedis = createRedisClient({
+          ...redisOptions,
+          keyPrefix: `${redisOptions.keyPrefix}runlock:`,
+        });
+
+        const originalDelayUntil = run1.delayUntil;
+        assertNonNullable(originalDelayUntil);
+
+        try {
+          const blockResult = await blockingRedis.set(run1.id, "test-blocker", "PX", 30_000, "NX");
+          expect(blockResult).toBe("OK");
+
+          const run2 = await engine.trigger(
+            {
+              number: 2,
+              friendlyId: "run_lc2",
+              environment: authenticatedEnvironment,
+              taskIdentifier,
+              payload: '{"data": "second"}',
+              payloadType: "application/json",
+              context: {},
+              traceContext: {},
+              traceId: "t_lc_2",
+              spanId: "s_lc_2",
+              workerQueue: "main",
+              queue: "task/test-task",
+              isTest: false,
+              tags: [],
+              delayUntil: new Date(Date.now() + 5000),
+              debounce: {
+                key: "contention-key",
+                delay: "5s",
+              },
+            },
+            prisma
+          );
+
+          // We did NOT 5xx; we returned the existing run.
+          expect(run2.id).toBe(run1.id);
+
+          // Prove the fallback actually ran rather than the lock being acquired
+          // normally: the second trigger could not push delayUntil forward
+          // because rescheduling is skipped on contention.
+          const updatedRun = await prisma.taskRun.findFirst({
+            where: { id: run1.id },
+          });
+          assertNonNullable(updatedRun);
+          assertNonNullable(updatedRun.delayUntil);
+          expect(updatedRun.delayUntil.getTime()).toBe(originalDelayUntil.getTime());
+        } finally {
+          await blockingRedis.del(run1.id);
+          await blockingRedis.quit();
+        }
+      } finally {
+        await engine.quit();
+      }
+    }
+  );
+
+  // Reproduces the hot-key contention from TRI-8758: fires N concurrent
+  // triggers on the same debounce key after the run is already DELAYED.
+  //
+  // - fixed=true: fast-path skip + 1s quantization on. The herd collapses on
+  //   the unlocked read and onto the same quantized newDelayUntil, so almost
+  //   every call short-circuits and `taskRun.update` is barely written.
+  // - fixed=false: fast-path off and quantization off (closer to the
+  //   pre-fix behaviour). The lock-contention fallback (also part of this
+  //   PR) still catches herd lock failures; this case validates that even
+  //   without the fast-path the system stays correct under stress, just at
+  //   higher Redlock cost.
+  for (const fixed of [true, false]) {
+    containerTest(
+      `Debounce hot-key stress (fixed=${fixed}): N concurrent triggers stay correct`,
+      async ({ prisma, redisOptions }) => {
+        const authenticatedEnvironment = await setupAuthenticatedEnvironment(prisma, "PRODUCTION");
+
+        const engine = new RunEngine({
+          prisma,
+          worker: {
+            redis: redisOptions,
+            workers: 1,
+            tasksPerWorker: 10,
+            pollIntervalMs: 100,
+          },
+          queue: {
+            redis: redisOptions,
+          },
+          runLock: {
+            redis: redisOptions,
+          },
+          machines: {
+            defaultMachine: "small-1x",
+            machines: {
+              "small-1x": {
+                name: "small-1x" as const,
+                cpu: 0.5,
+                memory: 0.5,
+                centsPerMs: 0.0001,
+              },
+            },
+            baseCostInCents: 0.0001,
+          },
+          debounce: {
+            maxDebounceDurationMs: 10 * 60_000,
+            fastPathSkipEnabled: fixed,
+            // 1s buckets - same as the real default - or 0 to mimic the
+            // pre-fix behaviour where every concurrent trigger has a slightly
+            // larger newDelayUntil than the last.
+            quantizeNewDelayUntilMs: fixed ? 1000 : 0,
+          },
+          tracer: trace.getTracer("test", "0.0.0"),
+        });
+
+        try {
+          const taskIdentifier = "test-task";
+          await setupBackgroundWorker(engine, authenticatedEnvironment, taskIdentifier);
+
+          // Seed the debounce key with an initial run, then push delayUntil far
+          // forward so the herd lands well inside the existing window.
+          const seed = await engine.trigger(
+            {
+              number: 0,
+              friendlyId: "run_stress0",
+              environment: authenticatedEnvironment,
+              taskIdentifier,
+              payload: '{"data": "seed"}',
+              payloadType: "application/json",
+              context: {},
+              traceContext: {},
+              traceId: "t_stress_seed",
+              spanId: "s_stress_seed",
+              workerQueue: "main",
+              queue: "task/test-task",
+              isTest: false,
+              tags: [],
+              delayUntil: new Date(Date.now() + 30_000),
+              debounce: {
+                key: "stress-key",
+                delay: "30s",
+              },
+            },
+            prisma
+          );
+
+          // Move delayUntil to a small but safe future offset. The herd's
+          // newDelayUntil (now + 30s) will be meaningfully later than the
+          // current value, so the fast-path-off branch reschedules. The
+          // ~2s buffer keeps the run DELAYED long enough to absorb startup
+          // jitter before the first trigger writes delayUntil = now + 30s.
+          await prisma.taskRun.update({
+            where: { id: seed.id },
+            data: { delayUntil: new Date(Date.now() + 2_000) },
+          });
+
+          // Subscribe to `runDelayRescheduled` so we can count how many times
+          // the herd actually pushed `delayUntil` forward. Each event corresponds
+          // to a successful reschedule under the lock - the fast-path/contention
+          // fallback paths skip the reschedule entirely. We use the engine's
+          // public eventBus, which is the same observable interface other tests
+          // in this repo (ttl, trigger, cancelling, waitpoints) use.
+          let rescheduleCount = 0;
+          engine.eventBus.on("runDelayRescheduled", () => {
+            rescheduleCount++;
+          });
+
+          const N = 40;
+          const triggers = Array.from({ length: N }, (_, i) =>
+            engine.trigger(
+              {
+                number: i + 1,
+                friendlyId: `run_stress${i + 1}`,
+                environment: authenticatedEnvironment,
+                taskIdentifier,
+                payload: `{"data": "stress-${i}"}`,
+                payloadType: "application/json",
+                context: {},
+                traceContext: {},
+                traceId: `t_stress_${i}`,
+                spanId: `s_stress_${i}`,
+                workerQueue: "main",
+                queue: "task/test-task",
+                isTest: false,
+                tags: [],
+                delayUntil: new Date(Date.now() + 30_000),
+                debounce: {
+                  key: "stress-key",
+                  delay: "30s",
+                },
+              },
+              prisma
+            )
+          );
+
+          const start = performance.now();
+          const settled = await Promise.allSettled(triggers);
+          const durationMs = performance.now() - start;
+
+          const fulfilled = settled.filter(
+            (r): r is PromiseFulfilledResult<{ id: string }> => r.status === "fulfilled"
+          );
+          const rejected = settled.filter((r) => r.status === "rejected");
+
+          // No 5xx feedback loop: every concurrent trigger succeeds and
+          // returns the existing run id.
+          expect(rejected).toHaveLength(0);
+          expect(fulfilled).toHaveLength(N);
+          for (const r of fulfilled) {
+            expect(r.value.id).toBe(seed.id);
+          }
+
+          // Only one row, regardless of contention path.
+          const runs = await prisma.taskRun.findMany({
+            where: { taskIdentifier, runtimeEnvironmentId: authenticatedEnvironment.id },
+          });
+          expect(runs.length).toBe(1);
+
+          // Wait briefly for any in-flight reschedule events to flush before
+          // asserting on the count. EventBus emit is synchronous here but
+          // settle a microtask just to be safe.
+          await new Promise((resolve) => setImmediate(resolve));
+
+          console.log(
+            `[stress fixed=${fixed}] N=${N} duration=${durationMs.toFixed(
+              0
+            )}ms reschedules=${rescheduleCount}`
+          );
+
+          if (fixed) {
+            // With fast-path + quantization: the herd collapses onto the
+            // same quantized newDelayUntil. Trigger #1 takes the lock and
+            // pushes delayUntil; every subsequent trigger sees a covering
+            // delayUntil on the unlocked read and short-circuits without
+            // emitting a reschedule. So at most one reschedule fires.
+            expect(rescheduleCount).toBeLessThanOrEqual(1);
+          }
+        } finally {
+          await engine.quit();
+        }
+      }
+    );
+  }
+});

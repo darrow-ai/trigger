@@ -2,11 +2,11 @@ import { containerTest } from "@internal/testcontainers";
 import { trace } from "@internal/tracing";
 import { generateFriendlyId } from "@trigger.dev/core/v3/isomorphic";
 import { RunEngine } from "../index.js";
-import { PrismaClientOrTransaction } from "@trigger.dev/database";
-import { MinimalAuthenticatedEnvironment } from "../../shared/index.js";
+import type { PrismaClientOrTransaction } from "@trigger.dev/database";
+import type { MinimalAuthenticatedEnvironment } from "../../shared/index.js";
 import { setTimeout } from "timers/promises";
 import { setupAuthenticatedEnvironment, setupBackgroundWorker } from "./setup.js";
-import { DequeuedMessage } from "@trigger.dev/core/v3";
+import type { DequeuedMessage } from "@trigger.dev/core/v3";
 
 vi.setConfig({ testTimeout: 60_000 });
 
@@ -20,6 +20,7 @@ describe("RunEngine priority", () => {
       const engine = new RunEngine({
         prisma,
         worker: {
+          disabled: true,
           redis: redisOptions,
           workers: 1,
           tasksPerWorker: 10,
@@ -52,7 +53,7 @@ describe("RunEngine priority", () => {
         const taskIdentifier = "test-task";
 
         //create background worker
-        const backgroundWorker = await setupBackgroundWorker(
+        const _backgroundWorker = await setupBackgroundWorker(
           engine,
           authenticatedEnvironment,
           taskIdentifier
@@ -129,6 +130,7 @@ describe("RunEngine priority", () => {
       const engine = new RunEngine({
         prisma,
         worker: {
+          disabled: true,
           redis: redisOptions,
           workers: 1,
           tasksPerWorker: 10,
@@ -159,7 +161,7 @@ describe("RunEngine priority", () => {
         const taskIdentifier = "test-task";
 
         //create background worker
-        const backgroundWorker = await setupBackgroundWorker(
+        const _backgroundWorker = await setupBackgroundWorker(
           engine,
           authenticatedEnvironment,
           taskIdentifier

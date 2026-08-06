@@ -7,16 +7,14 @@ import NodeVersions from "/snippets/node-versions.mdx";
 import MigrateV4UsingAi from "/snippets/migrate-v4-using-ai.mdx";
 
 <Warning>
-  **Action required: Trigger.dev v3 deprecation**
+  **Trigger.dev v3 has been retired**
 
-We're retiring Trigger.dev v3. **New v3 deploys will stop working from 1 April 2026.** Trigger.dev v4 is stable, fully supported, and recommended for all users.
+Trigger.dev v3 is end of life. v4 is stable, fully supported, and recommended for all users.
 
-**Key dates:**
+- On Trigger.dev Cloud, v3 has been shut down: v3 triggers and deploys no longer run.
+- If you self-host, 4.5.0 is the last version we officially support for running v3. Stay on 4.5.0 or upgrade to v4; 4.5.1 and later reject v3 triggers, batch triggers, and deploys with an upgrade message.
 
-- **1 April 2026** — New v3 deploys will no longer work. Existing v3 runs will continue to execute.
-- **1 July 2026** — v3 will be fully shut down. All v3 runs will stop executing.
-
-**What you need to do:** Migrate to v4 before April to avoid disruption to your task executions. The migration takes about 2 minutes — follow the steps on this page below. If you have questions or need help, [contact us](https://trigger.dev/contact) or reach out in our [Discord](https://trigger.dev/discord).
+**What you need to do:** Migrate to v4. The migration takes about 2 minutes; follow the steps below. If you have questions or need help, [contact us](https://trigger.dev/contact) or reach out in our [Discord](https://trigger.dev/discord).
 
 </Warning>
 
@@ -34,7 +32,7 @@ We're retiring Trigger.dev v3. **New v3 deploys will stop working from 1 April 2
 | [Hidden tasks](/hidden-tasks)                                        | Create tasks that are not exported from your trigger files but can still be executed.                                                                                                                      |
 | [Middleware & locals](#middleware-and-locals)                        | The middleware system runs at the top level, executing before and after all lifecycle hooks. The locals API allows sharing data between middleware and hooks.                                              |
 | [useWaitToken](/realtime/react-hooks/use-wait-token)                 | Use the useWaitToken hook to complete a wait token from a React component.                                                                                                                                 |
-| [ai.tool](/tasks/schemaTask#ai-tool)                                 | Create an AI tool from an existing `schemaTask` to use with the Vercel [AI SDK](https://vercel.com/docs/ai-sdk).                                                                                           |
+| [Task-backed AI tools](/tasks/schemaTask#task-backed-ai-tools)       | Use `schemaTask` with AI SDK `tool()` and `ai.toolExecute()` (legacy `ai.tool` is deprecated).                                                                                                              |
 
 ## Node.js support
 
@@ -165,7 +163,7 @@ export const myAiTask = schemaTask({
 });
 ```
 
-We've replaced the `toolTask` function with the `ai.tool` function, which creates an AI tool from an existing `schemaTask`. See the [ai.tool](/tasks/schemaTask#ai-tool) page for more details.
+We've replaced the `toolTask` function with `schemaTask` plus AI SDK `tool()` and `ai.toolExecute()` (the older `ai.tool()` wrapper is deprecated). See [Task-backed AI tools](/tasks/schemaTask#task-backed-ai-tools).
 
 ## Breaking changes
 

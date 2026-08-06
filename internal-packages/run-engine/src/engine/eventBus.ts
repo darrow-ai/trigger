@@ -1,17 +1,20 @@
-import { FlushedRunMetadata, TaskRunError } from "@trigger.dev/core/v3";
-import {
-  RuntimeEnvironmentType,
-  TaskRunExecutionStatus,
-  TaskRunStatus,
-} from "@trigger.dev/database";
-import { EventEmitter } from "events";
-import { AuthenticatedEnvironment } from "../shared/index.js";
+import type { FlushedRunMetadata, TaskRunError } from "@trigger.dev/core/v3";
+import type { TaskRunExecutionStatus, TaskRunStatus } from "@trigger.dev/database";
+import type { EventEmitter } from "events";
+import type { AuthenticatedEnvironment } from "../shared/index.js";
 
 export type EventBusEvents = {
   runCreated: [
     {
       time: Date;
-      runId: string;
+      run: {
+        id: string;
+        runTags: string[];
+        batchId: string | null;
+      };
+      environment: {
+        id: string;
+      };
     },
   ];
   runEnqueuedAfterDelay: [
@@ -23,6 +26,8 @@ export type EventBusEvents = {
         queuedAt: Date;
         updatedAt: Date;
         createdAt: Date;
+        runTags: string[];
+        batchId: string | null;
       };
       organization: {
         id: string;
@@ -44,6 +49,8 @@ export type EventBusEvents = {
         delayUntil: Date;
         updatedAt: Date;
         createdAt: Date;
+        runTags: string[];
+        batchId: string | null;
       };
       organization: {
         id: string;
@@ -76,6 +83,8 @@ export type EventBusEvents = {
         maxDurationInSeconds?: number;
         maxAttempts?: number;
         createdAt: Date;
+        runTags: string[];
+        batchId: string | null;
       };
       organization: {
         id: string;
@@ -96,6 +105,8 @@ export type EventBusEvents = {
         status: TaskRunStatus;
         updatedAt: Date;
         createdAt: Date;
+        runTags: string[];
+        batchId: string | null;
       };
       organization: {
         id?: string;
@@ -119,6 +130,8 @@ export type EventBusEvents = {
         attemptNumber: number;
         baseCostInCents: number;
         executedAt: Date | undefined;
+        runTags: string[];
+        batchId: string | null;
       };
       organization: {
         id: string;
@@ -245,6 +258,8 @@ export type EventBusEvents = {
         createdAt: Date;
         error: TaskRunError;
         taskEventStore?: string;
+        runTags: string[];
+        batchId: string | null;
       };
       organization: {
         id: string;

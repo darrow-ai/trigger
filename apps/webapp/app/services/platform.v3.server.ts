@@ -1,5 +1,5 @@
 import { MachinePresetName, tryCatch } from "@trigger.dev/core/v3";
-import type { Organization, Project, RuntimeEnvironmentType } from "@trigger.dev/database";
+import type { RuntimeEnvironmentType } from "@trigger.dev/database";
 import {
   BillingClient,
   defaultMachine as defaultMachineFromPlatform,
@@ -11,13 +11,25 @@ import {
   type PrivateLinkConnection,
   type PrivateLinkConnectionList,
   type PrivateLinkRegionsResult,
-  type ReportUsageResult,
   type SetPlanBody,
   type UpdateBillingAlertsRequest,
   type UsageResult,
   type UsageSeriesParams,
   type CurrentPlan,
 } from "@trigger.dev/platform";
+import {
+  BillingLimitResultSchema,
+  BillingLimitsActiveResultSchema,
+  BillingLimitsPendingResolvesResultSchema,
+  EntitlementResultSchema,
+  asPlatformSchema,
+  type BillingLimitResult,
+  type BillingLimitsActiveResult,
+  type BillingLimitsPendingResolvesResult,
+  type EntitlementResult,
+  type ResolveBillingLimitRequest,
+  type UpdateBillingLimitRequest,
+} from "~/services/billingLimit.schemas";
 import { createCache, DefaultStatefulContext, Namespace } from "@unkey/cache";
 import { createLRUMemoryStore } from "@internal/cache";
 import { existsSync, readFileSync } from "node:fs";
@@ -25,12 +37,12 @@ import { redirect } from "remix-typedjson";
 import { z } from "zod";
 import { env } from "~/env.server";
 import { redirectWithErrorMessage, redirectWithSuccessMessage } from "~/models/message.server";
-import { createEnvironment } from "~/models/organization.server";
 import { logger } from "~/services/logger.server";
 import { newProjectPath, organizationBillingPath } from "~/utils/pathBuilder";
 import { singleton } from "~/utils/singleton";
 import { RedisCacheStore } from "./unkey/redisCacheStore.server";
 import { $replica } from "~/db.server";
+import { metrics } from "@opentelemetry/api";
 
 function initializeClient() {
   if (isCloud() && process.env.BILLING_API_URL && process.env.BILLING_API_KEY) {
@@ -43,6 +55,104 @@ function initializeClient() {
 }
 
 const client = singleton("billingClient", initializeClient);
+
+/**
+ * `true` when the billing client was instantiated — i.e. we're running
+ * in a cloud-style install with `BILLING_API_URL` + `BILLING_API_KEY`
+ * configured. OSS / self-hosted installs return `false` here, which
+ * lets callers distinguish "no billing wired up, fall back to
+ * defaults" from "billing wired up but the call failed, retry."
+ */
+export function isBillingConfigured(): boolean {
+  return client !== undefined;
+}
+// Failures from @trigger.dev/platform billing client calls are tracked via
+// this metric (with low-cardinality {function, kind} labels) rather than
+// logged. Every task invocation hits these paths, so per-call logs were too
+// noisy; dashboard the counter for visibility instead.
+const platformClientMeter = metrics.getMeter("trigger.dev/platform-client");
+const platformClientFailuresCounter = platformClientMeter.createCounter(
+  "platform_client.failures_total",
+  {
+    description: "Failures returned or thrown by @trigger.dev/platform billing client calls",
+  }
+);
+
+function recordPlatformFailure(fn: string, kind: "caught" | "no_success") {
+  platformClientFailuresCounter.add(1, { function: fn, kind });
+}
+
+export type ValidatedPromoCode = {
+  valid: boolean;
+  amountInCents?: number;
+  expiresAt?: string | null;
+};
+
+/**
+ * Validate a promo code (no org context). Returns `undefined` when billing
+ * isn't configured or the call fails, so callers fall back to treating the
+ * code as not-yet-validated rather than crashing the page.
+ */
+export async function validatePromoCode(code: string): Promise<ValidatedPromoCode | undefined> {
+  if (!client) {
+    return undefined;
+  }
+
+  const [error, result] = await tryCatch(client.validatePromoCode(code));
+  if (error) {
+    recordPlatformFailure("validatePromoCode", "caught");
+    logger.error("validatePromoCode threw", { error });
+    return undefined;
+  }
+  if (!result.success) {
+    recordPlatformFailure("validatePromoCode", "no_success");
+    return undefined;
+  }
+
+  return {
+    valid: result.valid,
+    amountInCents: result.amountInCents,
+    expiresAt: result.expiresAt,
+  };
+}
+
+export type AppliedPromoCode = {
+  applied: boolean;
+  amountInCents?: number;
+  reason?: string;
+};
+
+/**
+ * Apply a promo code to a newly created org. Returns `undefined` when billing
+ * isn't configured or the call fails — callers treat that as "not applied" and
+ * must never block org creation on it.
+ */
+export async function applyPromoCode(
+  orgId: string,
+  userId: string,
+  code: string
+): Promise<AppliedPromoCode | undefined> {
+  if (!client) {
+    return undefined;
+  }
+
+  const [error, result] = await tryCatch(client.applyPromoCode(orgId, { code, userId }));
+  if (error) {
+    recordPlatformFailure("applyPromoCode", "caught");
+    logger.error("applyPromoCode threw", { error });
+    return undefined;
+  }
+  if (!result.success) {
+    recordPlatformFailure("applyPromoCode", "no_success");
+    return undefined;
+  }
+
+  return {
+    applied: result.applied,
+    amountInCents: result.amountInCents,
+    reason: result.reason,
+  };
+}
 
 function initializePlatformCache() {
   const ctx = new DefaultStatefulContext();
@@ -71,12 +181,58 @@ function initializePlatformCache() {
       fresh: 60_000 * 5, // 5 minutes
       stale: 60_000 * 10, // 10 minutes
     }),
+    entitlement: new Namespace<EntitlementResult>(ctx, {
+      stores: [memory, redisCacheStore],
+      fresh: 60_000, // serve without revalidation for 60s
+      stale: 120_000, // total TTL — fresh 0-60s, stale-revalidate 60-120s
+    }),
+    billingLimit: new Namespace<BillingLimitResult>(ctx, {
+      stores: [memory, redisCacheStore],
+      fresh: 60_000,
+      stale: 120_000,
+    }),
+    promoCredits: new Namespace<PromoCreditsData | null>(ctx, {
+      stores: [memory, redisCacheStore],
+      fresh: 60_000,
+      stale: 120_000,
+    }),
+    ssoEntitlement: new Namespace<boolean>(ctx, {
+      stores: [memory, redisCacheStore],
+      fresh: 60_000,
+      stale: 120_000,
+    }),
   });
 
   return cache;
 }
 
 const platformCache = singleton("platformCache", initializePlatformCache);
+
+function invalidateBillingLimitCaches(organizationId: string) {
+  platformCache.billingLimit.remove(organizationId).catch(() => {});
+  platformCache.entitlement.remove(organizationId).catch(() => {});
+  platformCache.ssoEntitlement.remove(organizationId).catch(() => {});
+}
+
+export function bustBillingLimitCaches(organizationId: string) {
+  invalidateBillingLimitCaches(organizationId);
+}
+
+/**
+ * Clears the caches whose value is derived from the org's plan. Call after a
+ * plan change — a downgrade can revoke SSO, and serving the previous decision
+ * for the stale TTL would keep a surface open that the new plan doesn't allow.
+ */
+function invalidatePlanDerivedCaches(organizationId: string) {
+  platformCache.entitlement.remove(organizationId).catch(() => {});
+  platformCache.ssoEntitlement.remove(organizationId).catch(() => {});
+}
+
+// Clear the cached promo-credits read so a just-granted code shows on the usage
+// page immediately rather than after the stale TTL.
+export function bustPromoCreditsCache(organizationId: string) {
+  platformCache.promoCredits.remove(organizationId).catch(() => {});
+}
 
 type Machines = typeof machinesFromPlatform;
 
@@ -201,7 +357,7 @@ export async function getCurrentPlan(orgId: string) {
     firstDayOfNextMonth.setUTCHours(0, 0, 0, 0);
 
     if (!result.success) {
-      logger.error("Error getting current plan - no success", { orgId, error: result.error });
+      recordPlatformFailure("getCurrentPlan", "no_success");
       return undefined;
     }
 
@@ -216,10 +372,34 @@ export async function getCurrentPlan(orgId: string) {
     };
 
     return { ...result, usage };
-  } catch (e) {
-    logger.error("Error getting current plan - caught error", { orgId, error: e });
+  } catch (_e) {
+    recordPlatformFailure("getCurrentPlan", "caught");
     return undefined;
   }
+}
+
+export type SelfServePurchaseBlockReason = "plan_unavailable" | "managed_billing";
+
+/**
+ * When cloud billing is configured, self-serve purchase endpoints must fail closed
+ * if the current plan can't be loaded or the org is on managed billing.
+ */
+export function getSelfServePurchaseBlockReason(
+  currentPlan: Awaited<ReturnType<typeof getCurrentPlan>>
+): SelfServePurchaseBlockReason | undefined {
+  if (!isBillingConfigured()) {
+    return undefined;
+  }
+
+  if (!currentPlan) {
+    return "plan_unavailable";
+  }
+
+  if (currentPlan.v3Subscription?.showSelfServe === false) {
+    return "managed_billing";
+  }
+
+  return undefined;
 }
 
 export async function getLimits(orgId: string) {
@@ -228,13 +408,13 @@ export async function getLimits(orgId: string) {
   try {
     const result = await client.currentPlan(orgId);
     if (!result.success) {
-      logger.error("Error getting limits - no success", { orgId, error: result.error });
+      recordPlatformFailure("getLimits", "no_success");
       return undefined;
     }
 
     return result.v3Subscription?.plan?.limits;
-  } catch (e) {
-    logger.error("Error getting limits - caught error", { orgId, error: e });
+  } catch (_e) {
+    recordPlatformFailure("getLimits", "caught");
     return undefined;
   }
 }
@@ -309,8 +489,8 @@ export async function customerPortalUrl(orgId: string, orgSlug: string) {
     return client.createPortalSession(orgId, {
       returnUrl: `${env.APP_ORIGIN}${organizationBillingPath({ slug: orgSlug })}`,
     });
-  } catch (e) {
-    logger.error("Error getting customer portal Url", { orgId, error: e });
+  } catch (_e) {
+    recordPlatformFailure("customerPortalUrl", "caught");
     return undefined;
   }
 }
@@ -321,12 +501,12 @@ export async function getPlans() {
   try {
     const result = await client.plans();
     if (!result.success) {
-      logger.error("Error getting plans - no success", { error: result.error });
+      recordPlatformFailure("getPlans", "no_success");
       return undefined;
     }
     return result;
-  } catch (e) {
-    logger.error("Error getting plans - caught error", { error: e });
+  } catch (_e) {
+    recordPlatformFailure("getPlans", "caught");
     return undefined;
   }
 }
@@ -336,7 +516,15 @@ export async function setPlan(
   request: Request,
   callerPath: string,
   plan: SetPlanBody,
-  opts?: { invalidateBillingCache?: (orgId: string) => void }
+  opts?: {
+    invalidateBillingCache?: (orgId: string) => void;
+    // Runs only after the Free plan has actually been provisioned, with the
+    // redirect it will return — the single success path where side effects that
+    // depend on a working free-plan entitlement (e.g. redeeming a promo code)
+    // are safe. It never fires on an error path, so callers can't act on a
+    // plan change that didn't happen.
+    onFreePlanProvisioned?: (response: Response) => void | Promise<void>;
+  }
 ) {
   if (!client) {
     return redirectWithErrorMessage(callerPath, request, "Error setting plan", {
@@ -361,22 +549,14 @@ export async function setPlan(
   }
 
   switch (result.action) {
-    case "free_connect_required": {
-      return redirect(result.connectUrl);
-    }
+    case "free_connect_required":
     case "free_connected": {
-      if (result.accepted) {
-        // Invalidate billing cache since plan changed
-        opts?.invalidateBillingCache?.(organization.id);
-        return redirect(newProjectPath(organization, "You're on the Free plan."));
-      } else {
-        return redirectWithErrorMessage(
-          callerPath,
-          request,
-          "Free tier unlock failed, your GitHub account is too new.",
-          { ephemeral: false }
-        );
-      }
+      // Selecting Free provisions the plan directly, so any free result is a success.
+      opts?.invalidateBillingCache?.(organization.id);
+      invalidatePlanDerivedCaches(organization.id);
+      const response = redirect(newProjectPath(organization, "You're on the Free plan."));
+      await opts?.onFreePlanProvisioned?.(response);
+      return response;
     }
     case "create_subscription_flow_start": {
       return redirect(result.checkoutUrl);
@@ -384,14 +564,22 @@ export async function setPlan(
     case "updated_subscription": {
       // Invalidate billing cache since subscription changed
       opts?.invalidateBillingCache?.(organization.id);
+      invalidatePlanDerivedCaches(organization.id);
       return redirectWithSuccessMessage(callerPath, request, "Subscription updated successfully.");
     }
     case "canceled_subscription": {
       // Invalidate billing cache since subscription was canceled
       opts?.invalidateBillingCache?.(organization.id);
+      invalidatePlanDerivedCaches(organization.id);
       return redirectWithSuccessMessage(callerPath, request, "Subscription canceled.");
     }
   }
+
+  // Unrecognised action shape — surface an error rather than falling through to
+  // an implicit undefined return, so callers always get a Response back.
+  return redirectWithErrorMessage(callerPath, request, "Error setting plan", {
+    ephemeral: false,
+  });
 }
 
 export async function setConcurrencyAddOn(organizationId: string, amount: number) {
@@ -400,12 +588,12 @@ export async function setConcurrencyAddOn(organizationId: string, amount: number
   try {
     const result = await client.setAddOn(organizationId, { type: "concurrency", amount });
     if (!result.success) {
-      logger.error("Error setting concurrency add on - no success", { error: result.error });
+      recordPlatformFailure("setConcurrencyAddOn", "no_success");
       return undefined;
     }
     return result;
-  } catch (e) {
-    logger.error("Error setting concurrency add on - caught error", { error: e });
+  } catch (_e) {
+    recordPlatformFailure("setConcurrencyAddOn", "caught");
     return undefined;
   }
 }
@@ -416,12 +604,12 @@ export async function setSeatsAddOn(organizationId: string, amount: number) {
   try {
     const result = await client.setAddOn(organizationId, { type: "seats", amount });
     if (!result.success) {
-      logger.error("Error setting seats add on - no success", { error: result.error });
+      recordPlatformFailure("setSeatsAddOn", "no_success");
       return undefined;
     }
     return result;
-  } catch (e) {
-    logger.error("Error setting seats add on - caught error", { error: e });
+  } catch (_e) {
+    recordPlatformFailure("setSeatsAddOn", "caught");
     return undefined;
   }
 }
@@ -432,12 +620,28 @@ export async function setBranchesAddOn(organizationId: string, amount: number) {
   try {
     const result = await client.setAddOn(organizationId, { type: "branches", amount });
     if (!result.success) {
-      logger.error("Error setting branches add on - no success", { error: result.error });
+      recordPlatformFailure("setBranchesAddOn", "no_success");
       return undefined;
     }
     return result;
-  } catch (e) {
-    logger.error("Error setting branches add on - caught error", { error: e });
+  } catch (_e) {
+    recordPlatformFailure("setBranchesAddOn", "caught");
+    return undefined;
+  }
+}
+
+export async function setSchedulesAddOn(organizationId: string, amount: number) {
+  if (!client) return undefined;
+
+  try {
+    const result = await client.setAddOn(organizationId, { type: "schedules", amount });
+    if (!result.success) {
+      recordPlatformFailure("setSchedulesAddOn", "no_success");
+      return undefined;
+    }
+    return result;
+  } catch (_e) {
+    recordPlatformFailure("setSchedulesAddOn", "caught");
     return undefined;
   }
 }
@@ -448,12 +652,12 @@ export async function getUsage(organizationId: string, { from, to }: { from: Dat
   try {
     const result = await client.usage(organizationId, { from, to });
     if (!result.success) {
-      logger.error("Error getting usage - no success", { error: result.error });
+      recordPlatformFailure("getUsage", "no_success");
       return undefined;
     }
     return result;
-  } catch (e) {
-    logger.error("Error getting usage - caught error", { error: e });
+  } catch (_e) {
+    recordPlatformFailure("getUsage", "caught");
     return undefined;
   }
 }
@@ -464,16 +668,21 @@ export async function getCachedUsage(
 ) {
   if (!client) return undefined;
 
-  const result = await platformCache.usage.swr(
-    `${organizationId}:${from.toISOString()}:${to.toISOString()}`,
-    async () => {
-      const usageResponse = await getUsage(organizationId, { from, to });
+  try {
+    const result = await platformCache.usage.swr(
+      `${organizationId}:${from.toISOString()}:${to.toISOString()}`,
+      async () => {
+        const usageResponse = await getUsage(organizationId, { from, to });
 
-      return usageResponse;
-    }
-  );
+        return usageResponse;
+      }
+    );
 
-  return result.val;
+    return result.val;
+  } catch (_e) {
+    recordPlatformFailure("getCachedUsage", "caught");
+    return undefined;
+  }
 }
 
 export async function getUsageSeries(organizationId: string, params: UsageSeriesParams) {
@@ -482,12 +691,12 @@ export async function getUsageSeries(organizationId: string, params: UsageSeries
   try {
     const result = await client.usageSeries(organizationId, params);
     if (!result.success) {
-      logger.error("Error getting usage series - no success", { error: result.error });
+      recordPlatformFailure("getUsageSeries", "no_success");
       return undefined;
     }
     return result;
-  } catch (e) {
-    logger.error("Error getting usage series - caught error", { error: e });
+  } catch (_e) {
+    recordPlatformFailure("getUsageSeries", "caught");
     return undefined;
   }
 }
@@ -506,12 +715,12 @@ export async function reportInvocationUsage(
       additionalData,
     });
     if (!result.success) {
-      logger.error("Error reporting invocation - no success", { error: result.error });
+      recordPlatformFailure("reportInvocationUsage", "no_success");
       return undefined;
     }
     return result;
-  } catch (e) {
-    logger.error("Error reporting invocation - caught error", { error: e });
+  } catch (_e) {
+    recordPlatformFailure("reportInvocationUsage", "caught");
     return undefined;
   }
 }
@@ -528,51 +737,279 @@ export async function reportComputeUsage(request: Request) {
 
 export async function getEntitlement(
   organizationId: string
-): Promise<ReportUsageResult | undefined> {
+): Promise<EntitlementResult | undefined> {
   if (!client) return undefined;
 
-  try {
-    const result = await client.getEntitlement(organizationId);
-    if (!result.success) {
-      logger.error("Error getting entitlement - no success", { error: result.error });
-      return {
-        hasAccess: true as const,
-      };
+  // Errors must be caught inside the loader — @unkey/cache passes the loader
+  // promise to waitUntil() with no .catch(), so an unhandled rejection during
+  // background SWR revalidation would crash the process. Returning undefined
+  // on error tells SWR not to commit a fail-open value to the cache, which
+  // prevents transient billing errors from overwriting a legitimate
+  // hasAccess: false entry. The fail-open default is applied *outside* the
+  // SWR call so it never becomes a cached access decision.
+  const result = await platformCache.entitlement.swr(organizationId, async () => {
+    try {
+      const response = await client.fetch(
+        `/api/v1/orgs/${organizationId}/usage/entitlement`,
+        asPlatformSchema(EntitlementResultSchema)
+      );
+      if (!response.success) {
+        recordPlatformFailure("getEntitlement", "no_success");
+        return undefined;
+      }
+      return response;
+    } catch (_e) {
+      recordPlatformFailure("getEntitlement", "caught");
+      return undefined;
     }
-    return result;
-  } catch (e) {
-    logger.error("Error getting entitlement - caught error", { error: e });
+  });
+
+  if (result.err || result.val === undefined) {
     return {
       hasAccess: true as const,
     };
   }
+
+  return result.val;
 }
 
-export async function projectCreated(
-  organization: Pick<Organization, "id" | "maximumConcurrencyLimit">,
-  project: Project
-) {
-  if (!isCloud()) {
-    await createEnvironment({ organization, project, type: "STAGING" });
-    await createEnvironment({
-      organization,
-      project,
-      type: "PREVIEW",
-      isBranchableEnvironment: true,
+export type SsoEntitlement = "entitled" | "not_entitled" | "unknown";
+
+/**
+ * Whether an org may configure and use SSO / Directory Sync.
+ *
+ * `unknown` means billing was configured but unreadable — callers decide:
+ * read paths show the upsell, mutations refuse, and the directory-sync
+ * worker throws so the effect is retried rather than silently dropped.
+ *
+ * Self-hosted deployments have no billing service, so the plugin's presence
+ * (plus the kill switch) is the only gate and this returns `entitled`.
+ *
+ * Loader errors are swallowed inside the loader for the same reason as
+ * `getEntitlement`: @unkey/cache passes the loader promise to waitUntil()
+ * with no .catch(), and returning undefined stops a transient billing
+ * failure from being cached as an access decision. The SWR read is guarded
+ * too, so a cache-infra failure resolves to `unknown` rather than rejecting
+ * into the settings loader and the directory-sync worker.
+ */
+export async function getSsoEntitlement(organizationId: string): Promise<SsoEntitlement> {
+  if (!client) return "entitled";
+
+  try {
+    const result = await platformCache.ssoEntitlement.swr(organizationId, async () => {
+      try {
+        const response = await client.currentPlan(organizationId);
+        if (!response.success) {
+          recordPlatformFailure("getSsoEntitlement", "no_success");
+          return undefined;
+        }
+        return response.v3Subscription?.plan?.limits?.hasSso === true;
+      } catch (_e) {
+        recordPlatformFailure("getSsoEntitlement", "caught");
+        return undefined;
+      }
     });
-  } else {
-    //staging is only available on certain plans
-    const plan = await getCurrentPlan(organization.id);
-    if (plan?.v3Subscription.plan?.limits.hasStagingEnvironment) {
-      await createEnvironment({ organization, project, type: "STAGING" });
-      await createEnvironment({
-        organization,
-        project,
-        type: "PREVIEW",
-        isBranchableEnvironment: true,
-      });
-    }
+
+    if (result.err || result.val === undefined) return "unknown";
+
+    return result.val ? "entitled" : "not_entitled";
+  } catch (_e) {
+    recordPlatformFailure("getSsoEntitlement", "caught");
+    return "unknown";
   }
+}
+
+export type PromoCreditsData = {
+  grantedCents: number;
+  remainingCents: number;
+  expiresAt: string | null;
+};
+
+/**
+ * Remaining promo/credit-grant balance for an org, or null when it has none.
+ * Billing-side gating keeps this cheap for orgs without credits; the SWR cache
+ * keeps repeated dashboard loads off the network. Fails closed to null so the
+ * display is simply hidden on any error — never blocks the page.
+ */
+export async function getPromoCredits(organizationId: string): Promise<PromoCreditsData | null> {
+  if (!client) return null;
+
+  const result = await platformCache.promoCredits.swr(organizationId, async () => {
+    try {
+      const response = await client.promoCredits(organizationId);
+      if (!response.success) {
+        recordPlatformFailure("promoCredits", "no_success");
+        // Return undefined (not null) so SWR doesn't cache a transient failure
+        // as "no credits" and hide the display for the stale TTL. null is
+        // reserved for a successful "org has no promo credits" response.
+        return undefined;
+      }
+      return response.promoCredits;
+    } catch (_e) {
+      recordPlatformFailure("promoCredits", "caught");
+      logger.error("promoCredits threw", { error: _e });
+      return undefined;
+    }
+  });
+
+  if (result.err || result.val === undefined) {
+    return null;
+  }
+  return result.val;
+}
+
+export async function getBillingLimit(
+  organizationId: string
+): Promise<BillingLimitResult | undefined> {
+  if (!client) return undefined;
+
+  // Loader callback errors are caught below; also guard the SWR read itself so
+  // Redis/cache infra failures cannot reject org-layout Promise.all callers.
+  try {
+    const result = await platformCache.billingLimit.swr(organizationId, async () => {
+      try {
+        const response = await client.fetch(
+          `/api/v1/orgs/${organizationId}/billing-limit`,
+          asPlatformSchema(BillingLimitResultSchema)
+        );
+        if (!response.success) {
+          recordPlatformFailure("getBillingLimit", "no_success");
+          return undefined;
+        }
+        return response;
+      } catch (_e) {
+        recordPlatformFailure("getBillingLimit", "caught");
+        return undefined;
+      }
+    });
+
+    if (result.err || result.val === undefined) {
+      return undefined;
+    }
+
+    return result.val;
+  } catch (_e) {
+    recordPlatformFailure("getBillingLimit", "caught");
+    return undefined;
+  }
+}
+
+export async function setBillingLimit(
+  organizationId: string,
+  config: UpdateBillingLimitRequest
+): Promise<BillingLimitResult | undefined> {
+  if (!client) return undefined;
+
+  const response = await client.fetch(
+    `/api/v1/orgs/${organizationId}/billing-limit`,
+    asPlatformSchema(BillingLimitResultSchema),
+    {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(config),
+    }
+  );
+
+  if (!response.success) {
+    recordPlatformFailure("setBillingLimit", "no_success");
+    throw new Error(response.error ?? "Error setting billing limit");
+  }
+
+  invalidateBillingLimitCaches(organizationId);
+  return response;
+}
+
+export async function resolveBillingLimit(
+  organizationId: string,
+  payload: ResolveBillingLimitRequest
+): Promise<BillingLimitResult | undefined> {
+  if (!client) return undefined;
+
+  const response = await client.fetch(
+    `/api/v1/orgs/${organizationId}/billing-limit/resolve`,
+    asPlatformSchema(BillingLimitResultSchema),
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    }
+  );
+
+  if (!response.success) {
+    recordPlatformFailure("resolveBillingLimit", "no_success");
+    throw new Error(response.error ?? "Error resolving billing limit");
+  }
+
+  invalidateBillingLimitCaches(organizationId);
+  return response;
+}
+
+/** Admin: orgs currently in grace or rejected — used by reconciliation worker (Phase 2). */
+export async function getActiveBillingLimits(): Promise<BillingLimitsActiveResult | undefined> {
+  if (!client) return undefined;
+
+  try {
+    const response = await client.fetch(
+      `/api/v1/billing-limits/active`,
+      asPlatformSchema(BillingLimitsActiveResultSchema)
+    );
+    if (!response.success) {
+      recordPlatformFailure("getActiveBillingLimits", "no_success");
+      return undefined;
+    }
+    return response;
+  } catch (_e) {
+    recordPlatformFailure("getActiveBillingLimits", "caught");
+    return undefined;
+  }
+}
+
+/** Admin: orgs with pending resolve side effects — used by reconciliation worker. */
+export async function getPendingBillingLimitResolves(): Promise<
+  BillingLimitsPendingResolvesResult | undefined
+> {
+  if (!client) return undefined;
+
+  try {
+    const response = await client.fetch(
+      `/api/v1/billing-limits/pending-resolves`,
+      asPlatformSchema(BillingLimitsPendingResolvesResultSchema)
+    );
+    if (!response.success) {
+      recordPlatformFailure("getPendingBillingLimitResolves", "no_success");
+      return undefined;
+    }
+    return response;
+  } catch (_e) {
+    recordPlatformFailure("getPendingBillingLimitResolves", "caught");
+    return undefined;
+  }
+}
+
+/** Admin: mark billing limit resolve side effects as completed after webapp convergence. */
+export async function completeBillingLimitResolve(
+  organizationId: string
+): Promise<{ completed: boolean } | undefined> {
+  if (!client) return undefined;
+
+  const response = await client.fetch(
+    `/api/v1/orgs/${organizationId}/billing-limit/resolve-complete`,
+    asPlatformSchema(z.object({ completed: z.boolean() })),
+    {
+      method: "POST",
+    }
+  );
+
+  if (!response.success) {
+    recordPlatformFailure("completeBillingLimitResolve", "no_success");
+    throw new Error(response.error ?? "Error completing billing limit resolve");
+  }
+
+  return response;
 }
 
 export async function getBillingAlerts(
@@ -581,7 +1018,7 @@ export async function getBillingAlerts(
   if (!client) return undefined;
   const result = await client.getBillingAlerts(organizationId);
   if (!result.success) {
-    logger.error("Error getting billing alert", { error: result.error, organizationId });
+    recordPlatformFailure("getBillingAlert", "no_success");
     throw new Error("Error getting billing alert");
   }
   return result;
@@ -594,7 +1031,7 @@ export async function setBillingAlert(
   if (!client) return undefined;
   const result = await client.updateBillingAlerts(organizationId, alert);
   if (!result.success) {
-    logger.error("Error setting billing alert", { error: result.error, organizationId });
+    recordPlatformFailure("setBillingAlert", "no_success");
     throw new Error("Error setting billing alert");
   }
   return result;
@@ -607,11 +1044,7 @@ export async function generateRegistryCredentials(
   if (!client) return undefined;
   const result = await client.generateRegistryCredentials(projectId, region);
   if (!result.success) {
-    logger.error("Error generating registry credentials", {
-      error: result.error,
-      projectId,
-      region,
-    });
+    recordPlatformFailure("generateRegistryCredentials", "no_success");
     throw new Error("Failed to generate registry credentials");
   }
 
@@ -630,13 +1063,7 @@ export async function enqueueBuild(
   if (!client) return undefined;
   const result = await client.enqueueBuild(projectId, { deploymentId, artifactKey, options });
   if (!result.success) {
-    logger.error("Error enqueuing build", {
-      error: result.error,
-      projectId,
-      deploymentId,
-      artifactKey,
-      options,
-    });
+    recordPlatformFailure("enqueueBuild", "no_success");
     throw new Error("Failed to enqueue build");
   }
 
@@ -651,12 +1078,12 @@ export async function getPrivateLinks(
   const [error, result] = await tryCatch(client.getPrivateLinks(organizationId));
 
   if (error) {
-    logger.error("Error getting private links", { organizationId, error });
+    recordPlatformFailure("getPrivateLinks", "caught");
     return undefined;
   }
 
   if (!result.success) {
-    logger.error("Error getting private links - no success", { organizationId, error: result.error });
+    recordPlatformFailure("getPrivateLinks", "no_success");
     return undefined;
   }
 
@@ -672,12 +1099,12 @@ export async function createPrivateLink(
   const [error, result] = await tryCatch(client.createPrivateLink(organizationId, body));
 
   if (error) {
-    logger.error("Error creating private link", { organizationId, error });
+    recordPlatformFailure("createPrivateLink", "caught");
     throw error;
   }
 
   if (!result.success) {
-    logger.error("Error creating private link - no success", { organizationId, error: result.error });
+    recordPlatformFailure("createPrivateLink", "no_success");
     throw new Error(result.error ?? "Failed to create private link");
   }
 
@@ -693,12 +1120,12 @@ export async function deletePrivateLink(
   const [error, result] = await tryCatch(client.deletePrivateLink(organizationId, connectionId));
 
   if (error) {
-    logger.error("Error deleting private link", { organizationId, connectionId, error });
+    recordPlatformFailure("deletePrivateLink", "caught");
     throw error;
   }
 
   if (!result.success) {
-    logger.error("Error deleting private link - no success", { organizationId, connectionId, error: result.error });
+    recordPlatformFailure("deletePrivateLink", "no_success");
     throw new Error(result.error ?? "Failed to delete private link");
   }
 }
@@ -711,12 +1138,12 @@ export async function getPrivateLinkRegions(
   const [error, result] = await tryCatch(client.getPrivateLinkRegions(organizationId));
 
   if (error) {
-    logger.error("Error getting private link regions", { organizationId, error });
+    recordPlatformFailure("getPrivateLinkRegions", "caught");
     return undefined;
   }
 
   if (!result.success) {
-    logger.error("Error getting private link regions - no success", { organizationId, error: result.error });
+    recordPlatformFailure("getPrivateLinkRegions", "no_success");
     return undefined;
   }
 
@@ -749,7 +1176,18 @@ export async function triggerInitialDeployment(
   }
 }
 
-function isCloud(): boolean {
+export type {
+  BillingLimitConfig,
+  BillingLimitPageData,
+  BillingLimitResult,
+  BillingLimitState,
+  BillingLimitsActiveResult,
+  EntitlementResult,
+  ResolveBillingLimitRequest,
+  UpdateBillingLimitRequest,
+} from "~/services/billingLimit.schemas";
+
+export function isCloud(): boolean {
   const acceptableHosts = [
     "https://cloud.trigger.dev",
     "https://test-cloud.trigger.dev",

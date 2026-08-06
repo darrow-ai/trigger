@@ -1,12 +1,13 @@
 import { ClickHouse } from "@internal/clickhouse";
-import { containerTest } from "@internal/testcontainers";
-import { fork, type ChildProcess } from "node:child_process";
-import { performance, PerformanceObserver } from "node:perf_hooks";
-import { setTimeout } from "node:timers/promises";
+import { replicationContainerTest } from "@internal/testcontainers";
+import { fork } from "node:child_process";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
+import { setTimeout } from "node:timers/promises";
 import { z } from "zod";
 import { RunsReplicationService } from "~/services/runsReplicationService.server";
-import { createInMemoryTracing, createInMemoryMetrics } from "./utils/tracing";
+import { TestReplicationClickhouseFactory } from "./utils/testReplicationClickhouseFactory";
+import { createInMemoryMetrics, createInMemoryTracing } from "./utils/tracing";
 
 // Extend test timeout for benchmarks
 vi.setConfig({ testTimeout: 300_000 }); // 5 minutes
@@ -320,7 +321,7 @@ async function runBenchmark(
 
   // Create and start replication service
   const runsReplicationService = new RunsReplicationService({
-    clickhouse,
+    clickhouseFactory: new TestReplicationClickhouseFactory(clickhouse),
     pgConnectionUrl: postgresContainer.getConnectionUri(),
     serviceName: `benchmark-${name}`,
     slotName: `benchmark_${name.replace(/-/g, "_")}`,
@@ -500,7 +501,7 @@ function compareBenchmarks(baseline: BenchmarkResult, comparison: BenchmarkResul
 }
 
 describe("RunsReplicationService Benchmark", () => {
-  containerTest.skipIf(process.env.BENCHMARKS_ENABLED !== "1")(
+  replicationContainerTest.skipIf(process.env.BENCHMARKS_ENABLED !== "1")(
     "should benchmark error fingerprinting performance impact",
     async ({ clickhouseContainer, redisOptions, postgresContainer, prisma }) => {
       // Enable replica identity for TaskRun table

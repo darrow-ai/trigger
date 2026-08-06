@@ -13,7 +13,11 @@ const CreateBody = z.object({
   textContent: z.string(),
   model: z.string().optional(),
   commitMessage: z.string().optional(),
-  source: z.string().optional(),
+  // `code` is reserved for deploy-created versions.
+  source: z
+    .string()
+    .refine((source) => source !== "code")
+    .optional(),
 });
 
 const UpdateBody = z.object({
@@ -22,7 +26,10 @@ const UpdateBody = z.object({
   commitMessage: z.string().optional(),
 });
 
-async function findPrompt(slug: string, authentication: { environment: { projectId: string; id: string } }) {
+async function findPrompt(
+  slug: string,
+  authentication: { environment: { projectId: string; id: string } }
+) {
   return prisma.prompt.findUnique({
     where: {
       projectId_runtimeEnvironmentId_slug: {
@@ -40,8 +47,7 @@ const { action, loader } = createMultiMethodApiRoute({
   corsStrategy: "all",
   authorization: {
     action: "update",
-    resource: (params) => ({ prompts: params.slug }),
-    superScopes: ["admin"],
+    resource: (params) => ({ type: "prompts", id: params.slug }),
   },
   methods: {
     POST: {

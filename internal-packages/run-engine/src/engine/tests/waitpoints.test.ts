@@ -3,7 +3,7 @@ import { trace } from "@internal/tracing";
 import { expect } from "vitest";
 import { RunEngine } from "../index.js";
 import { setTimeout } from "node:timers/promises";
-import { EventBusEventArgs } from "../eventBus.js";
+import type { EventBusEventArgs } from "../eventBus.js";
 import { isWaitpointOutputTimeout } from "@trigger.dev/core/v3";
 import { setupAuthenticatedEnvironment, setupBackgroundWorker } from "./setup.js";
 
@@ -107,7 +107,16 @@ describe("RunEngine Waitpoints", () => {
       const executionData = await engine.getRunExecutionData({ runId: run.id });
       expect(executionData?.snapshot.executionStatus).toBe("EXECUTING_WITH_WAITPOINTS");
 
-      await setTimeout(2_000);
+      // Event-driven wait: the run resumes once the datetime waitpoint (~1s out) completes and the
+      // worker unblocks it. Gate on the final state the test asserts (run EXECUTING), not just the
+      // waitpoint status, which flips slightly earlier.
+      await vi.waitFor(
+        async () => {
+          const ed = await engine.getRunExecutionData({ runId: run.id });
+          expect(ed?.snapshot.executionStatus).toBe("EXECUTING");
+        },
+        { timeout: 10_000, interval: 100 }
+      );
 
       const waitpoint2 = await prisma.waitpoint.findFirst({
         where: {
@@ -207,7 +216,7 @@ describe("RunEngine Waitpoints", () => {
       });
       expect(waitpoint.completedAfter!.toISOString()).toBe(date.toISOString());
 
-      const result = await engine.blockRunWithWaitpoint({
+      const _result = await engine.blockRunWithWaitpoint({
         runId: run.id,
         waitpoints: [waitpoint.id],
         projectId: authenticatedEnvironment.project.id,
@@ -497,7 +506,14 @@ describe("RunEngine Waitpoints", () => {
       const executionData = await engine.getRunExecutionData({ runId: run.id });
       expect(executionData?.snapshot.executionStatus).toBe("EXECUTING_WITH_WAITPOINTS");
 
-      await setTimeout(750);
+      // Event-driven wait: resume as soon as the waitpoint completes, no fixed margin.
+      await vi.waitFor(
+        async () => {
+          const ed = await engine.getRunExecutionData({ runId: run.id });
+          expect(ed?.snapshot.executionStatus).toBe("EXECUTING");
+        },
+        { timeout: 10_000, interval: 100 }
+      );
 
       const executionData2 = await engine.getRunExecutionData({ runId: run.id });
       expect(executionData2?.snapshot.executionStatus).toBe("EXECUTING");
@@ -781,7 +797,16 @@ describe("RunEngine Waitpoints", () => {
           event = result;
         });
 
-        await setTimeout(1_250);
+        // Event-driven wait: resume as soon as the timeout fires and the worker notifies, instead
+        // of a fixed 1250ms margin against the ~1s worker poll (the original flaky race).
+        await vi.waitFor(
+          async () => {
+            const ed = await engine.getRunExecutionData({ runId: run.id });
+            expect(ed?.snapshot.executionStatus).toBe("EXECUTING");
+            assertNonNullable(event);
+          },
+          { timeout: 10_000, interval: 100 }
+        );
 
         const executionData2 = await engine.getRunExecutionData({ runId: run.id });
         expect(executionData2?.snapshot.executionStatus).toBe("EXECUTING");
@@ -1193,7 +1218,7 @@ describe("RunEngine Waitpoints", () => {
           consumerId: "test_snapshotsince",
           workerQueue: "main",
         });
-        const attemptResult = await engine.startRunAttempt({
+        const _attemptResult = await engine.startRunAttempt({
           runId: dequeued[0].run.id,
           snapshotId: dequeued[0].snapshot.id,
         });
@@ -1261,7 +1286,7 @@ describe("RunEngine Waitpoints", () => {
             snapshotId: "invalid-id",
           });
           expect(sinceInvalid).toBeNull();
-        } catch (e) {
+        } catch (_e) {
           threw = true;
         }
         // should never throw

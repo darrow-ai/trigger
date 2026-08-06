@@ -6,27 +6,28 @@
  */
 
 import type { ClickHouseSettings } from "@clickhouse/client";
-import { z } from "zod";
 import {
   compileTSQL,
+  ExposedTSQLError,
+  type OutputColumnMetadata,
   sanitizeErrorMessage,
   transformResults,
-  type TableSchema,
-  type QuerySettings,
   type FieldMappings,
+  type QuerySettings,
+  type TableSchema,
   type TimeRange,
-  type WhereClauseCondition
+  type WhereClauseCondition,
 } from "@internal/tsql";
-import type { ClickhouseReader, QueryStats } from "./types.js";
-import { QueryError } from "./errors.js";
-import type { OutputColumnMetadata } from "@internal/tsql";
 import { Logger } from "@trigger.dev/core/logger";
+import { z } from "zod";
+import { QueryError } from "./errors.js";
+import type { ClickhouseReader, QueryStats } from "./types.js";
 
 const logger = new Logger("tsql", "info");
 
 export type { QueryStats };
 
-export type { TableSchema, QuerySettings, FieldMappings, TimeRange, WhereClauseCondition };
+export type { FieldMappings, QuerySettings, TableSchema, TimeRange, WhereClauseCondition };
 
 /**
  * Options for executing a TSQL query
@@ -108,6 +109,21 @@ export interface ExecuteTSQLOptions<TOut extends z.ZodSchema> {
    * based on the span of the time range.
    */
   timeRange?: TimeRange;
+  /**
+   * Opt-in: emit rows for empty time buckets in a top-level time-bucketed query
+   * (counters zero-fill, gauges carry forward). Off by default.
+   */
+  fillGaps?: boolean;
+  /**
+   * Floor for the `timeBucket()` interval, in seconds. Widens buckets past what the range
+   * would pick, for series whose samples are too sparse to read at that width.
+   */
+  minBucketSeconds?: number;
+  /**
+   * Set when `query` was written by whoever made the request rather than by us.
+   * A rejection of their SQL is then their mistake, not a bug on our side.
+   */
+  userAuthoredQuery?: boolean;
 }
 
 /**
@@ -180,9 +196,10 @@ export async function executeTSQL<TOut extends z.ZodSchema>(
   try {
     // 1. Compile the TSQL query to ClickHouse SQL
     // Pass maxRows + 1 to fetch one extra row for overflow detection
-    const compiledSettings = maxRows !== undefined
-      ? { ...options.querySettings, maxRows: maxRows + 1 }
-      : options.querySettings;
+    const compiledSettings =
+      maxRows !== undefined
+        ? { ...options.querySettings, maxRows: maxRows + 1 }
+        : options.querySettings;
 
     const { sql, params, columns, hiddenColumns } = compileTSQL(options.query, {
       tableSchema: options.tableSchema,
@@ -191,6 +208,8 @@ export async function executeTSQL<TOut extends z.ZodSchema>(
       fieldMappings: options.fieldMappings,
       whereClauseFallback: options.whereClauseFallback,
       timeRange: options.timeRange,
+      fillGaps: options.fillGaps,
+      minBucketSeconds: options.minBucketSeconds,
     });
 
     generatedSql = sql;
@@ -206,6 +225,8 @@ export async function executeTSQL<TOut extends z.ZodSchema>(
       // EXPLAIN returns rows with an 'explain' column
       schema: isExplain ? z.object({ explain: z.string() }) : options.schema,
       settings: options.clickhouseSettings,
+      logFields: { tsql: options.query },
+      userAuthoredQuery: options.userAuthoredQuery,
     });
 
     const [error, result] = await queryFn(params);
@@ -239,6 +260,8 @@ export async function executeTSQL<TOut extends z.ZodSchema>(
             params: z.record(z.any()),
             schema: z.object({ explain: z.string() }),
             settings: options.clickhouseSettings,
+            logFields: { tsql: options.query },
+            userAuthoredQuery: options.userAuthoredQuery,
           });
 
           const [additionalError, additionalResult] = await additionalQueryFn(params);
@@ -296,14 +319,21 @@ export async function executeTSQL<TOut extends z.ZodSchema>(
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
 
-    // Log TSQL compilation or unexpected errors (with original message for debugging)
-    logger.error("[TSQL] Query error", {
+    const logFields = {
       name: options.name,
       error: errorMessage,
       tsql: options.query,
       generatedSql: generatedSql ?? "(compilation failed)",
       generatedParams: generatedParams ?? {},
-    });
+    };
+
+    const callerWroteABadQuery = options.userAuthoredQuery && error instanceof ExposedTSQLError;
+
+    if (callerWroteABadQuery) {
+      logger.warn("[TSQL] Invalid query", logFields);
+    } else {
+      logger.error("[TSQL] Query error", logFields);
+    }
 
     // Sanitize error message to show TSQL names instead of ClickHouse internals
     const sanitizedMessage = sanitizeErrorMessage(errorMessage, options.tableSchema);

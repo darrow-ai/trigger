@@ -3,12 +3,11 @@ import type { GitHubProfile } from "remix-auth-github";
 import type { GoogleProfile } from "remix-auth-google";
 import { prisma } from "~/db.server";
 import { env } from "~/env.server";
-import {
-  DashboardPreferences,
-  getDashboardPreferences,
-} from "~/services/dashboardPreferences.server";
+import type { DashboardPreferences } from "~/services/dashboardPreferences.server";
+import { getDashboardPreferences } from "~/services/dashboardPreferences.server";
 export type { User } from "@trigger.dev/database";
 import { assertEmailAllowed } from "~/utils/email";
+import { emailMatchesPattern } from "~/utils/emailPattern";
 import { logger } from "~/services/logger.server";
 
 type FindOrCreateMagicLink = {
@@ -30,7 +29,18 @@ type FindOrCreateGoogle = {
   authenticationExtraParams: Record<string, unknown>;
 };
 
-type FindOrCreateUser = FindOrCreateMagicLink | FindOrCreateGithub | FindOrCreateGoogle;
+type FindOrCreateSso = {
+  authenticationMethod: "SSO";
+  email: User["email"];
+  firstName: string | null;
+  lastName: string | null;
+};
+
+type FindOrCreateUser =
+  | FindOrCreateMagicLink
+  | FindOrCreateGithub
+  | FindOrCreateGoogle
+  | FindOrCreateSso;
 
 type LoggedInUser = {
   user: User;
@@ -48,6 +58,9 @@ export async function findOrCreateUser(input: FindOrCreateUser): Promise<LoggedI
     case "GOOGLE": {
       return findOrCreateGoogleUser(input);
     }
+    case "SSO": {
+      return findOrCreateSsoUser(input);
+    }
   }
 }
 
@@ -62,8 +75,7 @@ export async function findOrCreateMagicLinkUser({
     },
   });
 
-  const adminEmailRegex = env.ADMIN_EMAILS ? new RegExp(env.ADMIN_EMAILS) : undefined;
-  const makeAdmin = adminEmailRegex ? adminEmailRegex.test(email) : false;
+  const makeAdmin = env.ADMIN_EMAILS ? emailMatchesPattern(env.ADMIN_EMAILS, email) : false;
 
   const user = await prisma.user.upsert({
     where: {
@@ -233,7 +245,7 @@ export async function findOrCreateGoogleUser({
     // Check if email user and auth user are the same
     if (existingEmailUser.id !== existingUser.id) {
       // Different users: email is taken by one user, Google auth belongs to another
-      logger.error(
+      logger.warn(
         `Google auth conflict: Google ID ${authenticationProfile.id} belongs to user ${existingUser.id} but email ${email} is taken by user ${existingEmailUser.id}`,
         {
           email,
@@ -303,6 +315,47 @@ export async function findOrCreateGoogleUser({
   };
 }
 
+// Find an existing user by email (lowercased) or create a new one with the
+// SSO authentication method. Mirrors the magic-link upsert shape; the
+// callback route is responsible for normalising email before calling.
+// Plugin writes (linking the IdP identity row) happen via the SSO plugin
+// after this returns.
+export async function findOrCreateSsoUser({
+  email,
+  firstName,
+  lastName,
+}: FindOrCreateSso): Promise<LoggedInUser> {
+  // Validate the canonical value we actually look up and persist below —
+  // validating raw `email` would let case/whitespace variants slip past
+  // (or misapply) the allow-list policy.
+  const normalised = email.toLowerCase().trim();
+  assertEmailAllowed(normalised);
+
+  const existingUser = await prisma.user.findFirst({ where: { email: normalised } });
+
+  const fullName = [firstName, lastName].filter(Boolean).join(" ").trim() || null;
+
+  const user = await prisma.user.upsert({
+    where: { email: normalised },
+    update: {
+      // Existing magic-link / OAuth users keep their original
+      // authenticationMethod; we only refresh name/displayName when the
+      // user has nothing set yet so we don't clobber a customised display
+      // name on every SSO login.
+      ...(existingUser?.name ? {} : { name: fullName }),
+      ...(existingUser?.displayName ? {} : { displayName: fullName }),
+    },
+    create: {
+      email: normalised,
+      name: fullName,
+      displayName: fullName,
+      authenticationMethod: "SSO",
+    },
+  });
+
+  return { user, isNewUser: !existingUser };
+}
+
 export type UserWithDashboardPreferences = User & {
   dashboardPreferences: DashboardPreferences;
 };
@@ -340,7 +393,14 @@ export function updateUser({
 }) {
   return prisma.user.update({
     where: { id },
-    data: { name, email, marketingEmails, referralSource, onboardingData, confirmedBasicDetails: true },
+    data: {
+      name,
+      email,
+      marketingEmails,
+      referralSource,
+      onboardingData,
+      confirmedBasicDetails: true,
+    },
   });
 }
 

@@ -1,15 +1,12 @@
-import { z } from "zod";
-import { DeploymentErrorData } from "./schemas/api.js";
-import { ImportTaskFileErrors, WorkerManifest } from "./schemas/build.js";
-import {
-  SerializedError,
-  TaskRunError,
-  TaskRunErrorCodes,
-  TaskRunInternalError,
-} from "./schemas/common.js";
+import type { z } from "zod";
+import type { DeploymentErrorData } from "./schemas/api.js";
+import type { WorkerManifest } from "./schemas/build.js";
+import { ImportTaskFileErrors } from "./schemas/build.js";
+import type { SerializedError, TaskRunError, TaskRunInternalError } from "./schemas/common.js";
+import { TaskRunErrorCodes } from "./schemas/common.js";
 import { TaskMetadataFailedToParseData } from "./schemas/messages.js";
 import { links } from "./links.js";
-import { ExceptionEventProperties } from "./schemas/openTelemetry.js";
+import type { ExceptionEventProperties } from "./schemas/openTelemetry.js";
 import { assertExhaustive } from "../utils.js";
 
 /**
@@ -154,13 +151,65 @@ export function isCompleteTaskWithOutput(error: unknown): error is CompleteTaskW
   return error instanceof Error && error.name === "CompleteTaskWithOutput";
 }
 
+const MAX_STACK_FRAMES = 50;
+const KEEP_TOP_FRAMES = 5;
+const MAX_STACK_LINE_LENGTH = 1024;
+const MAX_MESSAGE_LENGTH = 1_000;
+
+/** Truncate a stack trace to at most MAX_STACK_FRAMES frames, keeping
+ *  the top (closest to throw) and bottom (entry points) frames.
+ *  Individual lines (including message lines) are capped at MAX_STACK_LINE_LENGTH
+ *  to prevent OOM from huge error messages embedded in the stack. */
+export function truncateStack(stack: string | undefined): string {
+  if (!stack) return "";
+
+  const lines = stack.split("\n");
+
+  // First line(s) before the first frame are the error message
+  const messageLines: string[] = [];
+  const frameLines: string[] = [];
+
+  for (const line of lines) {
+    const safe =
+      line.length > MAX_STACK_LINE_LENGTH
+        ? line.slice(0, MAX_STACK_LINE_LENGTH) + "...[truncated]"
+        : line;
+    if (frameLines.length === 0 && !line.trimStart().startsWith("at ")) {
+      messageLines.push(safe);
+    } else {
+      frameLines.push(safe);
+    }
+  }
+
+  if (frameLines.length <= MAX_STACK_FRAMES) {
+    return [...messageLines, ...frameLines].join("\n");
+  }
+
+  const keepBottom = MAX_STACK_FRAMES - KEEP_TOP_FRAMES;
+  const omitted = frameLines.length - MAX_STACK_FRAMES;
+
+  return [
+    ...messageLines,
+    ...frameLines.slice(0, KEEP_TOP_FRAMES),
+    `    ... ${omitted} frames omitted ...`,
+    ...frameLines.slice(-keepBottom),
+  ].join("\n");
+}
+
+export function truncateMessage(message: string | undefined): string {
+  if (!message) return "";
+  return message.length > MAX_MESSAGE_LENGTH
+    ? message.slice(0, MAX_MESSAGE_LENGTH) + "...[truncated]"
+    : message;
+}
+
 export function parseError(error: unknown): TaskRunError {
   if (isInternalError(error)) {
     return {
       type: "INTERNAL_ERROR",
       code: error.code,
-      message: error.message,
-      stackTrace: error.stack ?? "",
+      message: truncateMessage(error.message),
+      stackTrace: truncateStack(error.stack),
     };
   }
 
@@ -168,8 +217,8 @@ export function parseError(error: unknown): TaskRunError {
     return {
       type: "BUILT_IN_ERROR",
       name: error.name,
-      message: error.message,
-      stackTrace: error.stack ?? "",
+      message: truncateMessage(error.message),
+      stackTrace: truncateStack(error.stack),
     };
   }
 
@@ -185,7 +234,7 @@ export function parseError(error: unknown): TaskRunError {
       type: "CUSTOM_ERROR",
       raw: JSON.stringify(error),
     };
-  } catch (e) {
+  } catch (_e) {
     return {
       type: "CUSTOM_ERROR",
       raw: String(error),
@@ -248,35 +297,48 @@ export function createJsonErrorObject(error: TaskRunError): SerializedError {
   }
 }
 
-// Removes any null characters from the error message
+// Removes null characters and truncates oversized fields to prevent OOM
 export function sanitizeError(error: TaskRunError): TaskRunError {
   switch (error.type) {
     case "BUILT_IN_ERROR": {
       return {
         type: "BUILT_IN_ERROR",
-        message: error.message?.replace(/\0/g, ""),
+        message: truncateMessage(error.message?.replace(/\0/g, "")),
         name: error.name?.replace(/\0/g, ""),
-        stackTrace: error.stackTrace?.replace(/\0/g, ""),
+        stackTrace: truncateStack(error.stackTrace?.replace(/\0/g, "")),
       };
     }
     case "STRING_ERROR": {
       return {
         type: "STRING_ERROR",
-        raw: error.raw.replace(/\0/g, ""),
+        raw: truncateMessage(error.raw.replace(/\0/g, "")),
       };
     }
     case "CUSTOM_ERROR": {
+      // CUSTOM_ERROR.raw holds JSON.stringify(error) which is later parsed by
+      // JSON.parse in createErrorTaskError. Naive truncation would cut mid-token
+      // and produce invalid JSON — wrap the preview in a valid JSON envelope.
+      const clean = error.raw.replace(/\0/g, "");
+      const safeRaw =
+        clean.length > MAX_MESSAGE_LENGTH
+          ? JSON.stringify({ truncated: true, preview: clean.slice(0, MAX_MESSAGE_LENGTH) })
+          : clean;
       return {
         type: "CUSTOM_ERROR",
-        raw: error.raw.replace(/\0/g, ""),
+        raw: safeRaw,
       };
     }
     case "INTERNAL_ERROR": {
+      // message and stackTrace are optional for INTERNAL_ERROR — preserve
+      // `undefined` so the `error.message ?? "Internal error (CODE)"` fallback
+      // in createErrorTaskError still kicks in (empty string is not nullish).
       return {
         type: "INTERNAL_ERROR",
         code: error.code,
-        message: error.message?.replace(/\0/g, ""),
-        stackTrace: error.stackTrace?.replace(/\0/g, ""),
+        message:
+          error.message != null ? truncateMessage(error.message.replace(/\0/g, "")) : undefined,
+        stackTrace:
+          error.stackTrace != null ? truncateStack(error.stackTrace.replace(/\0/g, "")) : undefined,
       };
     }
   }
@@ -292,7 +354,6 @@ export function shouldRetryError(error: TaskRunError): boolean {
         case "CONFIGURED_INCORRECTLY":
         case "TASK_ALREADY_RUNNING":
         case "TASK_PROCESS_SIGKILL_TIMEOUT":
-        case "TASK_PROCESS_SIGSEGV":
         case "TASK_PROCESS_OOM_KILLED":
         case "TASK_PROCESS_MAYBE_OOM_KILLED":
         case "TASK_RUN_CANCELLED":
@@ -326,8 +387,10 @@ export function shouldRetryError(error: TaskRunError): boolean {
         case "TASK_EXECUTION_ABORTED":
         case "TASK_EXECUTION_FAILED":
         case "TASK_RUN_CRASHED":
+        case "TASK_RUN_UNCAUGHT_EXCEPTION":
         case "TASK_PROCESS_EXITED_WITH_NON_ZERO_CODE":
         case "TASK_PROCESS_SIGTERM":
+        case "TASK_PROCESS_SIGSEGV":
           return true;
 
         default:
@@ -356,6 +419,8 @@ export function shouldLookupRetrySettings(error: TaskRunError): boolean {
         case "TASK_PROCESS_EXITED_WITH_NON_ZERO_CODE":
         case "TASK_PROCESS_SIGTERM":
         case "TASK_PROCESS_SIGSEGV":
+        case "TASK_RUN_UNCAUGHT_EXCEPTION":
+        case "TASK_MIDDLEWARE_ERROR":
           return true;
 
         default:
@@ -508,6 +573,39 @@ export class TaskIndexingImportError extends Error {
   }
 }
 
+export type TaskIdCollision = { id: string; filePaths: string[] };
+
+function formatDuplicateTaskIds(collisions: TaskIdCollision[]): string {
+  const lines = collisions.map(({ id, filePaths }) => {
+    const distinct = Array.from(new Set(filePaths));
+
+    if (distinct.length === 1) {
+      return `  - "${id}" found more than once in ${distinct[0]}`;
+    }
+
+    const last = distinct[distinct.length - 1];
+    const head = distinct.slice(0, -1).join(", ");
+
+    return `  - "${id}" found in ${head} and ${last}`;
+  });
+
+  return [
+    "Duplicate task ids detected:",
+    "",
+    ...lines,
+    "",
+    "Task ids must be unique across your project (including scheduled tasks). Please rename one of them.",
+  ].join("\n");
+}
+
+export class DuplicateTaskIdsError extends Error {
+  constructor(public readonly collisions: TaskIdCollision[]) {
+    super(formatDuplicateTaskIds(collisions));
+
+    this.name = "DuplicateTaskIdsError";
+  }
+}
+
 export class UnexpectedExitError extends Error {
   constructor(
     public code: number,
@@ -558,6 +656,26 @@ export class GracefulExitTimeoutError extends Error {
 
     this.name = "GracefulExitTimeoutError";
   }
+}
+
+export class ChatChunkTooLargeError extends Error {
+  constructor(
+    public readonly chunkSize: number,
+    public readonly maxSize: number,
+    public readonly chunkType?: string
+  ) {
+    super(
+      `chat.agent chunk${chunkType ? ` of type "${chunkType}"` : ""} is ${chunkSize} bytes, ` +
+        `over the realtime stream's per-record cap of ${maxSize} bytes. ` +
+        `For oversized payloads (e.g. large tool outputs), write the value to your own store and ` +
+        `emit only an id/url through the chat stream — see https://trigger.dev/docs/ai-chat/patterns/large-payloads.`
+    );
+    this.name = "ChatChunkTooLargeError";
+  }
+}
+
+export function isChatChunkTooLargeError(error: unknown): error is ChatChunkTooLargeError {
+  return error instanceof Error && error.name === "ChatChunkTooLargeError";
 }
 
 export class MaxDurationExceededError extends Error {
@@ -651,6 +769,18 @@ const prettyInternalErrors: Partial<
     link: {
       name: "Read our troubleshooting guide",
       href: links.docs.troubleshooting.stalledExecution,
+    },
+  },
+  // Link only — we deliberately do NOT set `message`, so the original
+  // error message (e.g. "read ECONNRESET") is preserved in the dashboard.
+  // Common cause: an EventEmitter (node-redis, pg, etc.) emitted "error"
+  // with no listener attached, which Node escalates to uncaughtException.
+  // The docs page explains how to attach .on("error") listeners and how
+  // unhandled rejections route through the same path.
+  TASK_RUN_UNCAUGHT_EXCEPTION: {
+    link: {
+      name: "Read our troubleshooting guide",
+      href: links.docs.troubleshooting.uncaughtException,
     },
   },
 };

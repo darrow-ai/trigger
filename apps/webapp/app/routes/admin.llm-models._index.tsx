@@ -1,7 +1,5 @@
 import { MagnifyingGlassIcon } from "@heroicons/react/20/solid";
 import { Form, useFetcher, Link } from "@remix-run/react";
-import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/server-runtime";
-import { redirect } from "@remix-run/server-runtime";
 import { typedjson, useTypedLoaderData } from "remix-typedjson";
 import { z } from "zod";
 import { Button, LinkButton } from "~/components/primitives/Buttons";
@@ -18,7 +16,7 @@ import {
   TableRow,
 } from "~/components/primitives/Table";
 import { prisma } from "~/db.server";
-import { requireUserId } from "~/services/session.server";
+import { dashboardAction, dashboardLoader } from "~/services/routeBuilders/dashboardBuilder";
 import { createSearchParams } from "~/utils/searchParams";
 import { seedLlmPricing, syncLlmCatalog } from "@internal/llm-model-catalog";
 import { llmPricingRegistry } from "~/v3/llmPricingRegistry.server";
@@ -30,125 +28,124 @@ const SearchParams = z.object({
   search: z.string().optional(),
 });
 
-export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const userId = await requireUserId(request);
-  const user = await prisma.user.findUnique({ where: { id: userId } });
-  if (!user?.admin) throw redirect("/");
+export const loader = dashboardLoader(
+  { authorization: { requireSuper: true } },
+  async ({ request }) => {
+    const searchParams = createSearchParams(request.url, SearchParams);
+    if (!searchParams.success) throw new Error(searchParams.error);
+    const { page: rawPage, search } = searchParams.params.getAll();
+    const page = rawPage ?? 1;
 
-  const searchParams = createSearchParams(request.url, SearchParams);
-  if (!searchParams.success) throw new Error(searchParams.error);
-  const { page: rawPage, search } = searchParams.params.getAll();
-  const page = rawPage ?? 1;
+    const where = {
+      projectId: null as string | null,
+      ...(search ? { modelName: { contains: search, mode: "insensitive" as const } } : {}),
+    };
 
-  const where = {
-    projectId: null as string | null,
-    ...(search ? { modelName: { contains: search, mode: "insensitive" as const } } : {}),
-  };
+    const [rawModels, total] = await Promise.all([
+      prisma.llmModel.findMany({
+        where,
+        include: {
+          pricingTiers: { include: { prices: true }, orderBy: { priority: "asc" } },
+        },
+        orderBy: { modelName: "asc" },
+        skip: (page - 1) * PAGE_SIZE,
+        take: PAGE_SIZE,
+      }),
+      prisma.llmModel.count({ where }),
+    ]);
 
-  const [rawModels, total] = await Promise.all([
-    prisma.llmModel.findMany({
-      where,
-      include: {
-        pricingTiers: { include: { prices: true }, orderBy: { priority: "asc" } },
-      },
-      orderBy: { modelName: "asc" },
-      skip: (page - 1) * PAGE_SIZE,
-      take: PAGE_SIZE,
-    }),
-    prisma.llmModel.count({ where }),
-  ]);
-
-  // Convert Prisma Decimal to plain numbers for serialization
-  const models = rawModels.map((m) => ({
-    ...m,
-    pricingTiers: m.pricingTiers.map((t) => ({
-      ...t,
-      prices: t.prices.map((p) => ({ ...p, price: Number(p.price) })),
-    })),
-  }));
-
-  return typedjson({
-    models,
-    total,
-    page,
-    pageCount: Math.ceil(total / PAGE_SIZE),
-    filters: { search },
-  });
-};
-
-export async function action({ request }: ActionFunctionArgs) {
-  const userId = await requireUserId(request);
-  const user = await prisma.user.findUnique({ where: { id: userId } });
-  if (!user?.admin) throw redirect("/");
-
-  const formData = await request.formData();
-  const _action = formData.get("_action");
-
-  if (_action === "seed") {
-    console.log("[admin] seed action started");
-    const result = await seedLlmPricing(prisma);
-    console.log(`[admin] seed complete: ${result.modelsCreated} created, ${result.modelsSkipped} skipped, ${result.modelsUpdated} updated`);
-    await llmPricingRegistry?.reload();
-    console.log("[admin] registry reloaded after seed");
-    return typedjson({
-      success: true,
-      message: `Seeded: ${result.modelsCreated} created, ${result.modelsSkipped} skipped, ${result.modelsUpdated} updated`,
-    });
-  }
-
-  if (_action === "sync") {
-    console.log("[admin] sync catalog action started");
-    const result = await syncLlmCatalog(prisma);
-    console.log(`[admin] sync complete: ${result.modelsUpdated} updated, ${result.modelsSkipped} skipped`);
-    await llmPricingRegistry?.reload();
-    console.log("[admin] registry reloaded after sync");
-    return typedjson({
-      success: true,
-      message: `Synced: ${result.modelsUpdated} updated, ${result.modelsSkipped} skipped`,
-    });
-  }
-
-  if (_action === "reload") {
-    console.log("[admin] reload action started");
-    await llmPricingRegistry?.reload();
-    console.log("[admin] registry reloaded");
-    return typedjson({ success: true, message: "Registry reloaded" });
-  }
-
-  if (_action === "test") {
-    const modelString = formData.get("modelString");
-    if (typeof modelString !== "string" || !modelString) {
-      return typedjson({ testResult: null });
-    }
-
-    // Use the registry's match() which handles prefix stripping automatically
-    const matched = llmPricingRegistry?.match(modelString) ?? null;
+    // Convert Prisma Decimal to plain numbers for serialization
+    const models = rawModels.map((m) => ({
+      ...m,
+      pricingTiers: m.pricingTiers.map((t) => ({
+        ...t,
+        prices: t.prices.map((p) => ({ ...p, price: Number(p.price) })),
+      })),
+    }));
 
     return typedjson({
-      testResult: {
-        modelString,
-        match: matched
-          ? { friendlyId: matched.friendlyId, modelName: matched.modelName }
-          : null,
-      },
+      models,
+      total,
+      page,
+      pageCount: Math.ceil(total / PAGE_SIZE),
+      filters: { search },
     });
   }
+);
 
-  if (_action === "delete") {
-    const modelId = formData.get("modelId");
-    if (typeof modelId === "string") {
-      await prisma.llmModel.delete({ where: { id: modelId } });
+export const action = dashboardAction(
+  { authorization: { requireSuper: true } },
+  async ({ request }) => {
+    const formData = await request.formData();
+    const _action = formData.get("_action");
+
+    if (_action === "seed") {
+      console.log("[admin] seed action started");
+      const result = await seedLlmPricing(prisma);
+      console.log(
+        `[admin] seed complete: ${result.modelsCreated} created, ${result.modelsSkipped} skipped, ${result.modelsUpdated} updated`
+      );
       await llmPricingRegistry?.reload();
+      console.log("[admin] registry reloaded after seed");
+      return typedjson({
+        success: true,
+        message: `Seeded: ${result.modelsCreated} created, ${result.modelsSkipped} skipped, ${result.modelsUpdated} updated`,
+      });
     }
-    return typedjson({ success: true });
-  }
 
-  return typedjson({ error: "Unknown action" }, { status: 400 });
-}
+    if (_action === "sync") {
+      console.log("[admin] sync catalog action started");
+      const result = await syncLlmCatalog(prisma);
+      console.log(
+        `[admin] sync complete: ${result.modelsUpdated} updated, ${result.modelsSkipped} skipped`
+      );
+      await llmPricingRegistry?.reload();
+      console.log("[admin] registry reloaded after sync");
+      return typedjson({
+        success: true,
+        message: `Synced: ${result.modelsUpdated} updated, ${result.modelsSkipped} skipped`,
+      });
+    }
+
+    if (_action === "reload") {
+      console.log("[admin] reload action started");
+      await llmPricingRegistry?.reload();
+      console.log("[admin] registry reloaded");
+      return typedjson({ success: true, message: "Registry reloaded" });
+    }
+
+    if (_action === "test") {
+      const modelString = formData.get("modelString");
+      if (typeof modelString !== "string" || !modelString) {
+        return typedjson({ testResult: null });
+      }
+
+      // Use the registry's match() which handles prefix stripping automatically
+      const matched = llmPricingRegistry?.match(modelString) ?? null;
+
+      return typedjson({
+        testResult: {
+          modelString,
+          match: matched ? { friendlyId: matched.friendlyId, modelName: matched.modelName } : null,
+        },
+      });
+    }
+
+    if (_action === "delete") {
+      const modelId = formData.get("modelId");
+      if (typeof modelId === "string") {
+        await prisma.llmModel.delete({ where: { id: modelId } });
+        await llmPricingRegistry?.reload();
+      }
+      return typedjson({ success: true });
+    }
+
+    return typedjson({ error: "Unknown action" }, { status: 400 });
+  }
+);
 
 export default function AdminLlmModelsRoute() {
-  const { models, filters, page, pageCount, total } =
-    useTypedLoaderData<typeof loader>();
+  const { models, filters, page, pageCount, total } = useTypedLoaderData<typeof loader>();
   const seedFetcher = useFetcher();
   const syncFetcher = useFetcher();
   const reloadFetcher = useFetcher();
@@ -225,7 +222,7 @@ export default function AdminLlmModelsRoute() {
         </div>
 
         {/* Model tester */}
-        <div className="rounded-md border border-grid-dimmed bg-charcoal-800 p-3 space-y-2">
+        <div className="rounded-md border border-grid-dimmed bg-background-bright p-3 space-y-2">
           <label className="text-xs font-medium text-text-dimmed">
             Test model string — paste a model name to see which pricing model matches
           </label>
@@ -238,18 +235,15 @@ export default function AdminLlmModelsRoute() {
               fullWidth
               className="font-mono text-xs"
             />
-            <Button
-              type="submit"
-              variant="secondary/small"
-              disabled={testFetcher.state !== "idle"}
-            >
+            <Button type="submit" variant="secondary/small" disabled={testFetcher.state !== "idle"}>
               Test
             </Button>
           </testFetcher.Form>
           {testResult !== undefined && testResult !== null && (
             <div className="text-xs space-y-1">
               <span className="text-text-dimmed">
-                Testing: <span className="font-mono text-text-bright">{testResult.modelString}</span>
+                Testing:{" "}
+                <span className="font-mono text-text-bright">{testResult.modelString}</span>
               </span>
               {testResult.match ? (
                 <div className="text-green-400">
@@ -262,9 +256,7 @@ export default function AdminLlmModelsRoute() {
                   </Link>
                 </div>
               ) : (
-                <div className="text-red-400">
-                  No match found — this model has no pricing data
-                </div>
+                <div className="text-red-400">No match found — this model has no pricing data</div>
               )}
             </div>
           )}
@@ -323,7 +315,7 @@ export default function AdminLlmModelsRoute() {
                         className={`inline-flex rounded-sm px-1.5 py-0.5 text-[11px] font-medium ${
                           model.source === "admin"
                             ? "bg-amber-500/20 text-amber-400"
-                            : "bg-charcoal-700 text-text-dimmed"
+                            : "bg-background-raised text-text-dimmed"
                         }`}
                       >
                         {model.source ?? "default"}
@@ -341,7 +333,10 @@ export default function AdminLlmModelsRoute() {
                     </TableCell>
                     <TableCell>
                       {otherPrices.length > 0 ? (
-                        <span className="text-xs text-text-dimmed" title={otherPrices.map((p) => p.usageType).join(", ")}>
+                        <span
+                          className="text-xs text-text-dimmed"
+                          title={otherPrices.map((p) => p.usageType).join(", ")}
+                        >
                           +{otherPrices.length} more
                         </span>
                       ) : (

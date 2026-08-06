@@ -1,16 +1,8 @@
-import { type TaskRunAttempt } from "@trigger.dev/database";
 import { eventStream } from "remix-utils/sse/server";
 import { type PrismaClient, prisma } from "~/db.server";
+import { getRequestAbortSignal } from "~/services/httpAsyncStorage.server";
 import { logger } from "~/services/logger.server";
 import { projectPubSub } from "~/v3/services/projectPubSub.server";
-
-type RunWithAttempts = {
-  updatedAt: Date;
-  attempts: {
-    status: TaskRunAttempt["status"];
-    updatedAt: Date;
-  }[];
-};
 
 const pingInterval = 1000;
 
@@ -63,7 +55,9 @@ export class TasksStreamPresenter {
 
     const subscriber = await projectPubSub.subscribe(`project:${project.id}:*`);
 
-    return eventStream(request.signal, (send, close) => {
+    const signal = getRequestAbortSignal();
+
+    return eventStream(signal, (send, close) => {
       const safeSend = (args: { event?: string; data: string }) => {
         try {
           send(args);
@@ -95,7 +89,7 @@ export class TasksStreamPresenter {
       });
 
       pinger = setInterval(() => {
-        if (request.signal.aborted) {
+        if (signal.aborted) {
           return close();
         }
 

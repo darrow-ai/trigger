@@ -1,13 +1,14 @@
-import { createCache, DefaultStatefulContext, Namespace, Cache as UnkeyCache } from "@unkey/cache";
+import type { Cache as UnkeyCache } from "@unkey/cache";
+import { createCache, DefaultStatefulContext, Namespace } from "@unkey/cache";
 import { createLRUMemoryStore } from "@internal/cache";
 import { Ratelimit } from "@upstash/ratelimit";
-import { Request as ExpressRequest, Response as ExpressResponse, NextFunction } from "express";
+import type { Request as ExpressRequest, Response as ExpressResponse, NextFunction } from "express";
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { env } from "~/env.server";
-import { RedisWithClusterOptions } from "~/redis.server";
+import type { RedisWithClusterOptions } from "~/redis.server";
 import { logger } from "./logger.server";
-import { createRedisRateLimitClient, Duration, Limiter, RateLimiter } from "./rateLimiter.server";
+import type { Duration, Limiter } from "./rateLimiter.server";
+import { createRedisRateLimitClient, RateLimiter } from "./rateLimiter.server";
 import { RedisCacheStore } from "./unkey/redisCacheStore.server";
 
 const DurationSchema = z.custom<Duration>((value) => {
@@ -54,10 +55,17 @@ export type RateLimiterConfig = z.infer<typeof RateLimiterConfig>;
 type LimitConfigOverrideFunction = (authorizationValue: string) => Promise<unknown>;
 
 type Options = {
-  redis?: RedisWithClusterOptions;
+  redis: RedisWithClusterOptions;
   keyPrefix: string;
   pathMatchers: (RegExp | string)[];
   pathWhiteList?: (RegExp | string)[];
+  /**
+   * Escape hatch for requests that can only be admitted by consulting state, rather than by
+   * matching a path. Runs after the authorization header check, so an unauthenticated
+   * request is still rejected, and only skips the rate limit itself. Must not throw: a
+   * bypass that cannot decide should return false and let the limiter apply.
+   */
+  bypass?: (req: ExpressRequest) => Promise<boolean>;
   defaultLimiter: RateLimiterConfig;
   limiterConfigOverride?: LimitConfigOverrideFunction;
   limiterCache?: {
@@ -138,8 +146,8 @@ export function createLimiterFromConfig(config: RateLimiterConfig): Limiter {
   return config.type === "fixedWindow"
     ? Ratelimit.fixedWindow(config.tokens, config.window)
     : config.type === "tokenBucket"
-    ? Ratelimit.tokenBucket(config.refillRate, config.interval, config.maxTokens)
-    : Ratelimit.slidingWindow(config.tokens, config.window);
+      ? Ratelimit.tokenBucket(config.refillRate, config.interval, config.maxTokens)
+      : Ratelimit.slidingWindow(config.tokens, config.window);
 }
 
 //returns an Express middleware that rate limits using the Bearer token in the Authorization header
@@ -149,6 +157,7 @@ export function authorizationRateLimitMiddleware({
   defaultLimiter,
   pathMatchers,
   pathWhiteList = [],
+  bypass,
   log = {
     rejections: true,
     requests: true,
@@ -174,16 +183,7 @@ export function authorizationRateLimitMiddleware({
     }),
   });
 
-  const redisClient = createRedisRateLimitClient(
-    redis ?? {
-      port: env.RATE_LIMIT_REDIS_PORT,
-      host: env.RATE_LIMIT_REDIS_HOST,
-      username: env.RATE_LIMIT_REDIS_USERNAME,
-      password: env.RATE_LIMIT_REDIS_PASSWORD,
-      tlsDisabled: env.RATE_LIMIT_REDIS_TLS_DISABLED === "true",
-      clusterMode: env.RATE_LIMIT_REDIS_CLUSTER_MODE_ENABLED === "1",
-    }
-  );
+  const redisClient = createRedisRateLimitClient(redis);
 
   return async (req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {
     if (log.requests) {
@@ -243,6 +243,26 @@ export function authorizationRateLimitMiddleware({
           2
         )
       );
+    }
+
+    if (bypass) {
+      let bypassed = false;
+
+      try {
+        bypassed = await bypass(req);
+      } catch (error) {
+        logger.warn(`RateLimiter (${keyPrefix}): bypass threw, applying the limit`, {
+          path: req.path,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+
+      if (bypassed) {
+        if (log.requests) {
+          logger.info(`RateLimiter (${keyPrefix}): bypassed ${req.path}`);
+        }
+        return next();
+      }
     }
 
     const hash = createHash("sha256");

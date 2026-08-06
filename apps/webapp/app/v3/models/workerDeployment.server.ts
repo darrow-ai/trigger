@@ -1,5 +1,5 @@
 import type { Prettify } from "@trigger.dev/core";
-import {
+import type {
   BackgroundWorker,
   PrismaClientOrTransaction,
   RunEngineVersion,
@@ -9,8 +9,9 @@ import {
   CURRENT_DEPLOYMENT_LABEL,
   CURRENT_UNMANAGED_DEPLOYMENT_LABEL,
 } from "@trigger.dev/core/v3/isomorphic";
-import { Prisma, prisma } from "~/db.server";
-import { AuthenticatedEnvironment } from "~/services/apiAuth.server";
+import type { Prisma } from "~/db.server";
+import { prisma } from "~/db.server";
+import type { AuthenticatedEnvironment } from "~/services/apiAuth.server";
 
 export type CurrentWorkerDeployment = Prettify<
   NonNullable<Awaited<ReturnType<typeof findCurrentWorkerDeployment>>>
@@ -127,14 +128,12 @@ export async function findCurrentWorkerDeployment({
   }
 
   // We need to get the latest deployment of the given type
-  const latestDeployment = await prisma.workerDeployment.findFirst({
+  const latestDeployment = await $prisma.workerDeployment.findFirst({
     where: {
       environmentId,
       type,
     },
-    orderBy: {
-      id: "desc",
-    },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
     select: {
       id: true,
       imageReference: true,

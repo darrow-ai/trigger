@@ -89,18 +89,15 @@ function enrichLlmMetrics(event: CreateEventInput): void {
     { text: formatTokenCount(totalTokens), icon: "tabler-hash" },
   ];
 
-  // Try cost enrichment if the registry is loaded.
-  // The registry handles prefix stripping (e.g. "mistral/mistral-large-3" → "mistral-large-3")
-  // for gateway/openrouter models automatically in its match() method.
-  let cost: ReturnType<NonNullable<typeof _registry>["calculateCost"]> | null = null;
-  if (_registry?.isLoaded) {
-    cost = _registry.calculateCost(responseModel, usageDetails);
-  }
+  // Provider-reported cost (gateway/openrouter) is the exact per-request bill and already
+  // reflects cache-read discounts and the real per-provider rate, so prefer it and only fall
+  // back to catalog pricing when it is absent. The registry handles prefix stripping (e.g.
+  // "mistral/mistral-large-3" → "mistral-large-3") for gateway/openrouter models in match().
+  const providerCost = extractProviderCost(props);
 
-  // Fallback: extract cost from provider metadata (gateway/openrouter report per-request cost)
-  let providerCost: { totalCost: number; source: string } | null = null;
-  if (!cost) {
-    providerCost = extractProviderCost(props);
+  let cost: ReturnType<NonNullable<typeof _registry>["calculateCost"]> | null = null;
+  if (!providerCost && _registry?.isLoaded) {
+    cost = _registry.calculateCost(responseModel, usageDetails);
   }
 
   if (cost) {
@@ -110,6 +107,8 @@ function enrichLlmMetrics(event: CreateEventInput): void {
       "trigger.llm.input_cost": cost.inputCost,
       "trigger.llm.output_cost": cost.outputCost,
       "trigger.llm.total_cost": cost.totalCost,
+      "trigger.llm.cached_cost": cost.costDetails["input_cached_tokens"] ?? 0,
+      "trigger.llm.cache_creation_cost": cost.costDetails["cache_creation_input_tokens"] ?? 0,
       "trigger.llm.matched_model": cost.matchedModelName,
       "trigger.llm.matched_model_id": cost.matchedModelId,
       "trigger.llm.pricing_tier": cost.pricingTierName,
@@ -157,32 +156,41 @@ function enrichLlmMetrics(event: CreateEventInput): void {
     }
   }
 
-  // Extract new performance/behavioral fields
-  const finishReason = typeof props["ai.response.finishReason"] === "string"
-    ? props["ai.response.finishReason"]
-    : typeof props["gen_ai.response.finish_reasons"] === "string"
-      ? props["gen_ai.response.finish_reasons"]
-      : "";
-  const operationId = typeof props["ai.operationId"] === "string"
-    ? props["ai.operationId"]
-    : typeof props["gen_ai.operation.name"] === "string"
-      ? props["gen_ai.operation.name"]
-      : typeof props["operation.name"] === "string"
-        ? props["operation.name"]
-        : "";
-  const msToFirstChunk = typeof props["ai.response.msToFirstChunk"] === "number"
-    ? props["ai.response.msToFirstChunk"]
-    : 0;
-  const avgTokensPerSec = typeof props["ai.response.avgOutputTokensPerSecond"] === "number"
-    ? props["ai.response.avgOutputTokensPerSecond"]
-    : 0;
+  // Extract new performance/behavioral fields.
+  // v6 emits ai.response.finishReason (plain string); v7 (@ai-sdk/otel) emits
+  // gen_ai.response.finish_reasons as a JSON array string (e.g. `["stop"]`).
+  const finishReason = readFinishReason(props);
+  const operationId =
+    typeof props["ai.operationId"] === "string"
+      ? props["ai.operationId"]
+      : typeof props["gen_ai.operation.name"] === "string"
+        ? props["gen_ai.operation.name"]
+        : typeof props["operation.name"] === "string"
+          ? props["operation.name"]
+          : "";
+  const msToFirstChunk =
+    typeof props["ai.response.msToFirstChunk"] === "number"
+      ? props["ai.response.msToFirstChunk"]
+      : 0;
+  const avgTokensPerSec =
+    typeof props["ai.response.avgOutputTokensPerSecond"] === "number"
+      ? props["ai.response.avgOutputTokensPerSecond"]
+      : 0;
   const costSource = cost ? "registry" : providerCost ? providerCost.source : "";
   const providerCostValue = providerCost?.totalCost ?? 0;
 
   // Set _llmMetrics side-channel for dual-write to llm_metrics_v1
   const llmMetrics: LlmMetricsData = {
-    genAiSystem: typeof props["gen_ai.system"] === "string" ? props["gen_ai.system"] : "unknown",
-    requestModel: typeof props["gen_ai.request.model"] === "string" ? props["gen_ai.request.model"] : responseModel,
+    genAiSystem:
+      typeof props["gen_ai.system"] === "string"
+        ? props["gen_ai.system"]
+        : typeof props["gen_ai.provider.name"] === "string"
+          ? props["gen_ai.provider.name"]
+          : "unknown",
+    requestModel:
+      typeof props["gen_ai.request.model"] === "string"
+        ? props["gen_ai.request.model"]
+        : responseModel,
     responseModel,
     baseResponseModel: modelCatalog[responseModel]?.baseModelName ?? responseModel,
     matchedModelId: cost?.matchedModelId ?? "",
@@ -190,10 +198,12 @@ function enrichLlmMetrics(event: CreateEventInput): void {
     finishReason,
     costSource,
     pricingTierId: cost?.pricingTierId ?? (providerCost ? `provider:${providerCost.source}` : ""),
-    pricingTierName: cost?.pricingTierName ?? (providerCost ? `${providerCost.source} reported` : ""),
+    pricingTierName:
+      cost?.pricingTierName ?? (providerCost ? `${providerCost.source} reported` : ""),
     inputTokens: usageDetails["input"] ?? 0,
     outputTokens: usageDetails["output"] ?? 0,
-    totalTokens: usageDetails["total"] ?? (usageDetails["input"] ?? 0) + (usageDetails["output"] ?? 0),
+    totalTokens:
+      usageDetails["total"] ?? (usageDetails["input"] ?? 0) + (usageDetails["output"] ?? 0),
     usageDetails,
     inputCost: cost?.inputCost ?? 0,
     outputCost: cost?.outputCost ?? 0,
@@ -224,8 +234,11 @@ function extractUsageDetails(props: Record<string, unknown>): Record<string, num
     "gen_ai.usage.total_tokens": "total",
     "gen_ai.usage.cache_read_input_tokens": "input_cached_tokens",
     "gen_ai.usage.input_tokens_cache_read": "input_cached_tokens",
+    // AI SDK 7 (@ai-sdk/otel) nests cache token counts: gen_ai.usage.cache_read.input_tokens
+    "gen_ai.usage.cache_read.input_tokens": "input_cached_tokens",
     "gen_ai.usage.cache_creation_input_tokens": "cache_creation_input_tokens",
     "gen_ai.usage.input_tokens_cache_write": "cache_creation_input_tokens",
+    "gen_ai.usage.cache_creation.input_tokens": "cache_creation_input_tokens",
     "gen_ai.usage.reasoning_tokens": "reasoning_tokens",
   };
 
@@ -242,6 +255,35 @@ function extractUsageDetails(props: Record<string, unknown>): Record<string, num
   return details;
 }
 
+/**
+ * Resolve the finish reason across AI SDK majors. v6 emits
+ * `ai.response.finishReason` as a plain string; v7 (@ai-sdk/otel) emits
+ * `gen_ai.response.finish_reasons` as a JSON array string (e.g. `["stop"]`).
+ */
+function readFinishReason(props: Record<string, unknown>): string {
+  const v6 = props["ai.response.finishReason"];
+  if (typeof v6 === "string" && v6) return v6;
+
+  const v7 = props["gen_ai.response.finish_reasons"];
+  if (typeof v7 === "string" && v7) {
+    const trimmed = v7.trim();
+    if (trimmed.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          const first = parsed.find((r) => typeof r === "string");
+          if (typeof first === "string") return first;
+        }
+      } catch {
+        // fall through to the raw value
+      }
+    }
+    return v7;
+  }
+
+  return "";
+}
+
 function enrichStyle(event: CreateEventInput) {
   const baseStyle = event.style ?? {};
   const props = event.properties;
@@ -250,7 +292,7 @@ function enrichStyle(event: CreateEventInput) {
     return baseStyle;
   }
 
-  const system = props["gen_ai.system"];
+  const system = props["gen_ai.system"] ?? props["gen_ai.provider.name"];
   const modelId = props["gen_ai.request.model"] ?? props["ai.model.id"];
 
   const provider = resolveAiProvider(
@@ -296,6 +338,11 @@ function extractProviderCost(
 ): { totalCost: number; source: string } | null {
   const rawMeta = props["ai.response.providerMetadata"];
   if (typeof rawMeta !== "string") return null;
+
+  // Cheap guard: providerMetadata can be large for reasoning models (it carries the full
+  // reasoning_details text), and this now runs on every AI span. Skip the JSON parse when
+  // there is no cost field to find.
+  if (!rawMeta.includes('"cost"')) return null;
 
   let meta: Record<string, unknown>;
   try {

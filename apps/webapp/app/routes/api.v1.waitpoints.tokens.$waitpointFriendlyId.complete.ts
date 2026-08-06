@@ -6,12 +6,12 @@ import {
 } from "@trigger.dev/core/v3";
 import { WaitpointId } from "@trigger.dev/core/v3/isomorphic";
 import { z } from "zod";
-import { $replica } from "~/db.server";
 import { env } from "~/env.server";
 import { logger } from "~/services/logger.server";
 import { processWaitpointCompletionPacket } from "~/runEngine/concerns/waitpointCompletionPacket.server";
 import { createActionApiRoute } from "~/services/routeBuilders/apiBuilder.server";
 import { engine } from "~/v3/runEngine.server";
+import { runStore } from "~/v3/runStore.server";
 
 const { action, loader } = createActionApiRoute(
   {
@@ -23,8 +23,7 @@ const { action, loader } = createActionApiRoute(
     allowJWT: true,
     authorization: {
       action: "write",
-      resource: (params) => ({ waitpoints: params.waitpointFriendlyId }),
-      superScopes: ["write:waitpoints", "admin"],
+      resource: (params) => ({ type: "waitpoints", id: params.waitpointFriendlyId }),
     },
     corsStrategy: "all",
   },
@@ -34,12 +33,24 @@ const { action, loader } = createActionApiRoute(
 
     try {
       //check permissions
-      const waitpoint = await $replica.waitpoint.findFirst({
+      // The store routes by the waitpointId's residency (id shape) and probes both stores, so a
+      // standalone token and a run-owned co-located waitpoint both resolve off the owning replica.
+      let waitpoint = await runStore.findWaitpoint({
         where: {
           id: waitpointId,
           environmentId: authentication.environment.id,
         },
       });
+
+      if (!waitpoint) {
+        // Read-your-writes: a token completed right after mint may not have replicated yet.
+        waitpoint = await runStore.findWaitpointOnPrimary({
+          where: {
+            id: waitpointId,
+            environmentId: authentication.environment.id,
+          },
+        });
+      }
 
       if (!waitpoint) {
         throw json({ error: "Waitpoint not found" }, { status: 404 });
@@ -58,7 +69,7 @@ const { action, loader } = createActionApiRoute(
         `${WaitpointId.toFriendlyId(waitpointId)}/token`
       );
 
-      const result = await engine.completeWaitpoint({
+      const _result = await engine.completeWaitpoint({
         id: waitpointId,
         output: finalData.data
           ? { type: finalData.dataType, value: finalData.data, isError: false }
@@ -72,7 +83,16 @@ const { action, loader } = createActionApiRoute(
         { status: 200 }
       );
     } catch (error) {
-      logger.error("Failed to complete waitpoint token", { error });
+      // Re-throw Response objects (intentional HTTP responses like the 404 above) so the
+      // client gets the correct status code instead of a 500, and we don't log them as errors.
+      if (error instanceof Response) throw error;
+
+      logger.error("Failed to complete waitpoint token", {
+        error:
+          error instanceof Error
+            ? { name: error.name, message: error.message, stack: error.stack }
+            : error,
+      });
       throw json({ error: "Failed to complete waitpoint token" }, { status: 500 });
     }
   }

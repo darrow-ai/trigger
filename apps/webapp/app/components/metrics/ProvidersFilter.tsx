@@ -20,7 +20,7 @@ interface ProvidersFilterProps {
 }
 
 export function ProvidersFilter({ possibleProviders }: ProvidersFilterProps) {
-  const { values, replace, del } = useSearchParams();
+  const { values, replace: _replace, del } = useSearchParams();
   const selectedProviders = values("providers");
 
   if (selectedProviders.length === 0 || selectedProviders.every((v) => v === "")) {
@@ -34,8 +34,9 @@ export function ProvidersFilter({ possibleProviders }: ProvidersFilterProps) {
                 variant="secondary/small"
                 shortcut={shortcut}
                 tooltipTitle="Filter by provider"
+                className="pl-1.5"
               >
-                <span className="ml-0.5">Providers</span>
+                <span className="ml-1">Providers</span>
               </SelectTrigger>
             }
             searchValue={search}
@@ -111,7 +112,12 @@ function ProvidersDropdown({
         <ComboBox placeholder="Filter by provider..." value={searchValue} />
         <SelectList>
           {filtered.map((provider) => (
-            <SelectItem key={provider} value={provider} icon={<ServerIcon className="size-4" />}>
+            <SelectItem
+              key={provider}
+              value={provider}
+              className="text-text-bright"
+              icon={<ServerIcon className="size-4 text-text-dimmed" />}
+            >
               {provider}
             </SelectItem>
           ))}

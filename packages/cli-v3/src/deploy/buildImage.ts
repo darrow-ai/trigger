@@ -1,7 +1,7 @@
 import { logger } from "../utilities/logger.js";
 import { depot } from "@depot/cli";
 import { x } from "tinyexec";
-import { BuildManifest, BuildRuntime } from "@trigger.dev/core/v3/schemas";
+import type { BuildManifest, BuildRuntime } from "@trigger.dev/core/v3/schemas";
 import { networkInterfaces } from "os";
 import { join } from "path";
 import { safeReadJSONFile } from "../utilities/fileSystem.js";
@@ -11,7 +11,7 @@ import { isLinux } from "std-env";
 import { z } from "zod";
 import { assertExhaustive } from "../utilities/assertExhaustive.js";
 import { tryCatch } from "@trigger.dev/core";
-import { CliApiClient } from "../apiClient.js";
+import type { CliApiClient } from "../apiClient.js";
 
 export interface BuildImageOptions {
   // Common options
@@ -692,6 +692,10 @@ const BASE_IMAGE: Record<BuildRuntime, string> = {
   node: "node:21.7.3-bookworm-slim@sha256:dfc05dee209a1d7adf2ef189bd97396daad4e97c6eaa85778d6f75205ba1b0fb",
   "node-22":
     "node:22.16.0-bookworm-slim@sha256:048ed02c5fd52e86fda6fbd2f6a76cf0d4492fd6c6fee9e2c463ed5108da0e34",
+  "node-24":
+    "node:24.18.0-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d",
+  "node-26":
+    "node:26.4.0-bookworm-slim@sha256:ec82d089a8ae2cf02628da7b34ea57dc357b24db724d557fe2d240e6beb659c1",
 };
 
 const DEFAULT_PACKAGES = ["busybox", "ca-certificates", "dumb-init", "git", "openssl"];
@@ -699,7 +703,9 @@ const DEFAULT_PACKAGES = ["busybox", "ca-certificates", "dumb-init", "git", "ope
 export async function generateContainerfile(options: GenerateContainerfileOptions) {
   switch (options.runtime) {
     case "node":
-    case "node-22": {
+    case "node-22":
+    case "node-24":
+    case "node-26": {
       return await generateNodeContainerfile(options);
     }
     case "bun": {
@@ -955,7 +961,7 @@ function normalizeApiUrlForBuild(apiUrl: string): string {
 function getHostIP() {
   const interfaces = networkInterfaces();
 
-  for (const [name, iface] of Object.entries(interfaces)) {
+  for (const [_name, iface] of Object.entries(interfaces)) {
     if (!iface) {
       continue;
     }
@@ -1026,7 +1032,7 @@ function isQemuRegistered() {
     // Check a single QEMU handler
     const binfmt = readFileSync("/proc/sys/fs/binfmt_misc/qemu-aarch64", "utf8");
     return binfmt.includes("enabled");
-  } catch (e) {
+  } catch (_e) {
     return false;
   }
 }
@@ -1152,7 +1158,14 @@ function getOutputOptions({
     return outputOptions;
   }
 
-  const outputOptions: string[] = ["type=image", "oci-mediatypes=true", "rewrite-timestamp=true"];
+  // `rewrite-timestamp` is incompatible with the buildx docker driver's
+  // implicit `unpack=true` on push (used by e.g. orbstack's default builder).
+  // Provide an env-var escape hatch so local-dev deploys can opt out.
+  const skipRewriteTimestamp = process.env.TRIGGER_BUILD_SKIP_REWRITE_TIMESTAMP === "1";
+  const outputOptions: string[] = ["type=image", "oci-mediatypes=true"];
+  if (!skipRewriteTimestamp) {
+    outputOptions.push("rewrite-timestamp=true");
+  }
 
   if (imageTag) {
     outputOptions.push(`name=${imageTag}`);

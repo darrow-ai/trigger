@@ -1,6 +1,6 @@
-import { SerializableJson } from "../../schemas/json.js";
-import { TriggerApiRequestOptions } from "../apiClient/index.js";
-import {
+import type { SerializableJson } from "../../schemas/json.js";
+import type { TriggerApiRequestOptions } from "../apiClient/index.js";
+import type {
   AnyOnCatchErrorHookFunction,
   OnCatchErrorHookFunction,
   OnCleanupHookFunction,
@@ -15,8 +15,8 @@ import {
   OnCancelHookFunction,
   OnStartAttemptHookFunction,
 } from "../lifecycleHooks/types.js";
-import { RunTags } from "../schemas/api.js";
-import {
+import type { RunTags } from "../schemas/api.js";
+import type {
   MachineCpu,
   MachineMemory,
   MachinePresetName,
@@ -25,12 +25,12 @@ import {
   TaskMetadata,
   TaskRunContext,
 } from "../schemas/index.js";
-import { IdempotencyKey } from "./idempotencyKeys.js";
-import { QueueOptions } from "./queues.js";
-import { AnySchemaParseFn, inferSchemaIn, inferSchemaOut, Schema } from "./schemas.js";
-import { inferToolParameters, ToolTaskParameters } from "./tools.js";
-import { Prettify } from "./utils.js";
-import { JSONSchema } from "./jsonSchema.js";
+import type { IdempotencyKey } from "./idempotencyKeys.js";
+import type { QueueOptions } from "./queues.js";
+import type { AnySchemaParseFn, inferSchemaIn, inferSchemaOut, Schema } from "./schemas.js";
+import type { inferToolParameters, ToolTaskParameters } from "./tools.js";
+import type { Prettify } from "./utils.js";
+import type { JSONSchema } from "./jsonSchema.js";
 
 export type Queue = QueueOptions;
 export type TaskSchema = Schema;
@@ -387,6 +387,12 @@ type CommonTaskOptions<
    * Should be a valid JSON Schema Draft 7 object.
    */
   jsonSchema?: JSONSchema;
+
+  /** @internal Set by SDK internals (e.g. `chat.agent()`, `schedules.task()`). */
+  triggerSource?: string;
+
+  /** @internal Agent configuration, only set when `triggerSource` is `"agent"`. */
+  agentConfig?: { type: string };
 };
 
 export type TaskOptions<
@@ -459,7 +465,7 @@ export type AnyBatchedRunHandle = BatchedRunHandle<string, any, any>;
 /**
  * A BatchRunHandle can be used to retrieve the runs of a batch trigger in a typesafe manner.
  */
-export type BatchRunHandle<TTaskIdentifier extends string, TPayload, TOutput> = BrandedRun<
+export type BatchRunHandle<_TTaskIdentifier extends string, TPayload, TOutput> = BrandedRun<
   {
     batchId: string;
     runCount: number;
@@ -469,21 +475,14 @@ export type BatchRunHandle<TTaskIdentifier extends string, TPayload, TOutput> = 
   TPayload
 >;
 
-export type RunHandleOutput<TRunHandle> = TRunHandle extends RunHandle<string, any, infer TOutput>
-  ? TOutput
-  : never;
+export type RunHandleOutput<TRunHandle> =
+  TRunHandle extends RunHandle<string, any, infer TOutput> ? TOutput : never;
 
-export type RunHandlePayload<TRunHandle> = TRunHandle extends RunHandle<string, infer TPayload, any>
-  ? TPayload
-  : never;
+export type RunHandlePayload<TRunHandle> =
+  TRunHandle extends RunHandle<string, infer TPayload, any> ? TPayload : never;
 
-export type RunHandleTaskIdentifier<TRunHandle> = TRunHandle extends RunHandle<
-  infer TTaskIdentifier,
-  any,
-  any
->
-  ? TTaskIdentifier
-  : never;
+export type RunHandleTaskIdentifier<TRunHandle> =
+  TRunHandle extends RunHandle<infer TTaskIdentifier, any, any> ? TTaskIdentifier : never;
 
 export type TaskRunResult<TIdentifier extends string, TOutput = any> =
   | {
@@ -501,13 +500,10 @@ export type TaskRunResult<TIdentifier extends string, TOutput = any> =
 
 export type AnyTaskRunResult = TaskRunResult<string, any>;
 
-export type TaskRunResultFromTask<TTask extends AnyTask> = TTask extends Task<
-  infer TIdentifier,
-  any,
-  infer TOutput
->
-  ? TaskRunResult<TIdentifier, TOutput>
-  : never;
+export type TaskRunResultFromTask<TTask extends AnyTask> =
+  TTask extends Task<infer TIdentifier, any, infer TOutput>
+    ? TaskRunResult<TIdentifier, TOutput>
+    : never;
 
 export type BatchResult<TIdentifier extends string, TOutput = any> = {
   id: string;
@@ -642,6 +638,30 @@ export interface Task<TIdentifier extends string, TInput = void, TOutput = any> 
   ) => TaskRunPromise<TIdentifier, TOutput>;
 
   /**
+   * Trigger a task and subscribe to its updates via realtime. Unlike `triggerAndWait`,
+   * this does NOT suspend the parent run — the parent stays alive and polls for updates.
+   * This enables parallel tool calls and proper abort signal handling.
+   *
+   * @param payload
+   * @param options - Options for the task run, including an optional `signal` to cancel the subscription and child run
+   * @returns TaskRunPromise
+   * @example
+   * ```
+   * const result = await task.triggerAndSubscribe({ foo: "bar" }, { signal: abortSignal });
+   *
+   * if (result.ok) {
+   *   console.log(result.output);
+   * } else {
+   *   console.error(result.error);
+   * }
+   * ```
+   */
+  triggerAndSubscribe: (
+    payload: TInput,
+    options?: TriggerAndSubscribeOptions
+  ) => TaskRunPromise<TIdentifier, TOutput>;
+
+  /**
    * Batch trigger multiple task runs with the given payloads, and wait for the results. Returns the results of the task runs.
    * @param items - Array, AsyncIterable, or ReadableStream of batch items
    * @returns BatchResult
@@ -692,33 +712,24 @@ export interface ToolTask<
 
 export type AnyTask = Task<string, any, any>;
 
-export type TaskPayload<TTask extends AnyTask> = TTask extends Task<string, infer TInput, any>
-  ? TInput
-  : never;
+export type TaskPayload<TTask extends AnyTask> =
+  TTask extends Task<string, infer TInput, any> ? TInput : never;
 
-export type TaskOutput<TTask extends AnyTask> = TTask extends Task<string, any, infer TOutput>
-  ? TOutput
-  : never;
+export type TaskOutput<TTask extends AnyTask> =
+  TTask extends Task<string, any, infer TOutput> ? TOutput : never;
 
-export type TaskOutputHandle<TTask extends AnyTask> = TTask extends Task<
-  infer TIdentifier,
-  infer TInput,
-  infer TOutput
->
-  ? RunHandle<TIdentifier, TOutput, TInput>
-  : never;
+export type TaskOutputHandle<TTask extends AnyTask> =
+  TTask extends Task<infer TIdentifier, infer TInput, infer TOutput>
+    ? RunHandle<TIdentifier, TOutput, TInput>
+    : never;
 
-export type TaskBatchOutputHandle<TTask extends AnyTask> = TTask extends Task<
-  infer TIdentifier,
-  infer TInput,
-  infer TOutput
->
-  ? BatchRunHandle<TIdentifier, TOutput, TInput>
-  : never;
+export type TaskBatchOutputHandle<TTask extends AnyTask> =
+  TTask extends Task<infer TIdentifier, infer TInput, infer TOutput>
+    ? BatchRunHandle<TIdentifier, TOutput, TInput>
+    : never;
 
-export type TaskIdentifier<TTask extends AnyTask> = TTask extends Task<infer TIdentifier, any, any>
-  ? TIdentifier
-  : never;
+export type TaskIdentifier<TTask extends AnyTask> =
+  TTask extends Task<infer TIdentifier, any, any> ? TIdentifier : never;
 
 export type TaskFromIdentifier<
   TTask extends AnyTask,
@@ -989,6 +1000,16 @@ export type TriggerOptions = {
 };
 
 export type TriggerAndWaitOptions = Omit<TriggerOptions, "version">;
+
+export type TriggerAndSubscribeOptions = Omit<TriggerOptions, "version"> & {
+  /** An AbortSignal to cancel the subscription. When fired, the subscription closes and the promise rejects. */
+  signal?: AbortSignal;
+  /**
+   * Whether to cancel the child run when the abort signal fires.
+   * @default true
+   */
+  cancelOnAbort?: boolean;
+};
 export type BatchTriggerOptions = {
   /**
    * If no idempotencyKey is set on an individual item in the batch, it will use this key on each item + the array index.
@@ -1047,17 +1068,14 @@ export type RunTypes<TTaskIdentifier extends string, TPayload, TOutput> = {
 
 export type AnyRunTypes = RunTypes<string, any, any>;
 
-export type InferRunTypes<T> = T extends RunHandle<
-  infer TTaskIdentifier,
-  infer TPayload,
-  infer TOutput
->
-  ? RunTypes<TTaskIdentifier, TPayload, TOutput>
-  : T extends BatchedRunHandle<infer TTaskIdentifier, infer TPayload, infer TOutput>
-  ? RunTypes<TTaskIdentifier, TPayload, TOutput>
-  : T extends Task<infer TTaskIdentifier, infer TPayload, infer TOutput>
-  ? RunTypes<TTaskIdentifier, TPayload, TOutput>
-  : AnyRunTypes;
+export type InferRunTypes<T> =
+  T extends RunHandle<infer TTaskIdentifier, infer TPayload, infer TOutput>
+    ? RunTypes<TTaskIdentifier, TPayload, TOutput>
+    : T extends BatchedRunHandle<infer TTaskIdentifier, infer TPayload, infer TOutput>
+      ? RunTypes<TTaskIdentifier, TPayload, TOutput>
+      : T extends Task<infer TTaskIdentifier, infer TPayload, infer TOutput>
+        ? RunTypes<TTaskIdentifier, TPayload, TOutput>
+        : AnyRunTypes;
 
 export type RunHandleFromTypes<TRunTypes extends AnyRunTypes> = RunHandle<
   TRunTypes["taskIdentifier"],

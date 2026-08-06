@@ -18,6 +18,7 @@ import {
   UNSET_VALUE,
   BooleanControl,
   EnumControl,
+  NumberControl,
   StringControl,
   WorkerGroupControl,
   type WorkerGroup,
@@ -165,14 +166,14 @@ export function FeatureFlagsDialog({
                   return (
                     <div
                       key={key}
-                      className="flex items-center justify-between rounded-md border border-transparent bg-charcoal-750 px-3 py-2.5"
+                      className="flex items-center justify-between rounded-md border border-transparent bg-background-hover px-3 py-2.5"
                       title="Global-level setting - not editable per org"
                     >
                       <div className="min-w-0 flex-1">
                         <div className="truncate text-sm text-text-dimmed">{key}</div>
-                        <div className="text-xs text-charcoal-400">global: {globalDisplay}</div>
+                        <div className="text-xs text-text-dimmed">global: {globalDisplay}</div>
                       </div>
-                      <LockClosedIcon className="size-4 text-charcoal-500" />
+                      <LockClosedIcon className="size-4 text-text-faint" />
                     </div>
                   );
                 }
@@ -186,7 +187,7 @@ export function FeatureFlagsDialog({
                       "flex items-center justify-between rounded-md border px-3 py-2.5",
                       isOverridden
                         ? "border-indigo-500/20 bg-indigo-500/5"
-                        : "border-transparent bg-charcoal-750"
+                        : "border-transparent bg-background-hover"
                     )}
                   >
                     <div className="min-w-0 flex-1">
@@ -198,7 +199,7 @@ export function FeatureFlagsDialog({
                       >
                         {key}
                       </div>
-                      <div className="text-xs text-charcoal-400">global: {globalDisplay}</div>
+                      <div className="text-xs text-text-dimmed">global: {globalDisplay}</div>
                     </div>
 
                     <div className="flex items-center gap-2">
@@ -242,6 +243,20 @@ export function FeatureFlagsDialog({
                           }}
                           dimmed={!isOverridden}
                         />
+                      ) : control.type === "number" ? (
+                        <NumberControl
+                          value={isOverridden ? (overrides[key] as number) : undefined}
+                          min={control.min}
+                          max={control.max}
+                          onChange={(val) => {
+                            if (val === undefined) {
+                              unsetFlag(key);
+                            } else {
+                              setFlagValue(key, val);
+                            }
+                          }}
+                          dimmed={!isOverridden}
+                        />
                       ) : control.type === "string" ? (
                         <StringControl
                           value={isOverridden ? (overrides[key] as string) : ""}
@@ -268,7 +283,7 @@ export function FeatureFlagsDialog({
             <summary className="cursor-pointer text-xs text-text-dimmed hover:text-text-bright">
               Preview JSON
             </summary>
-            <pre className="mt-1 max-h-40 overflow-auto rounded bg-charcoal-800 p-2 text-xs text-text-dimmed">
+            <pre className="mt-1 max-h-40 overflow-auto rounded bg-background-bright p-2 text-xs text-text-dimmed">
               {jsonPreview}
             </pre>
           </details>

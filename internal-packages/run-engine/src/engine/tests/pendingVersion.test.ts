@@ -3,7 +3,8 @@ import { trace } from "@internal/tracing";
 import { RunEngine } from "../index.js";
 import { setTimeout } from "timers/promises";
 import { setupAuthenticatedEnvironment, setupBackgroundWorker } from "./setup.js";
-import { DequeuedMessage } from "@trigger.dev/core/v3";
+import type { DequeuedMessage } from "@trigger.dev/core/v3";
+import { PostgresPendingVersionRunIdLookup } from "./postgresPendingVersionLookup.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
@@ -44,6 +45,7 @@ describe("RunEngine pending version", () => {
         },
         //set this so we have to requeue the runs in two batches
         queueRunsWaitingForWorkerBatchSize: 1,
+        pendingVersionRunIdLookup: new PostgresPendingVersionRunIdLookup(prisma),
         tracer: trace.getTracer("test", "0.0.0"),
       });
 
@@ -131,7 +133,7 @@ describe("RunEngine pending version", () => {
         expect(executionData2R2.run.status).toBe("PENDING_VERSION");
 
         //create background worker
-        const backgroundWorker = await setupBackgroundWorker(
+        const _backgroundWorker = await setupBackgroundWorker(
           engine,
           authenticatedEnvironment,
           taskIdentifier
@@ -191,6 +193,7 @@ describe("RunEngine pending version", () => {
         },
         //set this so we have to requeue the runs in two batches
         queueRunsWaitingForWorkerBatchSize: 1,
+        pendingVersionRunIdLookup: new PostgresPendingVersionRunIdLookup(prisma),
         tracer: trace.getTracer("test", "0.0.0"),
         logLevel: "debug",
       });
@@ -281,7 +284,7 @@ describe("RunEngine pending version", () => {
         expect(executionData2R2.run.status).toBe("PENDING_VERSION");
 
         //create background worker
-        const backgroundWorker = await setupBackgroundWorker(
+        const _backgroundWorker = await setupBackgroundWorker(
           engine,
           authenticatedEnvironment,
           taskIdentifier,
@@ -304,6 +307,139 @@ describe("RunEngine pending version", () => {
         expect(executionData3R2.snapshot.executionStatus).toBe("QUEUED");
         expect(executionData3R1.run.status).toBe("PENDING");
         expect(executionData3R2.run.status).toBe("PENDING");
+      } finally {
+        await engine.quit();
+      }
+    }
+  );
+
+  containerTest(
+    "PENDING_VERSION re-enqueue arms TTL but anchors the scheduling-delay clock at the promotion",
+    async ({ prisma, redisOptions }) => {
+      // When a run enters PENDING_VERSION (background worker doesn't yet have
+      // the task), the first enqueue happens but the message is dequeued and
+      // its TTL set entry is dropped while the run waits for a matching worker.
+      // Once a worker arrives, pendingVersionSystem re-enqueues. That
+      // re-enqueue is the first time the run is actually queued for a worker,
+      // so TTL must be armed at that point — not held over from the original
+      // enqueue.
+      const authenticatedEnvironment = await setupAuthenticatedEnvironment(prisma, "PRODUCTION");
+
+      const engine = new RunEngine({
+        prisma,
+        worker: {
+          redis: redisOptions,
+          workers: 1,
+          tasksPerWorker: 10,
+          pollIntervalMs: 100,
+        },
+        queue: {
+          redis: redisOptions,
+          processWorkerQueueDebounceMs: 50,
+          masterQueueConsumersDisabled: true,
+          ttlSystem: {
+            pollIntervalMs: 100,
+            batchSize: 10,
+            batchMaxWaitMs: 100,
+          },
+        },
+        runLock: {
+          redis: redisOptions,
+        },
+        machines: {
+          defaultMachine: "small-1x",
+          machines: {
+            "small-1x": {
+              name: "small-1x" as const,
+              cpu: 0.5,
+              memory: 0.5,
+              centsPerMs: 0.0001,
+            },
+          },
+          baseCostInCents: 0.0001,
+        },
+        pendingVersionRunIdLookup: new PostgresPendingVersionRunIdLookup(prisma),
+        tracer: trace.getTracer("test", "0.0.0"),
+      });
+
+      try {
+        const taskIdentifier = "test-task";
+
+        // Trigger a run with TTL — no background worker exists yet for this
+        // task, so it will end up in PENDING_VERSION.
+        const run = await engine.trigger(
+          {
+            number: 1,
+            friendlyId: "run_pvttl1",
+            environment: authenticatedEnvironment,
+            taskIdentifier,
+            payload: "{}",
+            payloadType: "application/json",
+            context: {},
+            traceContext: {},
+            traceId: "tpv1",
+            spanId: "spv1",
+            queue: "task/test-task",
+            isTest: false,
+            tags: [],
+            ttl: "10m",
+          },
+          prisma
+        );
+
+        // A worker arrives that doesn't have this task — flushes the run to
+        // PENDING_VERSION.
+        await setupBackgroundWorker(engine, authenticatedEnvironment, ["test-task-other"]);
+
+        await setTimeout(500);
+
+        // The consumer attempt is what flushes the run to PENDING_VERSION —
+        // dequeue finds no matching task version and returns nothing.
+        const dequeuedEmpty = await engine.dequeueFromWorkerQueue({
+          consumerId: "test_pv",
+          workerQueue: "main",
+        });
+        expect(dequeuedEmpty.length).toBe(0);
+
+        const executionDataAfter = await engine.getRunExecutionData({ runId: run.id });
+        assertNonNullable(executionDataAfter);
+        expect(executionDataAfter.run.status).toBe("PENDING_VERSION");
+
+        // Now a worker arrives WITH the task — pendingVersionSystem
+        // re-enqueues the run.
+        const beforePromotion = Date.now();
+        await setupBackgroundWorker(engine, authenticatedEnvironment, taskIdentifier);
+
+        await setTimeout(1000);
+
+        const executionDataReenqueued = await engine.getRunExecutionData({ runId: run.id });
+        assertNonNullable(executionDataReenqueued);
+        expect(executionDataReenqueued.run.status).toBe("PENDING");
+
+        // The re-enqueued message must carry ttlExpiresAt so the TTL set
+        // tracks it for expiration.
+        const message = await engine.runQueue.readMessage(
+          authenticatedEnvironment.organization.id,
+          run.id
+        );
+        assertNonNullable(message);
+        expect(message.ttlExpiresAt).toBeDefined();
+        expect(typeof message.ttlExpiresAt).toBe("number");
+
+        const queuePositionMs = (run.queueTimestamp ?? run.createdAt).getTime();
+
+        expect(
+          message.eligibleAtMs,
+          "scheduling-delay clock must start at the promotion, since the run was not runnable while it waited for a worker version"
+        ).toBeGreaterThanOrEqual(beforePromotion);
+        expect(
+          message.eligibleAtMs,
+          "anchoring at the original queue position would bill the whole wait-for-deploy period as queue scheduling delay"
+        ).toBeGreaterThan(queuePositionMs);
+        expect(
+          message.timestamp,
+          "ordering keeps the original queue position, so waiting for a deployment must not cost the run its place in line"
+        ).toBe(queuePositionMs - run.priorityMs);
       } finally {
         await engine.quit();
       }

@@ -1,3 +1,4 @@
+import { XMarkIcon } from "@heroicons/react/20/solid";
 import { useFetcher, useNavigate } from "@remix-run/react";
 import { AnimatePresence, motion } from "framer-motion";
 import { useEffect, useRef, useState } from "react";
@@ -6,6 +7,7 @@ import { Input } from "~/components/primitives/Input";
 import { Popover, PopoverContent, PopoverTrigger } from "~/components/primitives/Popover";
 import { ShortcutKey } from "~/components/primitives/ShortcutKey";
 import { Spinner } from "~/components/primitives/Spinner";
+import { SimpleTooltip } from "~/components/primitives/Tooltip";
 import { useEnvironment } from "~/hooks/useEnvironment";
 import { useOrganization } from "~/hooks/useOrganizations";
 import { useProject } from "~/hooks/useProject";
@@ -98,7 +100,7 @@ export function AIFilterInput() {
                 "disabled:text-text-dimmed/50",
                 isFocused && "placeholder:text-text-dimmed/70"
               )}
-              containerClassName="has-[:disabled]:opacity-100"
+              containerClassName="has-disabled:opacity-100"
               onKeyDown={(e) => {
                 if (e.key === "Enter" && text.trim() && !isLoading) {
                   e.preventDefault();
@@ -106,6 +108,11 @@ export function AIFilterInput() {
                   if (form) {
                     form.requestSubmit();
                   }
+                }
+                if (e.key === "Escape") {
+                  e.stopPropagation();
+                  setText("");
+                  e.currentTarget.blur();
                 }
               }}
               onFocus={() => setIsFocused(true)}
@@ -125,11 +132,34 @@ export function AIFilterInput() {
                     className="size-4 opacity-80"
                   />
                 ) : text.length > 0 ? (
-                  <ShortcutKey
-                    shortcut={{ key: "enter" }}
-                    variant="small"
-                    className={cn("transition-opacity", text.length === 0 && "opacity-0")}
-                  />
+                  <div className="-mr-1 flex items-center gap-1.5">
+                    <ShortcutKey
+                      shortcut={{ key: "enter" }}
+                      variant="medium"
+                      className="border-none"
+                    />
+                    <SimpleTooltip
+                      asChild
+                      button={
+                        <button
+                          type="button"
+                          onMouseDown={(e) => e.preventDefault()}
+                          onClick={() => setText("")}
+                          className="flex size-4.5 items-center justify-center rounded-[2px] border border-text-dimmed/40 text-text-dimmed transition hover:bg-surface-control hover:text-text-bright"
+                        >
+                          <XMarkIcon className="size-3" />
+                        </button>
+                      }
+                      content={
+                        <div className="flex items-center gap-1">
+                          <span className="text-text-dimmed">Clear field</span>
+                          <ShortcutKey shortcut={{ key: "esc" }} variant="small" />
+                        </div>
+                      }
+                      className="px-2 py-1.5 text-xs"
+                      disableHoverableContent
+                    />
+                  </div>
                 ) : undefined
               }
             />
@@ -176,7 +206,7 @@ function ErrorPopover({
       <PopoverContent
         align="start"
         side="bottom"
-        className="w-[var(--radix-popover-trigger-width)] min-w-[var(--radix-popover-trigger-width)] max-w-[var(--radix-popover-trigger-width)] border border-error/20 bg-[#2F1D24] px-3 py-2 text-xs text-text-dimmed"
+        className="w-(--radix-popover-trigger-width) min-w-(--radix-popover-trigger-width) max-w-(--radix-popover-trigger-width) border border-error/20 bg-[#2F1D24] light:bg-error/10 px-3 py-2 text-xs text-text-dimmed"
       >
         {error}
       </PopoverContent>

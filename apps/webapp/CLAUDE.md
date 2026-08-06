@@ -1,6 +1,6 @@
 # Webapp
 
-Remix 2.1.0 app serving as the main API, dashboard, and orchestration engine. Uses an Express server (`server.ts`).
+Remix 2.17.4 app serving as the main API, dashboard, and orchestration engine. Uses an Express server (`server.ts`).
 
 ## Verifying Changes
 
@@ -59,13 +59,24 @@ Use the `chrome-devtools` MCP server to visually verify local dashboard changes.
 Routes use Remix flat-file convention with dot-separated segments:
 `api.v1.tasks.$taskId.trigger.ts` -> `/api/v1/tasks/:taskId/trigger`
 
+## Abort Signals
+
+**Never use `request.signal`** for detecting client disconnects. It is broken due to a Node.js bug ([nodejs/node#55428](https://github.com/nodejs/node/issues/55428)) where the AbortSignal chain is severed when Remix internally clones the Request object. Instead, use `getRequestAbortSignal()` from `app/services/httpAsyncStorage.server.ts`, which is wired directly to Express `res.on("close")` and fires reliably.
+
+```typescript
+import { getRequestAbortSignal } from "~/services/httpAsyncStorage.server";
+
+// In route handlers, SSE streams, or any server-side code:
+const signal = getRequestAbortSignal();
+```
+
 ## Environment Variables
 
 Access via `env` export from `app/env.server.ts`. **Never use `process.env` directly.**
 
 For testable code, **never import env.server.ts** in test files. Pass configuration as options instead:
-- `realtimeClient.server.ts` (testable service, takes config as constructor arg)
-- `realtimeClientGlobal.server.ts` (creates singleton with env config)
+- `realtime/nativeRealtimeClient.server.ts` (testable service, takes config as constructor arg)
+- `realtime/nativeRealtimeClientInstance.server.ts` (creates singleton with env config)
 
 ## Run Engine 2.0
 
@@ -80,24 +91,14 @@ Background job workers use `@trigger.dev/redis-worker`:
 - `app/v3/alertsWorker.server.ts`
 - `app/v3/batchTriggerWorker.server.ts`
 
-Do NOT add new jobs using zodworker/graphile-worker (legacy).
-
 ## Real-time
 
 - Socket.io: `app/v3/handleSocketIo.server.ts`, `app/v3/handleWebsockets.server.ts`
 - Electric SQL: Powers real-time data sync for the dashboard
 
-## Legacy V1 Code
+## v3 (engine V1) removed
 
-The `app/v3/` directory name is misleading - most code is actively used by V2. Only these specific files are V1-only legacy:
-- `app/v3/marqs/` (old MarQS queue system)
-- `app/v3/legacyRunEngineWorker.server.ts`
-- `app/v3/services/triggerTaskV1.server.ts`
-- `app/v3/services/cancelTaskRunV1.server.ts`
-- `app/v3/authenticatedSocketConnection.server.ts`
-- `app/v3/sharedSocketConnection.ts`
-
-Some services (e.g., `cancelTaskRun.server.ts`, `batchTriggerV3.server.ts`) branch on `RunEngineVersion` to support both V1 and V2. When editing these, only modify V2 code paths.
+v3 (engine V1: MarQS + Graphile worker) is end-of-life and its execution code is gone. The `app/v3/` directory name is historical; everything under it now serves V2. There is no V1 execution path: a `RunEngineVersion` `V1` branch (e.g. in `triggerTask.server.ts`, `cancelTaskRun.server.ts`) only rejects/finalizes gracefully so v3 clients get a clean 4xx, never a 5xx. Do not reintroduce V1. See `.claude/rules/legacy-v3-code.md` for the deprecation boundary.
 
 ## Performance: Trigger Hot Path
 
@@ -113,6 +114,16 @@ The `triggerTask.server.ts` service is the **highest-throughput code path** in t
 ## Prisma Query Patterns
 
 - **Always use `findFirst` instead of `findUnique`.** Prisma's `findUnique` has an implicit DataLoader that batches concurrent calls into a single `IN` query. This batching cannot be disabled and has active bugs even in Prisma 6.x: uppercase UUIDs returning null (#25484, confirmed 6.4.1), composite key SQL correctness issues (#22202), and 5-10x worse performance than manual DataLoader (#6573, open since 2021). `findFirst` is never batched and avoids this entire class of issues.
+
+## Transactions
+
+- **Always use the `$transaction` helper from `~/db.server`, never `prisma.$transaction` (or `$replica.$transaction`) directly.** The helper wraps the raw call with tracing (an OTEL span + an `isolation_level` attribute) and boundary logging for infrastructure errors (e.g. `PrismaClientInitializationError`) that the raw client swallows. Signature: `$transaction(prisma, name?, async (tx) => { ... }, options?)`.
+- Pass the isolation level via options as a string: `{ isolationLevel: "Serializable" }`. Reach for `Serializable` when a read-then-write must be atomic against concurrent transactions (e.g. a count-then-delete invariant); the loser of a race fails and can retry, which is the right trade for rare, correctness-critical paths.
+- The helper returns `R | undefined` — guard the result (`if (!result) throw ...`) when callers need a definite value.
+
+## PAT-authenticated API routes
+
+- **A PAT route must resolve its target org/project scoped to the caller's membership** (`members: { some: { userId } }`, or a helper like `findProjectByRef` / `resolveOrganizationForApiUser`). A PAT is user-scoped and can name any org/project by id/slug, and the OSS RBAC fallback ability is permissive — so `ability.can(...)` alone does NOT reject a non-member on self-hosted. The RBAC `authorization` gate enforces the *role*; the membership-scoped query is the *tenant* floor. Skipping it opens cross-org access on OSS.
 
 ## React Patterns
 

@@ -1,10 +1,9 @@
-import type { DeliverEmail, SendPlainTextOptions } from "emails";
-import { EmailClient, MailTransportOptions } from "emails";
+import type { DeliverEmail, SendPlainTextOptions, MailTransportOptions } from "emails";
+import { EmailClient } from "emails";
 import type { SendEmailOptions } from "remix-auth-email-link";
 import { redirect } from "remix-typedjson";
 import { env } from "~/env.server";
 import type { AuthUser } from "./authUser";
-import { commonWorker } from "~/v3/commonWorker.server";
 import { logger } from "./logger.server";
 import { singleton } from "~/utils/singleton";
 import { assertEmailAllowed } from "~/utils/email";
@@ -90,15 +89,6 @@ export async function sendMagicLinkEmail(options: SendEmailOptions<AuthUser>): P
 
 export async function sendPlainTextEmail(options: SendPlainTextOptions) {
   return client.sendPlainText(options);
-}
-
-export async function scheduleEmail(data: DeliverEmail, delay?: { seconds: number }) {
-  const availableAt = delay ? new Date(Date.now() + delay.seconds * 1000) : undefined;
-  await commonWorker.enqueue({
-    job: "scheduleEmail",
-    payload: data,
-    availableAt,
-  });
 }
 
 export async function sendEmail(data: DeliverEmail) {

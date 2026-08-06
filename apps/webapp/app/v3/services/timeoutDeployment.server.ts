@@ -3,8 +3,8 @@ import { BaseService } from "./baseService.server";
 import { commonWorker } from "../commonWorker.server";
 import { PerformDeploymentAlertsService } from "./alerts/performDeploymentAlerts.server";
 import { type PrismaClientOrTransaction } from "~/db.server";
-import { workerQueue } from "~/services/worker.server";
 import { DeploymentService } from "./deployment.server";
+import { recordDeploymentOutcome } from "./recordDeploymentOutcome.server";
 
 export class TimeoutDeploymentService extends BaseService {
   public async call(id: string, fromStatus: string, errorMessage: string) {
@@ -27,7 +27,10 @@ export class TimeoutDeploymentService extends BaseService {
     }
 
     if (deployment.status !== fromStatus) {
-      logger.error("Deployment is not in the correct state to be timed out", {
+      // Race: timeout job fired after the deployment moved out of the
+      // expected state (already deployed/failed). System handles it by
+      // returning early — not an error.
+      logger.warn("Deployment is not in the correct state to be timed out", {
         currentStatus: deployment.status,
         fromStatus,
       });
@@ -43,6 +46,16 @@ export class TimeoutDeploymentService extends BaseService {
         failedAt: new Date(),
         errorData: { message: errorMessage, name: "TimeoutError" },
       },
+    });
+
+    recordDeploymentOutcome({
+      status: "TIMED_OUT",
+      deploymentFriendlyId: deployment.friendlyId,
+      organizationId: deployment.environment.project.organizationId,
+      projectId: deployment.environment.projectId,
+      environmentId: deployment.environmentId,
+      environmentType: deployment.environment.type,
+      reason: errorMessage,
     });
 
     const deploymentService = new DeploymentService();
@@ -82,8 +95,6 @@ export class TimeoutDeploymentService extends BaseService {
   }
 
   static async dequeue(deploymentId: string, tx?: PrismaClientOrTransaction) {
-    // For backwards compatibility during transition, we need to dequeue/ack from both workers
-    await workerQueue.dequeue(`timeoutDeployment:${deploymentId}`, { tx });
     await commonWorker.ack(`timeoutDeployment:${deploymentId}`);
   }
 }

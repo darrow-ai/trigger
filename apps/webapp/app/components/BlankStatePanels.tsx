@@ -11,7 +11,8 @@ import {
   Squares2X2Icon,
 } from "@heroicons/react/20/solid";
 import { useLocation } from "react-use";
-import { AIPromptsIcon } from "~/assets/icons/AIPromptsIcon";
+import { AIChatIcon } from "~/assets/icons/AIChatIcon";
+import { AIPenIcon } from "~/assets/icons/AIPenIcon";
 import { BranchEnvironmentIconSmall } from "~/assets/icons/EnvironmentIcons";
 import { WaitpointTokenIcon } from "~/assets/icons/WaitpointTokenIcon";
 import openBulkActionsPanel from "~/assets/images/open-bulk-actions-panel.png";
@@ -22,7 +23,8 @@ import { useFeatures } from "~/hooks/useFeatures";
 import { useOrganization } from "~/hooks/useOrganizations";
 import { useProject } from "~/hooks/useProject";
 import { type MinimumEnvironment } from "~/presenters/SelectBestEnvironmentPresenter.server";
-import { NewBranchPanel } from "~/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.branches/route";
+import { type BranchableEnvironmentToken } from "~/utils/branchableEnvironment";
+import { NewBranchPanel } from "~/routes/resources.branches.create";
 import { GitHubSettingsPanel } from "~/routes/resources.orgs.$organizationSlug.projects.$projectParam.env.$envParam.github";
 import {
   docsPath,
@@ -189,6 +191,40 @@ export function BatchesNone() {
   );
 }
 
+export function SessionsNone() {
+  return (
+    <InfoPanel
+      title="Sessions"
+      icon={AIChatIcon}
+      iconClassName="text-sessions"
+      panelClassName="max-w-full"
+      accessory={
+        <LinkButton
+          to={docsPath("ai-chat/sessions")}
+          variant="docs/small"
+          LeadingIcon={BookOpenIcon}
+        >
+          Sessions docs
+        </LinkButton>
+      }
+    >
+      <Paragraph spacing variant="small">
+        A session is a stateful execution of an agent, with two-way streaming and durable compute. A
+        single session can have multiple runs associated with it, so one conversation can span many
+        task triggers. The input stream carries incoming user messages, and the output stream
+        carries everything the agent produces, including AI generation parts (text, reasoning, tool
+        calls, etc.) and any custom data parts your task emits.
+      </Paragraph>
+      <Paragraph spacing variant="small">
+        The easiest way to create one is to trigger a <InlineCode>chat.agent</InlineCode> task,
+        which is built on sessions and handles the chat turn loop for you. You can also call{" "}
+        <InlineCode>sessions.start()</InlineCode> directly for non-chat patterns like agent inboxes,
+        approval flows, or server-to-server streaming.
+      </Paragraph>
+    </InfoPanel>
+  );
+}
+
 export function TestHasNoTasks() {
   const organization = useOrganization();
   const project = useProject();
@@ -269,7 +305,7 @@ export function DeploymentsNoneDev() {
           organization={organization}
           project={project}
           environment={environment}
-          className="w-fit border border-charcoal-600 bg-secondary hover:border-charcoal-550 hover:bg-charcoal-600"
+          className="w-fit border border-border-bright bg-secondary hover:border-border-brighter hover:bg-surface-control"
         />
       </StepContentContainer>
     </>
@@ -401,7 +437,7 @@ export function NoWaitpointTokens() {
   );
 }
 
-export function BranchesNoBranchableEnvironment() {
+export function BranchesNoBranchableEnvironment({ showSelfServe }: { showSelfServe: boolean }) {
   const { isManagedCloud } = useFeatures();
   const organization = useOrganization();
 
@@ -429,9 +465,16 @@ export function BranchesNoBranchableEnvironment() {
       iconClassName="text-preview"
       panelClassName="max-w-full"
       accessory={
-        <LinkButton variant="primary/small" to={v3BillingPath(organization)}>
-          Upgrade
-        </LinkButton>
+        showSelfServe ? (
+          <LinkButton variant="primary/small" to={v3BillingPath(organization)}>
+            Upgrade
+          </LinkButton>
+        ) : (
+          <Feedback
+            button={<Button variant="secondary/small">Request more</Button>}
+            defaultValue="enterprise"
+          />
+        )
       }
     >
       <Paragraph spacing variant="small">
@@ -447,32 +490,41 @@ export function BranchesNoBranchableEnvironment() {
 }
 
 export function BranchesNoBranches({
-  parentEnvironment,
+  env,
   limits,
   canUpgrade,
+  showSelfServe,
 }: {
-  parentEnvironment: { id: string };
+  env: BranchableEnvironmentToken;
   limits: { used: number; limit: number };
   canUpgrade: boolean;
+  showSelfServe: boolean;
 }) {
   const organization = useOrganization();
+
+  const envTextClassName = env === "preview" ? "text-preview" : "text-dev";
+  const branchesLabel = env === "preview" ? "preview branches" : "dev branches";
 
   if (limits.used >= limits.limit) {
     return (
       <InfoPanel
-        title="Upgrade to get preview branches"
+        title={`Upgrade to get ${branchesLabel}`}
         icon={BranchEnvironmentIconSmall}
-        iconClassName="text-preview"
+        iconClassName={envTextClassName}
         panelClassName="max-w-full"
         accessory={
-          canUpgrade ? (
+          showSelfServe && canUpgrade ? (
             <LinkButton variant="primary/small" to={v3BillingPath(organization)}>
               Upgrade
             </LinkButton>
           ) : (
             <Feedback
-              button={<Button variant="primary/small">Request more</Button>}
-              defaultValue="help"
+              button={
+                <Button variant={showSelfServe ? "primary/small" : "secondary/small"}>
+                  Request more
+                </Button>
+              }
+              defaultValue={showSelfServe ? "help" : "enterprise"}
             />
           )
         }
@@ -489,7 +541,7 @@ export function BranchesNoBranches({
     <InfoPanel
       title="Create your first branch"
       icon={BranchEnvironmentIconSmall}
-      iconClassName="text-preview"
+      iconClassName={envTextClassName}
       panelClassName="max-w-full"
       accessory={
         <NewBranchPanel
@@ -502,7 +554,7 @@ export function BranchesNoBranches({
               New branch
             </Button>
           }
-          parentEnvironment={parentEnvironment}
+          env={env}
         />
       }
     >
@@ -650,14 +702,12 @@ function DeploymentOnboardingSteps() {
               Deploy automatically with every push. Read the{" "}
               <TextLink to={docsPath("github-integration")}>full guide</TextLink>.
             </Paragraph>
-            <div className="w-fit">
-              <GitHubSettingsPanel
-                organizationSlug={organization.slug}
-                projectSlug={project.slug}
-                environmentSlug={environment.slug}
-                billingPath={v3BillingPath({ slug: organization.slug })}
-              />
-            </div>
+            <GitHubSettingsPanel
+              organizationSlug={organization.slug}
+              projectSlug={project.slug}
+              environmentSlug={environment.slug}
+              billingPath={v3BillingPath({ slug: organization.slug })}
+            />
           </StepContentContainer>
         </ClientTabsContent>
         <ClientTabsContent value={"cli"}>
@@ -693,15 +743,11 @@ export function PromptsNone() {
   return (
     <InfoPanel
       title="Define your first prompt"
-      icon={AIPromptsIcon}
+      icon={AIPenIcon}
       iconClassName="text-aiPrompts"
       panelClassName="max-w-lg"
       accessory={
-        <LinkButton
-          to={docsPath("prompt-management")}
-          variant="docs/small"
-          LeadingIcon={BookOpenIcon}
-        >
+        <LinkButton to={docsPath("ai/prompts")} variant="docs/small" LeadingIcon={BookOpenIcon}>
           Prompts docs
         </LinkButton>
       }

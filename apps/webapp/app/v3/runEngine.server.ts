@@ -2,10 +2,16 @@ import { RunEngine } from "@internal/run-engine";
 import { $replica, prisma } from "~/db.server";
 import { env } from "~/env.server";
 import { createBatchGlobalRateLimiter } from "~/runEngine/concerns/batchGlobalRateLimiter.server";
+import { SCHEDULED_WORKER_QUEUE_SUFFIX } from "~/runEngine/concerns/workerQueueSplit.server";
 import { logger } from "~/services/logger.server";
 import { defaultMachine, getCurrentPlan } from "~/services/platform.v3.server";
 import { singleton } from "~/utils/singleton";
 import { allMachines } from "./machinePresets.server";
+import { getQueueMetricsEmitter } from "./queueMetrics.server";
+import { runEnginePendingVersionLookup } from "./runEnginePendingVersionLookup.server";
+import { pickRunOpsStoreForCompletion } from "./runOpsMigration/crossSeamGuard.server";
+import { runEngineControlPlaneResolver } from "./runOpsMigration/runEngineControlPlaneResolver.server";
+import { runStore } from "./runStore.server";
 import { meter, tracer } from "./tracer.server";
 
 export const engine = singleton("RunEngine", createRunEngine);
@@ -16,9 +22,20 @@ function createRunEngine() {
   const engine = new RunEngine({
     prisma,
     readOnlyPrisma: $replica,
+    crossSeamGuard: pickRunOpsStoreForCompletion,
+    // Inject the shared run-store singleton so the engine and the webapp presenters/
+    // services route through ONE store. When split is off this is the same passthrough
+    // PostgresRunStore the engine would have defaulted to, so behavior is unchanged.
+    store: runStore,
+    controlPlaneResolver: runEngineControlPlaneResolver,
     logLevel: env.RUN_ENGINE_WORKER_LOG_LEVEL,
     treatProductionExecutionStallsAsOOM:
       env.RUN_ENGINE_TREAT_PRODUCTION_EXECUTION_STALLS_AS_OOM === "1",
+    readReplicaSnapshotsSinceEnabled: env.RUN_ENGINE_READ_REPLICA_SNAPSHOTS_SINCE_ENABLED === "1",
+    readReplicaSnapshotsSinceRetryDelay: {
+      minMs: env.RUN_ENGINE_SNAPSHOTS_SINCE_REPLICA_RETRY_MIN_MS,
+      maxMs: env.RUN_ENGINE_SNAPSHOTS_SINCE_REPLICA_RETRY_MAX_MS,
+    },
     worker: {
       disabled: env.RUN_ENGINE_WORKER_ENABLED === "0",
       workers: env.RUN_ENGINE_WORKER_COUNT,
@@ -67,6 +84,7 @@ function createRunEngine() {
         tracer,
       },
       shardCount: env.RUN_ENGINE_RUN_QUEUE_SHARD_COUNT,
+      queueMetrics: env.QUEUE_METRICS_EMIT_ENABLED === "1" ? getQueueMetricsEmitter() : undefined,
       processWorkerQueueDebounceMs: env.RUN_ENGINE_PROCESS_WORKER_QUEUE_DEBOUNCE_MS,
       dequeueBlockingTimeoutSeconds: env.RUN_ENGINE_DEQUEUE_BLOCKING_TIMEOUT_SECONDS,
       masterQueueConsumersIntervalMs: env.RUN_ENGINE_MASTER_QUEUE_CONSUMERS_INTERVAL_MS,
@@ -114,6 +132,18 @@ function createRunEngine() {
     },
     tracer,
     meter,
+    workerQueueObserver: {
+      enabled: env.RUN_ENGINE_WORKER_QUEUE_OBSERVER_ENABLED === "1",
+      intervalMs: env.RUN_ENGINE_WORKER_QUEUE_OBSERVER_INTERVAL_MS,
+      // Also observe the scheduled split variant of each worker queue. The suffix
+      // naming convention lives in the webapp, so it is passed in here.
+      additionalQueueSuffixes: [SCHEDULED_WORKER_QUEUE_SUFFIX],
+      excludedCloudProviders: env.RUN_ENGINE_WORKER_QUEUE_OBSERVER_EXCLUDED_CLOUD_PROVIDERS.split(
+        ","
+      )
+        .map((provider) => provider.trim())
+        .filter(Boolean),
+    },
     defaultMaxTtl: env.RUN_ENGINE_DEFAULT_MAX_TTL,
     heartbeatTimeoutsMs: {
       PENDING_EXECUTING: env.RUN_ENGINE_TIMEOUT_PENDING_EXECUTING,
@@ -129,6 +159,7 @@ function createRunEngine() {
       factor: env.RUN_ENGINE_SUSPENDED_HEARTBEAT_RETRIES_FACTOR,
     },
     retryWarmStartThresholdMs: env.RUN_ENGINE_RETRY_WARM_START_THRESHOLD_MS,
+    pendingVersionRunIdLookup: runEnginePendingVersionLookup,
     billing: {
       getCurrentPlan: async (orgId: string) => {
         const plan = await getCurrentPlan(orgId);
@@ -212,6 +243,9 @@ function createRunEngine() {
     // Debounce configuration
     debounce: {
       maxDebounceDurationMs: env.RUN_ENGINE_MAXIMUM_DEBOUNCE_DURATION_MS,
+      quantizeNewDelayUntilMs: env.RUN_ENGINE_DEBOUNCE_QUANTIZE_NEW_DELAY_UNTIL_MS,
+      fastPathSkipEnabled: env.RUN_ENGINE_DEBOUNCE_FAST_PATH_SKIP_ENABLED === "1",
+      useReplicaForFastPathRead: env.RUN_ENGINE_DEBOUNCE_USE_REPLICA_FOR_FAST_PATH_READ === "1",
     },
   });
 

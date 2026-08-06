@@ -22,6 +22,11 @@ export type ToolUse = {
   resultSummary?: string;
   /** Full formatted result for display in a code block */
   resultOutput?: string;
+  /** Sub-agent output — when the tool result is a UIMessage with parts */
+  subAgent?: {
+    parts: any[];
+    isStreaming: boolean;
+  };
 };
 
 // ---------------------------------------------------------------------------
@@ -99,6 +104,8 @@ export type AISpanData = {
   inputCost?: number;
   outputCost?: number;
   totalCost?: number;
+  cachedCost?: number;
+  cacheCreationCost?: number;
 
   // Response text (final assistant output)
   responseText?: string;

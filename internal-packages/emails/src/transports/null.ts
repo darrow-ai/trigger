@@ -1,25 +1,26 @@
 import { render } from "@react-email/render";
-import { MailMessage, MailTransport, PlainTextMailMessage } from "./index";
+import type { MailMessage, MailTransport, PlainTextMailMessage } from "./index";
 
 export type NullMailTransportOptions = {
-  type: undefined,
-}
+  type: undefined;
+};
 
 export class NullMailTransport implements MailTransport {
-  constructor(options: NullMailTransportOptions) {
-  }
+  constructor(options: NullMailTransportOptions) {}
 
-  async send({to, subject, react}: MailMessage): Promise<void> {
+  async send({ to, subject, react }: MailMessage): Promise<void> {
+    const plainText = await render(react, {
+      plainText: true,
+    });
+
     console.log(`
 ##### sendEmail to ${to}, subject: ${subject}
 
-${render(react, {
-      plainText: true,
-    })}
+${plainText}
     `);
   }
 
-  async sendPlainText({to, subject, text}: PlainTextMailMessage): Promise<void> {
+  async sendPlainText({ to, subject, text }: PlainTextMailMessage): Promise<void> {
     console.log(`
 ##### sendEmail to ${to}, subject: ${subject}
 

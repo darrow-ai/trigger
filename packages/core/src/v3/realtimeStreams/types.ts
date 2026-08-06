@@ -1,9 +1,9 @@
-import { AnyZodFetchOptions, ApiRequestOptions } from "../apiClient/core.js";
+import type { AnyZodFetchOptions, ApiRequestOptions } from "../apiClient/core.js";
 import type { InputStreamOncePromise } from "../inputStreams/types.js";
 export { InputStreamOncePromise, InputStreamTimeoutError } from "../inputStreams/types.js";
 export type { InputStreamOnceResult } from "../inputStreams/types.js";
-import { AsyncIterableStream } from "../streams/asyncIterableStream.js";
-import { Prettify } from "../types/utils.js";
+import type { AsyncIterableStream } from "../streams/asyncIterableStream.js";
+import type { Prettify } from "../types/utils.js";
 import type { ManualWaitpointPromise } from "../waitpoints/index.js";
 
 export type RealtimeStreamOperationOptions = {
@@ -26,13 +26,17 @@ export interface RealtimeStreamsManager {
   ): Promise<void>;
 }
 
+export type StreamWriteResult = {
+  lastEventId?: string;
+};
+
 export interface RealtimeStreamInstance<T> {
-  wait(): Promise<void>;
+  wait(): Promise<StreamWriteResult>;
   get stream(): AsyncIterableStream<T>;
 }
 
 export interface StreamsWriter {
-  wait(): Promise<void>;
+  wait(): Promise<StreamWriteResult>;
 }
 
 export type RealtimeDefinedStream<TPart> = {
@@ -71,6 +75,10 @@ export type PipeStreamOptions = {
    * Additional request options for the API call.
    */
   requestOptions?: ApiRequestOptions;
+  /** Override the default span name for this operation. */
+  spanName?: string;
+  /** When true, the span will be collapsed in the dashboard. */
+  collapsed?: boolean;
 };
 
 /**
@@ -89,7 +97,7 @@ export type PipeStreamResult<T> = {
    * to the realtime stream. Use this to wait for the stream to complete before
    * finishing your task.
    */
-  waitUntilComplete: () => Promise<void>;
+  waitUntilComplete: () => Promise<StreamWriteResult>;
 };
 
 /**
@@ -186,6 +194,16 @@ export type RealtimeDefinedInputStream<TData> = {
    */
   wait: (options?: InputStreamWaitOptions) => ManualWaitpointPromise<TData>;
   /**
+   * Wait for data with an idle phase before suspending.
+   *
+   * Keeps the task active (using compute) for `idleTimeoutInSeconds`,
+   * then suspends via `.wait()` if no data arrives. If data arrives during
+   * the idle phase the task responds instantly without suspending.
+   */
+  waitWithIdleTimeout: (
+    options: InputStreamWaitWithIdleTimeoutOptions
+  ) => Promise<{ ok: true; output: TData } | { ok: false; error?: any }>;
+  /**
    * Send data to this input stream on a specific run.
    * This is used from outside the task (e.g., from your backend or another task).
    */
@@ -199,6 +217,8 @@ export type InputStreamSubscription = {
 export type InputStreamOnceOptions = {
   signal?: AbortSignal;
   timeoutMs?: number;
+  /** Override the default span name for this operation. */
+  spanName?: string;
 };
 
 export type SendInputStreamOptions = {
@@ -234,11 +254,28 @@ export type InputStreamWaitOptions = {
    * and filtering waitpoints via `wait.listTokens()`.
    */
   tags?: string[];
+
+  /** Override the default span name for this operation. */
+  spanName?: string;
 };
 
-export type InferInputStreamType<T> = T extends RealtimeDefinedInputStream<infer TData>
-  ? TData
-  : unknown;
+export type InputStreamWaitWithIdleTimeoutOptions = {
+  /** Seconds to keep the task idle (active, using compute) before suspending. */
+  idleTimeoutInSeconds: number;
+  /** Maximum time to wait after suspending (duration string, e.g. "1h"). */
+  timeout?: string;
+  /** Override the default span name for the outer operation. */
+  spanName?: string;
+  /** Called right before suspending (after idle phase times out). Not called if data arrives during idle. */
+  onSuspend?: () => void | Promise<void>;
+  /** Called right after resuming from suspension with data. Not called if data arrived during idle or on timeout. */
+  onResume?: () => void | Promise<void>;
+  /** When true, skip the suspend phase entirely. If idle times out, return `{ ok: false }` immediately. */
+  skipSuspend?: boolean;
+};
+
+export type InferInputStreamType<T> =
+  T extends RealtimeDefinedInputStream<infer TData> ? TData : unknown;
 
 /**
  * Internal record format for multiplexed input stream data on S2.

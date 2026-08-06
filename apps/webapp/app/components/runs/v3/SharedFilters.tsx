@@ -1,5 +1,4 @@
 import * as Ariakit from "@ariakit/react";
-import type { RuntimeEnvironment } from "@trigger.dev/database";
 import {
   endOfDay,
   endOfMonth,
@@ -11,20 +10,22 @@ import {
   subWeeks,
 } from "date-fns";
 import parse from "parse-duration";
-import { startTransition, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { type ReactNode, startTransition, useCallback, useEffect, useRef, useState } from "react";
 import simplur from "simplur";
 import { AppliedFilter } from "~/components/primitives/AppliedFilter";
 import { Callout } from "~/components/primitives/Callout";
 import { DateTime } from "~/components/primitives/DateTime";
 import { DateTimePicker } from "~/components/primitives/DateTimePicker";
+import { FormError } from "~/components/primitives/FormError";
+import { Input } from "~/components/primitives/Input";
 import { Label } from "~/components/primitives/Label";
 import { Paragraph } from "~/components/primitives/Paragraph";
 import { RadioButtonCircle } from "~/components/primitives/RadioButton";
 import { ComboboxProvider, SelectPopover, SelectProvider } from "~/components/primitives/Select";
+import { ShortcutKey } from "~/components/primitives/ShortcutKey";
 import { useOptionalOrganization } from "~/hooks/useOrganizations";
 import { useSearchParams } from "~/hooks/useSearchParam";
 import { type ShortcutDefinition, useShortcutKeys } from "~/hooks/useShortcutKeys";
-import { ShortcutKey } from "~/components/primitives/ShortcutKey";
 import { cn } from "~/utils/cn";
 import { organizationBillingPath } from "~/utils/pathBuilder";
 import { Button, LinkButton } from "../../primitives/Buttons";
@@ -327,8 +328,8 @@ export function timeFilterRenderValues({
     rangeType === "range" || rangeType === "period"
       ? labelName
       : rangeType === "from"
-      ? `${labelName} after`
-      : `${labelName} before`;
+        ? `${labelName} after`
+        : `${labelName} before`;
 
   return { label, valueLabel, rangeType };
 }
@@ -373,9 +374,13 @@ export function TimeFilter({
   valueClassName,
 }: TimeFilterProps = {}) {
   const { value } = useSearchParams();
-  const periodValue = period ?? value("period");
-  const fromValue = from ?? value("from");
-  const toValue = to ?? value("to");
+  // In controlled mode (onValueChange provided) the caller owns all three values via local
+  // state, so don't fall back to the URL — otherwise selecting a custom date range (which
+  // sets period to undefined) would read the page-level URL period and override the range.
+  const controlled = onValueChange !== undefined;
+  const periodValue = controlled ? period : (period ?? value("period"));
+  const fromValue = controlled ? from : (from ?? value("from"));
+  const toValue = controlled ? to : (to ?? value("to"));
   const triggerRef = useRef<HTMLButtonElement>(null);
 
   useShortcutKeys({
@@ -419,14 +424,10 @@ export function TimeFilter({
                 />
               </Ariakit.TooltipAnchor>
               {shortcut && (
-                <Ariakit.Tooltip className="z-40 cursor-default rounded border border-charcoal-700 bg-background-bright px-2 py-1.5 text-xs">
+                <Ariakit.Tooltip className="z-40 cursor-default rounded border border-grid-bright bg-background-bright px-2 py-1.5 text-xs">
                   <div className="flex items-center gap-2">
                     <span>Filter by time period</span>
-                    <ShortcutKey
-                      className="size-4 flex-none"
-                      shortcut={shortcut}
-                      variant="small"
-                    />
+                    <ShortcutKey className="size-4 flex-none" shortcut={shortcut} variant="small" />
                   </div>
                 </Ariakit.Tooltip>
               )}
@@ -501,7 +502,7 @@ export function TimeDropdown({
   const isInitialCustom =
     period && !timePeriods.some((p) => p.value === period) && initialCustom.value !== "";
   const [selectedPeriod, setSelectedPeriod] = useState<string>(
-    isInitialCustom ? "custom" : period ?? defaultPeriod
+    isInitialCustom ? "custom" : (period ?? defaultPeriod)
   );
 
   // Custom duration state
@@ -515,7 +516,7 @@ export function TimeDropdown({
     setCustomUnit(parsed.unit);
 
     const isCustom = period && !timePeriods.some((p) => p.value === period) && parsed.value !== "";
-    setSelectedPeriod(isCustom ? "custom" : period ?? defaultPeriod);
+    setSelectedPeriod(isCustom ? "custom" : (period ?? defaultPeriod));
     setActiveSection(from || to ? "dateRange" : "duration");
   }, [period, from, to, defaultPeriod]);
 
@@ -679,10 +680,10 @@ export function TimeDropdown({
                 {/* Custom duration row */}
                 <div
                   className={cn(
-                    "col-span-4 flex h-[1.8rem] w-full items-center gap-2 rounded border bg-charcoal-750 py-0.5 pl-0 pr-2 transition-colors",
+                    "col-span-4 flex h-[1.8rem] w-full items-center gap-2 rounded border bg-background-hover py-0.5 pl-0 pr-2 transition-colors",
                     activeSection === "duration" && selectedPeriod === "custom"
                       ? "border-indigo-500 "
-                      : "border-charcoal-650 hover:border-charcoal-600",
+                      : "border-border-bright hover:border-border-bright",
                     validationError &&
                       activeSection === "duration" &&
                       selectedPeriod === "custom" &&
@@ -708,7 +709,7 @@ export function TimeDropdown({
                       setActiveSection("duration");
                       setValidationError(null);
                     }}
-                    className="h-full w-full translate-y-px border-none bg-transparent py-0 pl-2 pr-0 text-xs leading-none text-text-bright outline-none placeholder:text-text-dimmed focus:outline-none focus:ring-0 [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                    className="h-full w-full translate-y-px border-none bg-transparent py-0 pl-2 pr-0 text-xs leading-none text-text-bright outline-hidden placeholder:text-text-dimmed focus:outline-hidden focus:ring-0 [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
                   />
                   <div className="flex items-center gap-2">
                     {timeUnits.map((unit) => (
@@ -1003,5 +1004,104 @@ function QuickDateButton({
     >
       {label}
     </Button>
+  );
+}
+
+export type IdFilterDropdownProps = {
+  trigger: ReactNode;
+  clearSearchValue: () => void;
+  searchValue: string;
+  onClose?: () => void;
+  label: string;
+  placeholder: string;
+  paramKey: string;
+  validate?: (value: string) => string | undefined;
+  inputWidth?: string;
+};
+
+export function IdFilterDropdown({
+  trigger,
+  clearSearchValue,
+  onClose,
+  label,
+  placeholder,
+  paramKey,
+  validate,
+  inputWidth = "w-[29ch]",
+}: IdFilterDropdownProps) {
+  const [open, setOpen] = useState<boolean | undefined>();
+  const { value, replace } = useSearchParams();
+  const currentValue = value(paramKey);
+
+  const [inputValue, setInputValue] = useState(currentValue);
+  const [prevOpen, setPrevOpen] = useState(open);
+  if (open !== prevOpen) {
+    setPrevOpen(open);
+    if (open) setInputValue(currentValue);
+  }
+
+  const apply = () => {
+    clearSearchValue();
+    replace({
+      cursor: undefined,
+      direction: undefined,
+      [paramKey]: inputValue === "" ? undefined : inputValue?.toString(),
+    });
+
+    setOpen(false);
+  };
+
+  const error = inputValue ? validate?.(inputValue) : undefined;
+
+  return (
+    <SelectProvider virtualFocus={true} open={open} setOpen={setOpen}>
+      {trigger}
+      <SelectPopover
+        hideOnEnter={false}
+        hideOnEscape={() => {
+          if (onClose) {
+            onClose();
+            return false;
+          }
+
+          return true;
+        }}
+        className="max-w-[min(32ch,var(--popover-available-width))]"
+      >
+        <div className="flex flex-col gap-3 p-3 pt-2">
+          <div className="flex flex-col gap-1">
+            <Paragraph variant="extra-small/bright" className="mb-0.5">
+              {label}
+            </Paragraph>
+            <Input
+              placeholder={placeholder}
+              value={inputValue ?? ""}
+              onChange={(e) => setInputValue(e.target.value)}
+              variant="small"
+              className={cn(inputWidth, "font-mono")}
+              spellCheck={false}
+            />
+            {error ? <FormError>{error}</FormError> : null}
+          </div>
+          <div className="flex justify-between gap-1">
+            <Button variant="secondary/small" onClick={() => setOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              disabled={error !== undefined || !inputValue}
+              variant="secondary/small"
+              shortcut={{
+                modifiers: ["mod"],
+                key: "Enter",
+                enabledOnInputElements: true,
+              }}
+              onClick={() => apply()}
+            >
+              Apply
+            </Button>
+          </div>
+        </div>
+      </SelectPopover>
+    </SelectProvider>
   );
 }

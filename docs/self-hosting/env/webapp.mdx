@@ -11,7 +11,8 @@ mode: "wide"
 | `SESSION_SECRET`                                 | Yes      | —                     | Session encryption secret. Run: `openssl rand -hex 16`                                                             |
 | `MAGIC_LINK_SECRET`                              | Yes      | —                     | Magic link encryption secret. Run: `openssl rand -hex 16`                                                          |
 | `ENCRYPTION_KEY`                                 | Yes      | —                     | Secret store encryption key. Run: `openssl rand -hex 16`                                                           |
-| `MANAGED_WORKER_SECRET`                          | No       | managed-secret        | Managed worker secret. Should be changed and match supervisor.                                                     |
+| `MANAGED_WORKER_SECRET`                          | Yes      | —                     | Managed worker secret. Must be set and match supervisor. Run: `openssl rand -hex 32`                               |
+| `ALLOW_INSECURE_DEFAULT_SECRETS`                 | No       | false                 | Boot even if a secret is still a known-insecure published default. Temporary escape hatch for values you can't safely rotate yet (see [Secrets](/self-hosting/kubernetes#secrets)). |
 | **Domains & ports**                              |          |                       |                                                                                                                    |
 | `REMIX_APP_PORT`                                 | No       | 3030                  | Remix app port.                                                                                                    |
 | `APP_ORIGIN`                                     | Yes      | http://localhost:3030 | App origin URL.                                                                                                    |
@@ -25,7 +26,11 @@ mode: "wide"
 | `DATABASE_CONNECTION_LIMIT`                      | No       | 10                    | Max DB connections.                                                                                                |
 | `DATABASE_POOL_TIMEOUT`                          | No       | 60                    | DB pool timeout (s).                                                                                               |
 | `DATABASE_CONNECTION_TIMEOUT`                    | No       | 20                    | DB connect timeout (s).                                                                                            |
+| `DATABASE_WRITER_POOL_TIMEOUT`                   | No       | `DATABASE_POOL_TIMEOUT`       | Writer pool timeout (s); overrides the shared default for the writer only.                                 |
+| `DATABASE_WRITER_CONNECTION_TIMEOUT`             | No       | `DATABASE_CONNECTION_TIMEOUT` | Writer connect timeout (s); overrides the shared default for the writer only.                              |
 | `DATABASE_READ_REPLICA_URL`                      | No       | `DATABASE_URL`        | Read-replica DB string.                                                                                            |
+| `DATABASE_READ_REPLICA_POOL_TIMEOUT`             | No       | `DATABASE_POOL_TIMEOUT`       | Read-replica pool timeout (s); overrides the shared default for the replica only.                          |
+| `DATABASE_READ_REPLICA_CONNECTION_TIMEOUT`       | No       | `DATABASE_CONNECTION_TIMEOUT` | Read-replica connect timeout (s); overrides the shared default for the replica only.                       |
 | **Redis**                                        |          |                       |                                                                                                                    |
 | `REDIS_HOST`                                     | Yes      | —                     | Redis host.                                                                                                        |
 | `REDIS_PORT`                                     | Yes      | —                     | Redis port.                                                                                                        |
@@ -36,6 +41,7 @@ mode: "wide"
 | `REDIS_TLS_DISABLED`                             | No       | —                     | Disable Redis TLS.                                                                                                 |
 | **Auth**                                         |          |                       |                                                                                                                    |
 | `WHITELISTED_EMAILS`                             | No       | —                     | Whitelisted emails regex.                                                                                          |
+| `LOGIN_RATE_LIMITS_ENABLED`                      | No       | true                  | Enable rate limiting on magic-link login.                                                                          |
 | `AUTH_GITHUB_CLIENT_ID`                          | No       | —                     | GitHub client ID.                                                                                                  |
 | `AUTH_GITHUB_CLIENT_SECRET`                      | No       | —                     | GitHub client secret.                                                                                              |
 | **Email**                                        |          |                       |                                                                                                                    |
@@ -51,14 +57,13 @@ mode: "wide"
 | `AWS_REGION`                                     | No       | —                     | AWS region for SES.                                                                                                |
 | `AWS_ACCESS_KEY_ID`                              | No       | —                     | AWS access key ID for SES.                                                                                         |
 | `AWS_SECRET_ACCESS_KEY`                          | No       | —                     | AWS secret access key for SES.                                                                                     |
-| **Graphile & Redis worker**                      |          |                       |                                                                                                                    |
-| `WORKER_CONCURRENCY`                             | No       | 10                    | Redis worker concurrency.                                                                                          |
-| `WORKER_POLL_INTERVAL`                           | No       | 1000                  | Redis worker poll interval (ms).                                                                                   |
-| `WORKER_SCHEMA`                                  | No       | graphile_worker       | Graphile worker schema.                                                                                            |
-| `GRACEFUL_SHUTDOWN_TIMEOUT`                      | No       | 60000 (1m)            | Graphile graceful shutdown timeout (ms). Affects shutdown time.                                                    |
+| **Worker**                                       |          |                       |                                                                                                                    |
+| `GRACEFUL_SHUTDOWN_TIMEOUT`                      | No       | 60000 (1m)            | Graceful shutdown timeout (ms). Affects shutdown time.                                                             |
 | **Concurrency limits**                           |          |                       |                                                                                                                    |
 | `DEFAULT_ENV_EXECUTION_CONCURRENCY_LIMIT`        | No       | 100                   | Default env execution concurrency.                                                                                 |
 | `DEFAULT_ORG_EXECUTION_CONCURRENCY_LIMIT`        | No       | 300                   | Default org execution concurrency, needs to be 3x env concurrency.                                                 |
+| `DEFAULT_ENV_EXECUTION_CONCURRENCY_BURST_FACTOR` | No       | 1.0                   | Burst factor for env concurrency.                                                                                  |
+| `DEFAULT_DEV_ENV_EXECUTION_ATTEMPTS`             | No       | 1                     | Default max attempts for dev environment runs.                                                                     |
 | **Dev**                                          |          |                       |                                                                                                                    |
 | `DEV_MAX_CONCURRENT_RUNS`                        | No       | 25                    | Sets the max concurrency for dev runs via the CLI.                                                                 |
 | `DEV_OTEL_EXPORTER_OTLP_ENDPOINT`                | No       | `APP_ORIGIN/otel`     | OTel endpoint for dev runs.                                                                                        |
@@ -76,20 +81,28 @@ mode: "wide"
 | `DEPLOY_REGISTRY_USERNAME`                       | No       | —                     | Deploy registry username.                                                                                          |
 | `DEPLOY_REGISTRY_PASSWORD`                       | No       | —                     | Deploy registry password.                                                                                          |
 | `DEPLOY_REGISTRY_NAMESPACE`                      | No       | trigger               | Deploy registry namespace.                                                                                         |
+| `DEPLOY_REGISTRY_ECR_DEFAULT_REPOSITORY_POLICY`  | No       | —                     | Raw IAM policy JSON applied via SetRepositoryPolicy to every ECR repo created by the webapp. Use to grant cross-account pull access to EKS workers when the ECR account is separate from the cluster account. |
 | `DEPLOY_IMAGE_PLATFORM`                          | No       | linux/amd64           | Deploy image platform, same values as docker `--platform` flag.                                                    |
 | `DEPLOY_TIMEOUT_MS`                              | No       | 480000 (8m)           | Deploy timeout (ms).                                                                                               |
+| `DEPLOY_QUEUE_TIMEOUT_MS`                        | No       | 900000 (15m)          | Deploy queue timeout (ms).                                                                                         |
 | **Object store (S3)**                            |          |                       |                                                                                                                    |
 | `OBJECT_STORE_BASE_URL`                          | No       | —                     | Object store base URL (default provider).                                                                          |
+| `OBJECT_STORE_BUCKET`                            | No       | —                     | Object store bucket name (default provider).                                                                       |
 | `OBJECT_STORE_ACCESS_KEY_ID`                     | No       | —                     | Object store access key (default provider).                                                                        |
 | `OBJECT_STORE_SECRET_ACCESS_KEY`                 | No       | —                     | Object store secret key (default provider).                                                                        |
 | `OBJECT_STORE_REGION`                            | No       | —                     | Object store region (default provider).                                                                            |
 | `OBJECT_STORE_SERVICE`                           | No       | s3                    | Object store service (default provider).                                                                           |
-| `OBJECT_STORE_DEFAULT_PROTOCOL`                  | No       | —                     | Protocol to use for new uploads (e.g., `s3`, `r2`). Enables protocol-prefixed storage. See migration guide below.  |
-| `OBJECT_STORE_{PROTOCOL}_BASE_URL`               | No       | —                     | Named provider base URL (replace `{PROTOCOL}` with protocol name, e.g., `OBJECT_STORE_S3_BASE_URL`).               |
+| `OBJECT_STORE_DEFAULT_PROTOCOL`                  | No       | —                     | Protocol for new uploads (e.g. `s3`, `r2`). Enables protocol-prefixed storage. See migration guide below.          |
+| `OBJECT_STORE_{PROTOCOL}_BASE_URL`               | No       | —                     | Named provider base URL (replace `{PROTOCOL}`, e.g. `OBJECT_STORE_S3_BASE_URL`).                                   |
 | `OBJECT_STORE_{PROTOCOL}_ACCESS_KEY_ID`          | No       | —                     | Named provider access key.                                                                                         |
 | `OBJECT_STORE_{PROTOCOL}_SECRET_ACCESS_KEY`      | No       | —                     | Named provider secret key.                                                                                         |
 | `OBJECT_STORE_{PROTOCOL}_REGION`                 | No       | —                     | Named provider region.                                                                                             |
 | `OBJECT_STORE_{PROTOCOL}_SERVICE`                | No       | —                     | Named provider service.                                                                                            |
+| `ARTIFACTS_OBJECT_STORE_BUCKET`                  | No       | —                     | Optional separate bucket for artifacts. If not set, uses main object store.                                        |
+| `ARTIFACTS_OBJECT_STORE_BASE_URL`                | No       | —                     | Optional artifacts store base URL.                                                                                 |
+| `ARTIFACTS_OBJECT_STORE_ACCESS_KEY_ID`           | No       | —                     | Optional artifacts store access key.                                                                               |
+| `ARTIFACTS_OBJECT_STORE_SECRET_ACCESS_KEY`       | No       | —                     | Optional artifacts store secret key.                                                                               |
+| `ARTIFACTS_OBJECT_STORE_REGION`                  | No       | —                     | Optional artifacts store region.                                                                                   |
 | **Alerts**                                       |          |                       |                                                                                                                    |
 | `ORG_SLACK_INTEGRATION_CLIENT_ID`                | No       | —                     | Slack client ID. Required for Slack alerts.                                                                        |
 | `ORG_SLACK_INTEGRATION_CLIENT_SECRET`            | No       | —                     | Slack client secret. Required for Slack alerts.                                                                    |
@@ -106,12 +119,15 @@ mode: "wide"
 | `TASK_PAYLOAD_OFFLOAD_THRESHOLD`                 | No       | 524288 (512KB)        | Max task payload size before offloading to S3.                                                                     |
 | `TASK_PAYLOAD_MAXIMUM_SIZE`                      | No       | 3145728 (3MB)         | Max task payload size.                                                                                             |
 | `BATCH_TASK_PAYLOAD_MAXIMUM_SIZE`                | No       | 1000000 (1MB)         | Max batch payload size.                                                                                            |
+| `BATCH_CONCURRENCY_LIMIT_DEFAULT`                | No       | 5                     | Default concurrency for batch processing.                                                                          |
+| `BATCH_RATE_LIMIT_REFILL_RATE`                   | No       | 100                   | Batch rate limit refill rate.                                                                                      |
+| `BATCH_RATE_LIMIT_MAX`                           | No       | 1200                  | Batch rate limit max.                                                                                              |
+| `BATCH_RATE_LIMIT_REFILL_INTERVAL`               | No       | 10s                   | Batch rate limit refill interval.                                                                                  |
 | `TASK_RUN_METADATA_MAXIMUM_SIZE`                 | No       | 262144 (256KB)        | Max metadata size.                                                                                                 |
 | `MAX_BATCH_V2_TRIGGER_ITEMS`                     | No       | 500                   | Max batch size (legacy v2 API).                                                                                    |
 | `STREAMING_BATCH_MAX_ITEMS`                      | No       | 1000                  | Max items in streaming batch (v3 API, requires SDK 4.3.1+).                                                        |
 | `STREAMING_BATCH_ITEM_MAXIMUM_SIZE`              | No       | 3145728 (3MB)         | Max size per item in streaming batch.                                                                              |
-| `MAXIMUM_DEV_QUEUE_SIZE`                         | No       | —                     | Max dev queue size.                                                                                                |
-| `MAXIMUM_DEPLOYED_QUEUE_SIZE`                    | No       | —                     | Max deployed queue size.                                                                                           |
+| `STREAMING_BATCH_INGEST_CONCURRENCY`             | No       | 10                    | Items ingested concurrently per streaming batch request. Peak memory ≈ this × item size. Set to 1 for sequential. |
 | **OTel limits**                                  |          |                       |                                                                                                                    |
 | `TRIGGER_OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`        | No       | 1024                  | OTel span attribute count limit.                                                                                   |
 | `TRIGGER_OTEL_LOG_ATTRIBUTE_COUNT_LIMIT`         | No       | 1024                  | OTel log attribute count limit.                                                                                    |
@@ -122,9 +138,18 @@ mode: "wide"
 | `TRIGGER_OTEL_ATTRIBUTE_PER_LINK_COUNT_LIMIT`    | No       | 10                    | OTel attribute per link count limit.                                                                               |
 | `TRIGGER_OTEL_ATTRIBUTE_PER_EVENT_COUNT_LIMIT`   | No       | 10                    | OTel attribute per event count limit.                                                                              |
 | `SERVER_OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT`  | No       | 8192                  | OTel span attribute value length limit.                                                                            |
+| **Task events**                                  |          |                       |                                                                                                                    |
+| `EVENT_REPOSITORY_DEFAULT_STORE`                 | No       | postgres              | Where to store task events. Set to `clickhouse_v2` to store in ClickHouse (recommended for production).            |
+| `EVENT_REPOSITORY_POSTGRES_WRITES_DISABLED`      | No       | 0                     | Skip all PostgreSQL task-event writes (set to `1`). Only enable when `EVENT_REPOSITORY_DEFAULT_STORE` is `clickhouse_v2`, otherwise task events are lost. |
 | **Realtime**                                     |          |                       |                                                                                                                    |
+| `REALTIME_STREAM_VERSION`                        | No       | v1                    | Stream version exposed to tasks via the `TRIGGER_REALTIME_STREAM_VERSION` variable. Distinct from `REALTIME_STREAMS_DEFAULT_VERSION`. One of `v1`, `v2`. |
 | `REALTIME_STREAM_MAX_LENGTH`                     | No       | 1000                  | Realtime stream max length.                                                                                        |
 | `REALTIME_STREAM_TTL`                            | No       | 86400 (1d)            | Realtime stream TTL (s).                                                                                           |
+| `REALTIME_STREAMS_DEFAULT_VERSION`               | No       | v1                    | Server-side default the webapp uses when a stream request doesn't pin a version (modern SDKs request `v2`). The Docker and Helm self-hosting defaults set this to `v2`. One of `v1`, `v2`. |
+| `REALTIME_STREAMS_S2_BASIN`                       | No       | —                     | S2 basin that holds v2 realtime streams. Required for `v2`. Must be at least 8 characters.                          |
+| `REALTIME_STREAMS_S2_ENDPOINT`                    | No       | —                     | Custom S2 API endpoint, including the `/v1` suffix (e.g. `http://s2/v1` for the bundled s2-lite). Omit to use hosted S2 at s2.dev. |
+| `REALTIME_STREAMS_S2_SKIP_ACCESS_TOKENS`         | No       | false                 | Skip minting per-stream access tokens. Set to `true` for s2-lite, which needs no authentication.                    |
+| `REALTIME_STREAMS_S2_ACCESS_TOKEN`               | No       | —                     | S2 access token. Required for hosted S2 unless `REALTIME_STREAMS_S2_SKIP_ACCESS_TOKENS` is `true`.                  |
 | **Bootstrap**                                    |          |                       |                                                                                                                    |
 | `TRIGGER_BOOTSTRAP_ENABLED`                      | No       | 0                     | Trigger bootstrap enabled.                                                                                         |
 | `TRIGGER_BOOTSTRAP_WORKER_GROUP_NAME`            | No       | —                     | Trigger bootstrap worker group name.                                                                               |
@@ -233,6 +258,7 @@ Restart the webapp and verify both providers work:
 
 - Old runs (no prefix) should still access R2
 - New runs with `s3://` prefix should use S3
+
 </Step>
 
 <Step title="Switch to S3 for new uploads">
@@ -247,6 +273,7 @@ After this change:
 - New data uses `s3://` prefix and goes to S3
 - Old data (no prefix) still uses R2
 - Data with explicit protocol uses the corresponding provider
+
 </Step>
 
 <Step title="Optionally decommission R2">

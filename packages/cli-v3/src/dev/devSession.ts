@@ -1,8 +1,8 @@
-import { ResolvedConfig } from "@trigger.dev/core/v3/build";
-import * as esbuild from "esbuild";
-import { CliApiClient } from "../apiClient.js";
+import type { ResolvedConfig } from "@trigger.dev/core/v3/build";
+import type * as esbuild from "esbuild";
+import type { CliApiClient } from "../apiClient.js";
+import type { BundleResult } from "../build/bundle.js";
 import {
-  BundleResult,
   bundleWorker,
   createBuildManifestFromBundle,
   getBundleResultFromBuild,
@@ -19,20 +19,16 @@ import { createExternalsBuildExtension, resolveAlwaysExternal } from "../build/e
 import { type DevCommandOptions } from "../commands/dev.js";
 import { eventBus } from "../utilities/eventBus.js";
 import { logger } from "../utilities/logger.js";
-import {
-  clearTmpDirs,
-  EphemeralDirectory,
-  getStoreDir,
-  getTmpDir,
-} from "../utilities/tempDirectories.js";
+import type { EphemeralDirectory } from "../utilities/tempDirectories.js";
+import { clearTmpDirs, getStoreDir, getTmpDir } from "../utilities/tempDirectories.js";
 import { startDevOutput } from "./devOutput.js";
 import { startWorkerRuntime } from "./devSupervisor.js";
-import { startMcpServer, stopMcpServer } from "./mcpServer.js";
 import { writeJSONFile } from "../utilities/fileSystem.js";
 import { join } from "node:path";
 
 export type DevSessionOptions = {
   name: string | undefined;
+  branch?: string;
   dashboardUrl: string;
   initialMode: "local";
   showInteractiveDevSession: boolean | undefined;
@@ -50,37 +46,29 @@ export type DevSessionInstance = {
 export async function startDevSession({
   rawConfig,
   name,
+  branch,
   rawArgs,
   client,
   dashboardUrl,
   keepTmpFiles,
 }: DevSessionOptions): Promise<DevSessionInstance> {
-  clearTmpDirs(rawConfig.workingDir);
-  const destination = getTmpDir(rawConfig.workingDir, "build", keepTmpFiles);
+  clearTmpDirs(rawConfig.workingDir, branch);
+  const destination = getTmpDir(rawConfig.workingDir, "build", keepTmpFiles, branch);
   // Create shared store directory for deduplicating chunk files across rebuilds
-  const storeDir = getStoreDir(rawConfig.workingDir, keepTmpFiles);
+  const storeDir = getStoreDir(rawConfig.workingDir, keepTmpFiles, branch);
 
   const runtime = await startWorkerRuntime({
     name,
+    branch,
     config: rawConfig,
     args: rawArgs,
     client,
     dashboardUrl,
   });
 
-  if (rawArgs.mcp) {
-    await startMcpServer({
-      port: rawArgs.mcpPort,
-      cliApiClient: client,
-      devSession: {
-        dashboardUrl,
-        projectRef: rawConfig.project,
-      },
-    });
-  }
-
   const stopOutput = startDevOutput({
     name,
+    branch,
     dashboardUrl,
     config: rawConfig,
     args: rawArgs,
@@ -117,6 +105,13 @@ export async function startDevSession({
       join(workerDir?.path ?? destination.path, "metafile.json"),
       bundle.metafile
     );
+
+    // Skill folder copying happens after the main worker indexer runs in
+    // `BackgroundWorker.initialize` — that pass already discovers skills
+    // via the resource catalog and reports them on `workerManifest.skills`,
+    // so we don't need a duplicate indexer here (which historically ran
+    // with a bare `process.env` and silently dropped skills on projects
+    // whose task files read CLI-injected vars at module top level).
 
     buildManifest = await notifyExtensionOnBuildComplete(buildContext, buildManifest);
 
@@ -180,7 +175,7 @@ export async function startDevSession({
           return;
         }
 
-        const workerDir = getTmpDir(rawConfig.workingDir, "build", keepTmpFiles);
+        const workerDir = getTmpDir(rawConfig.workingDir, "build", keepTmpFiles, branch);
         await updateBuild(result, workerDir);
       });
     },
@@ -230,7 +225,6 @@ export async function startDevSession({
       stopBundling?.().catch((error) => {});
       runtime.shutdown().catch((error) => {});
       stopOutput();
-      stopMcpServer();
     },
   };
 }

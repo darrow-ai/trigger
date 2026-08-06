@@ -3,26 +3,26 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { VERSION } from "@trigger.dev/core";
 import { tryCatch } from "@trigger.dev/core/utils";
-import { Command, Option as CommandOption } from "commander";
+import type { Command } from "commander";
 import { z } from "zod";
 import { CommonCommandOptions, commonOptions, wrapCommandAction } from "../cli/common.js";
-import { CLOUD_API_URL } from "../consts.js";
+import { serverMetadata } from "../mcp/config.js";
 import { McpContext } from "../mcp/context.js";
+import { toMcpContextOptions } from "../mcp/contextOptions.js";
 import { FileLogger } from "../mcp/logger.js";
+import { registerPrompts } from "../mcp/prompts.js";
 import { registerTools } from "../mcp/tools.js";
 import { printStandloneInitialBanner } from "../utilities/initialBanner.js";
 import { logger } from "../utilities/logger.js";
 import { installMcpServer } from "./install-mcp.js";
-import { serverMetadata } from "../mcp/config.js";
-import { initiateRulesInstallWizard } from "./install-rules.js";
+import { initiateSkillsInstallWizard } from "./skills.js";
 
 const McpCommandOptions = CommonCommandOptions.extend({
   projectRef: z.string().optional(),
   logFile: z.string().optional(),
   devOnly: z.boolean().default(false),
   readonly: z.boolean().default(false),
-  rulesInstallManifestPath: z.string().optional(),
-  rulesInstallBranch: z.string().optional(),
+  install: z.boolean().default(false),
 });
 
 export type McpCommandOptions = z.infer<typeof McpCommandOptions>;
@@ -42,17 +42,9 @@ export function configureMcpCommand(program: Command) {
         "Run in read-only mode. Write tools (deploy, trigger_task, cancel_run) are hidden from the AI."
       )
       .option("--log-file <log file>", "The file to log to")
-      .addOption(
-        new CommandOption(
-          "--rules-install-manifest-path <path>",
-          "The path to the rules install manifest"
-        ).hideHelp()
-      )
-      .addOption(
-        new CommandOption(
-          "--rules-install-branch <branch>",
-          "The branch to install the rules from"
-        ).hideHelp()
+      .option(
+        "--install",
+        "Run the interactive install wizard instead of starting the server. Bare `mcp` always starts the server (so clients that spawn it over a PTY don't get stuck in the wizard)."
       )
   ).action(async (options) => {
     wrapCommandAction("mcp", McpCommandOptions, options, async (opts) => {
@@ -62,7 +54,11 @@ export function configureMcpCommand(program: Command) {
 }
 
 export async function mcpCommand(options: McpCommandOptions) {
-  if (process.stdout.isTTY) {
+  // The install wizard runs ONLY when explicitly requested (`trigger mcp --install`).
+  // Bare `trigger mcp` always starts the server — MCP hosts (e.g. Claude Code) spawn it
+  // over a PTY, so `process.stdout.isTTY` is true even though no human is there; gating
+  // the wizard on isTTY made the server never start and the client time out.
+  if (options.install) {
     await printStandloneInitialBanner(true, options.profile);
 
     intro("Welcome to the Trigger.dev MCP server install wizard 🧙");
@@ -80,10 +76,7 @@ export async function mcpCommand(options: McpCommandOptions) {
       return;
     }
 
-    await initiateRulesInstallWizard({
-      manifestPath: options.rulesInstallManifestPath,
-      branch: options.rulesInstallBranch,
-    });
+    await initiateSkillsInstallWizard({});
 
     return;
   }
@@ -112,15 +105,10 @@ export async function mcpCommand(options: McpCommandOptions) {
     ? new FileLogger(options.logFile, server)
     : undefined;
 
-  const context = new McpContext(server, {
-    projectRef: options.projectRef,
-    fileLogger,
-    apiUrl: options.apiUrl ?? CLOUD_API_URL,
-    profile: options.profile,
-    readonly: options.readonly,
-  });
+  const context = new McpContext(server, toMcpContextOptions(options, fileLogger));
 
   registerTools(context);
+  registerPrompts(context);
 
   await server.connect(transport);
 }

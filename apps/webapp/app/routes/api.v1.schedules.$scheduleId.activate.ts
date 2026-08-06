@@ -2,9 +2,10 @@ import type { ActionFunctionArgs } from "@remix-run/server-runtime";
 import { json } from "@remix-run/server-runtime";
 import { z } from "zod";
 import { prisma } from "~/db.server";
-import { scheduleUniqWhereClause, scheduleWhereClause } from "~/models/schedules.server";
+import { getScheduleEnvVisibility, scheduleUniqWhereClause } from "~/models/schedules.server";
 import { ViewSchedulePresenter } from "~/presenters/v3/ViewSchedulePresenter.server";
 import { authenticateApiRequest } from "~/services/apiAuth.server";
+import { logger } from "~/services/logger.server";
 
 const ParamsSchema = z.object({
   scheduleId: z.string(),
@@ -33,14 +34,17 @@ export async function action({ request, params }: ActionFunctionArgs) {
   }
 
   try {
-    const existingSchedule = await prisma.taskSchedule.findFirst({
-      where: scheduleWhereClause(
-        authenticationResult.environment.projectId,
-        parsedParams.data.scheduleId
-      ),
-    });
-
-    if (!existingSchedule) {
+    // Env-scoped API keys can only toggle schedules that have an instance in
+    // their own environment. Without this a key scoped to one environment
+    // could enable/disable a schedule that only runs in another environment
+    // of the same project.
+    const visibility = await getScheduleEnvVisibility(
+      prisma,
+      authenticationResult.environment.projectId,
+      parsedParams.data.scheduleId,
+      authenticationResult.environment.id
+    );
+    if (visibility.status !== "visible") {
       return json({ error: "Schedule not found" }, { status: 404 });
     }
 
@@ -68,9 +72,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
 
     return json(presenter.toJSONResponse(result), { status: 200 });
   } catch (error) {
-    return json(
-      { error: error instanceof Error ? error.message : "Internal Server Error" },
-      { status: 500 }
-    );
+    logger.error("Failed to activate schedule", { error });
+    return json({ error: "Something went wrong, please try again." }, { status: 500 });
   }
 }

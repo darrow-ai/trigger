@@ -1,5 +1,11 @@
 import { randomUUID } from "crypto";
-import {
+import { z } from "zod";
+import type {
+  ExecutorToWorkerMessageCatalog,
+  WorkerToExecutorMessageCatalog,
+} from "./schemas/messages.js";
+import { ZodSchemaParsedError } from "./zodMessageHandler.js";
+import type {
   GetSocketCallbackSchema,
   GetSocketMessageSchema,
   GetSocketMessagesWithCallback,
@@ -8,13 +14,6 @@ import {
   SocketMessageHasCallback,
   ZodSocketMessageCatalogSchema,
 } from "./zodSocket.js";
-import { z } from "zod";
-import { ZodSchemaParsedError } from "./zodMessageHandler.js";
-import { inspect } from "node:util";
-import {
-  ExecutorToWorkerMessageCatalog,
-  WorkerToExecutorMessageCatalog,
-} from "./schemas/messages.js";
 
 interface ZodIpcMessageSender<TEmitCatalog extends ZodSocketMessageCatalogSchema> {
   send<K extends GetSocketMessagesWithoutCallback<TEmitCatalog>>(
@@ -143,6 +142,7 @@ interface ZodIpcConnectionOptions<
   process: {
     send?: (message: any) => any;
     on?: (event: "message", listener: (message: any) => void) => void;
+    connected?: boolean;
   };
   handlers?: ZodIpcMessageHandlers<TListenCatalog, TEmitCatalog>;
 }
@@ -257,7 +257,19 @@ export class ZodIpcConnection<
   }
 
   async #sendPacket(packet: Packet) {
-    await this.opts.process.send?.(packet);
+    // When the IPC channel is closed (e.g. parent process exited), there is no
+    // recipient — drop the packet rather than letting `process.send` throw
+    // ERR_IPC_CHANNEL_CLOSED, which would otherwise propagate as an
+    // uncaughtException and re-enter any handler that itself calls `process.send`.
+    if (this.opts.process.connected === false) {
+      return;
+    }
+
+    try {
+      await this.opts.process.send?.(packet);
+    } catch {
+      // swallow: channel raced from open to closed between the check and the send
+    }
   }
 
   async send<K extends GetSocketMessagesWithoutCallback<TEmitCatalog>>(
@@ -293,7 +305,7 @@ export class ZodIpcConnection<
   ): Promise<z.infer<GetSocketCallbackSchema<TEmitCatalog, K>>> {
     const currentId = this.#messageCounter++;
 
-    return new Promise(async (resolve, reject) => {
+    return new Promise((resolve, reject) => {
       const defaultTimeoutInMs = 2000;
 
       // Timeout if the ACK takes too long to get back to us
@@ -324,7 +336,7 @@ export class ZodIpcConnection<
         return reject(`Failed to parse message payload: ${JSON.stringify(parsedPayload.error)}`);
       }
 
-      await this.#sendPacket({
+      this.#sendPacket({
         type: "EVENT",
         message: {
           type,
@@ -332,7 +344,7 @@ export class ZodIpcConnection<
           version: "v1",
         },
         id: currentId,
-      });
+      }).catch(reject);
     });
   }
 }

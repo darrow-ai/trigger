@@ -170,6 +170,10 @@ spec:
               value: {{ .Values.supervisor.config.kubernetes.forceEnabled | quote }}
             - name: KUBERNETES_WORKER_NODETYPE_LABEL
               value: {{ .Values.supervisor.config.kubernetes.workerNodetypeLabel | quote }}
+            {{- with .Values.supervisor.config.kubernetes.runnerTolerations }}
+            - name: KUBERNETES_RUNNER_TOLERATIONS
+              value: {{ join "," . | quote }}
+            {{- end }}
             {{- $registryAuthEnabled := false }}
             {{- if .Values.registry.deploy }}
               {{- $registryAuthEnabled = .Values.registry.auth.enabled }}
@@ -237,7 +241,7 @@ spec:
               value: {{ .Values.supervisor.config.debug | quote }}
             # OTEL
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: "http://{{ include "trigger-v4.fullname" . }}-webapp:{{ .Values.webapp.service.port }}/otel"
+              value: "http://{{ include "trigger-v4.fullname" . }}-webapp.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.webapp.service.port }}/otel"
             {{- with .Values.supervisor.extraEnvVars }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

@@ -4,15 +4,9 @@ import type {
   ResponseBodyEnvs,
   FilterProjectEnvsResponseBody,
 } from "@vercel/sdk/models/filterprojectenvsop";
-import type {
-  GetV9ProjectsIdOrNameCustomEnvironmentsEnvironments,
-} from "@vercel/sdk/models/getv9projectsidornamecustomenvironmentsop";
+import type { GetV9ProjectsIdOrNameCustomEnvironmentsEnvironments } from "@vercel/sdk/models/getv9projectsidornamecustomenvironmentsop";
 import type { ResponseBodyProjects } from "@vercel/sdk/models/getprojectsop";
-import {
-  Organization,
-  OrganizationIntegration,
-  SecretReference,
-} from "@trigger.dev/database";
+import type { Organization, OrganizationIntegration, SecretReference } from "@trigger.dev/database";
 import { z } from "zod";
 import { ResultAsync, errAsync, okAsync } from "neverthrow";
 import { $transaction, prisma } from "~/db.server";
@@ -20,13 +14,16 @@ import { env } from "~/env.server";
 import { logger } from "~/services/logger.server";
 import { getSecretStore } from "~/services/secrets/secretStore.server";
 import { generateFriendlyId } from "~/v3/friendlyIdentifiers";
-import {
+import type {
   SyncEnvVarsMapping,
-  shouldSyncEnvVar,
   TriggerEnvironmentType,
+} from "~/v3/vercel/vercelProjectIntegrationSchema";
+import {
+  shouldSyncEnvVar,
   envTypeToVercelTarget,
 } from "~/v3/vercel/vercelProjectIntegrationSchema";
 import { EnvironmentVariablesRepository } from "~/v3/environmentVariables/environmentVariablesRepository.server";
+import { isReservedForExternalSync } from "~/v3/environmentVariableRules.server";
 import {
   callVercelWithRecovery,
   wrapVercelCallWithRecovery,
@@ -39,13 +36,11 @@ import {
 
 function normalizeTarget(target: string[] | string | undefined): string[] {
   if (Array.isArray(target)) return target.filter(Boolean);
-  if (typeof target === 'string') return [target];
+  if (typeof target === "string") return [target];
   return [];
 }
 
-function extractVercelEnvs(
-  response: FilterProjectEnvsResponseBody
-): ResponseBodyEnvs[] {
+function extractVercelEnvs(response: FilterProjectEnvsResponseBody): ResponseBodyEnvs[] {
   if ("envs" in response && Array.isArray(response.envs)) {
     return response.envs;
   }
@@ -72,30 +67,30 @@ const VercelErrorSchema = z.union([
 ]);
 
 function extractVercelErrorStatus(error: unknown): number | null {
-  if (error && typeof error === 'object' && 'status' in error) {
+  if (error && typeof error === "object" && "status" in error) {
     const parsed = VercelErrorSchema.safeParse(error);
-    if (parsed.success && 'status' in parsed.data) {
+    if (parsed.success && "status" in parsed.data) {
       return parsed.data.status;
     }
   }
 
-  if (error && typeof error === 'object' && 'response' in error) {
+  if (error && typeof error === "object" && "response" in error) {
     const parsed = VercelErrorSchema.safeParse(error);
-    if (parsed.success && 'response' in parsed.data) {
+    if (parsed.success && "response" in parsed.data) {
       return parsed.data.response.status;
     }
   }
 
-  if (error && typeof error === 'object' && 'statusCode' in error) {
+  if (error && typeof error === "object" && "statusCode" in error) {
     const parsed = VercelErrorSchema.safeParse(error);
-    if (parsed.success && 'statusCode' in parsed.data) {
+    if (parsed.success && "statusCode" in parsed.data) {
       return parsed.data.statusCode;
     }
   }
 
-  if (typeof error === 'string') {
-    if (error.includes('401')) return 401;
-    if (error.includes('403')) return 403;
+  if (typeof error === "string") {
+    if (error.includes("401")) return 401;
+    if (error.includes("403")) return 403;
   }
 
   return null;
@@ -124,22 +119,6 @@ function isVercelApiErrorShape(error: unknown): error is VercelApiError {
     typeof (error as VercelApiError).authInvalid === "boolean"
   );
 }
-
-/**
- * Wrap a Vercel SDK call in ResultAsync with structured error logging.
- */
-function wrapVercelCall<T>(
-  promise: Promise<T>,
-  message: string,
-  context: Record<string, unknown>
-): ResultAsync<T, VercelApiError> {
-  return ResultAsync.fromPromise(promise, (error) => {
-    const apiError = toVercelApiError(error);
-    logger.error(message, { ...context, error, authInvalid: apiError.authInvalid });
-    return apiError;
-  });
-}
-
 // ---------------------------------------------------------------------------
 // Schemas & token types
 // ---------------------------------------------------------------------------
@@ -197,6 +176,26 @@ export type VercelEnvironmentVariableValue = {
   isSecret: boolean;
 };
 
+/** Minimal shape of a shared (team-level) env var record from `GET /v1/env`. */
+const RawSharedEnvVarSchema = z
+  .object({
+    id: z.string().optional(),
+    key: z.string().optional(),
+    type: z.string().optional(),
+    target: z.union([z.array(z.string()), z.string()]).optional(),
+    value: z.string().optional(),
+    applyToAllCustomEnvironments: z.boolean().optional(),
+  })
+  .passthrough();
+
+type RawSharedEnvVar = z.infer<typeof RawSharedEnvVarSchema>;
+
+/** Page shape of `GET /v1/env` (shared env vars), validated at the boundary. */
+const SharedEnvPageSchema = z.object({
+  data: z.array(RawSharedEnvVarSchema).default([]),
+  pagination: z.object({ next: z.number().nullish() }).nullish(),
+});
+
 /** Narrowed Vercel project type – only id and name. */
 export type VercelProject = Pick<ResponseBodyProjects, "id" | "name">;
 
@@ -204,9 +203,7 @@ export type VercelProject = Pick<ResponseBodyProjects, "id" | "name">;
 // Mapper functions – narrow wide SDK responses into our domain types.
 // ---------------------------------------------------------------------------
 
-function toVercelEnvironmentVariable(
-  env: ResponseBodyEnvs
-): VercelEnvironmentVariable {
+function toVercelEnvironmentVariable(env: ResponseBodyEnvs): VercelEnvironmentVariable {
   return {
     id: env.id ?? "",
     key: env.key,
@@ -286,18 +283,31 @@ export class VercelIntegrationRepository {
         logger.error("Error exchanging Vercel OAuth code", { error });
         return toVercelApiError(error);
       }
-    ).map((data): TokenResponse => ({
-      accessToken: data.access_token,
-      tokenType: data.token_type,
-      teamId: data.team_id,
-      userId: data.user_id,
-      raw: data as Record<string, unknown>,
-    }));
+    ).map(
+      (data): TokenResponse => ({
+        accessToken: data.access_token,
+        tokenType: data.token_type,
+        teamId: data.team_id,
+        userId: data.user_id,
+        raw: data as Record<string, unknown>,
+      })
+    );
   }
 
   static getVercelClient(
     integration: OrganizationIntegration & { tokenReference: SecretReference }
   ): ResultAsync<Vercel, VercelApiError> {
+    return this.getVercelClientAndToken(integration).map(({ client }) => client);
+  }
+
+  /**
+   * Resolve both the Vercel SDK client and the raw bearer token. The raw token
+   * is needed to paginate shared env vars via `fetch`, since the SDK's
+   * `listSharedEnvVariable` exposes no `until` cursor param.
+   */
+  static getVercelClientAndToken(
+    integration: OrganizationIntegration & { tokenReference: SecretReference }
+  ): ResultAsync<{ client: Vercel; accessToken: string }, VercelApiError> {
     return ResultAsync.fromPromise(
       (async () => {
         const secretStore = getSecretStore(integration.tokenReference.provider);
@@ -308,16 +318,16 @@ export class VercelIntegrationRepository {
         if (!secret) {
           throw new Error("Failed to get Vercel access token");
         }
-        return new Vercel({ bearerToken: secret.accessToken });
+        return {
+          client: new Vercel({ bearerToken: secret.accessToken }),
+          accessToken: secret.accessToken,
+        };
       })(),
       (error) => toVercelApiError(error)
     );
   }
 
-  static getTeamSlug(
-    client: Vercel,
-    teamId: string | null
-  ): ResultAsync<string, VercelApiError> {
+  static getTeamSlug(client: Vercel, teamId: string | null): ResultAsync<string, VercelApiError> {
     if (teamId) {
       return wrapVercelCallWithRecovery(
         client.teams.getTeam({ teamId }),
@@ -342,18 +352,12 @@ export class VercelIntegrationRepository {
   ): ResultAsync<{ isValid: boolean }, VercelApiError> {
     return this.getVercelClient(integration)
       .andThen((client) =>
-        callVercelWithRecovery(
-          client.user.getAuthUser(),
-          VercelSchemas.getAuthUser,
-          { context: "validateVercelToken" }
-        ).mapErr(toVercelApiError)
+        callVercelWithRecovery(client.user.getAuthUser(), VercelSchemas.getAuthUser, {
+          context: "validateVercelToken",
+        }).mapErr(toVercelApiError)
       )
       .map(() => ({ isValid: true }))
-      .orElse((error) =>
-        error.authInvalid
-          ? okAsync({ isValid: false })
-          : errAsync(error)
-      );
+      .orElse((error) => (error.authInvalid ? okAsync({ isValid: false }) : errAsync(error)));
   }
 
   static async getTeamIdFromIntegration(
@@ -361,10 +365,7 @@ export class VercelIntegrationRepository {
   ): Promise<string | null> {
     const secretStore = getSecretStore(integration.tokenReference.provider);
 
-    const secret = await secretStore.getSecret(
-      VercelSecretSchema,
-      integration.tokenReference.key
-    );
+    const secret = await secretStore.getSecret(VercelSecretSchema, integration.tokenReference.key);
 
     if (!secret) {
       return null;
@@ -377,11 +378,14 @@ export class VercelIntegrationRepository {
     accessToken: string,
     configurationId: string,
     teamId?: string | null
-  ): ResultAsync<{
-    id: string;
-    teamId: string | null;
-    projects: string[];
-  }, VercelApiError> {
+  ): ResultAsync<
+    {
+      id: string;
+      teamId: string | null;
+      projects: string[];
+    },
+    VercelApiError
+  > {
     return ResultAsync.fromPromise(
       fetch(
         `https://api.vercel.com/v1/integrations/configuration/${configurationId}${teamId ? `?teamId=${teamId}` : ""}`,
@@ -445,7 +449,7 @@ export class VercelIntegrationRepository {
   static getVercelEnvironmentVariables(
     client: Vercel,
     projectId: string,
-    teamId?: string | null,
+    teamId?: string | null
   ): ResultAsync<VercelEnvironmentVariable[], VercelApiError> {
     return wrapVercelCallWithRecovery(
       client.projects.filterProjectEnvs({
@@ -558,31 +562,85 @@ export class VercelIntegrationRepository {
     };
   }
 
+  /**
+   * Fetch ALL shared (team-level) env var records, following pagination.
+   *
+   * Unlike the project env endpoint, the shared endpoint (`/v1/env`) DOES
+   * paginate (≈25/page) and the SDK's `listSharedEnvVariable` exposes no cursor
+   * param — so we walk pages via a raw fetch using `pagination.next` (a
+   * millisecond-timestamp cursor) until it is null. Shared vars are an edge
+   * case, so we load every page up front and return the full set.
+   */
+  static #fetchAllSharedEnvsRaw(params: {
+    accessToken: string;
+    teamId: string;
+    projectId?: string;
+  }): ResultAsync<RawSharedEnvVar[], VercelApiError> {
+    const { accessToken, teamId, projectId } = params;
+    return ResultAsync.fromPromise(
+      (async () => {
+        const all: RawSharedEnvVar[] = [];
+        let until: number | undefined = undefined;
+        const MAX_PAGES = 200; // safety cap (1000-var ceiling / ~25 per page)
+
+        for (let page = 0; page < MAX_PAGES; page++) {
+          const url = new URL("https://api.vercel.com/v1/env");
+          url.searchParams.set("teamId", teamId);
+          if (projectId) url.searchParams.set("projectId", projectId);
+          if (until !== undefined) url.searchParams.set("until", String(until));
+
+          const response = await fetch(url.toString(), {
+            method: "GET",
+            headers: { Authorization: `Bearer ${accessToken}` },
+          });
+
+          if (!response.ok) {
+            const body = await response.text().catch(() => "");
+            const error = new Error(
+              `Failed to fetch Vercel shared environment variables: ${response.status} ${response.statusText} — ${body}`
+            ) as Error & { status?: number };
+            error.status = response.status;
+            throw error;
+          }
+
+          const json = SharedEnvPageSchema.parse(await response.json());
+          all.push(...json.data);
+
+          // `next` is a millisecond-timestamp cursor; treat 0/null/undefined as "done".
+          const next = json.pagination?.next;
+          if (!next) break;
+          until = next;
+
+          if (page === MAX_PAGES - 1) {
+            logger.warn("Vercel shared env var pagination hit max page cap", { teamId, projectId });
+          }
+        }
+
+        return all;
+      })(),
+      (error) => toVercelApiError(error)
+    );
+  }
+
   static getVercelSharedEnvironmentVariables(
-    client: Vercel,
+    accessToken: string,
     teamId: string,
     projectId?: string // Optional: filter by project
-  ): ResultAsync<Array<{
+  ): ResultAsync<
+    Array<{
       id: string;
       key: string;
       type: string;
       isSecret: boolean;
       target: string[];
-    }>, VercelApiError> {
-    return wrapVercelCallWithRecovery(
-      client.environment.listSharedEnvVariable({
-        teamId,
-        ...(projectId && { projectId }),
-      }),
-      VercelSchemas.listSharedEnvVariable,
-      "Failed to fetch Vercel shared environment variables",
-      { teamId, projectId },
-      toVercelApiError
-    ).map((response) => {
-      const envVars = response.data || [];
+    }>,
+    VercelApiError
+  > {
+    return this.#fetchAllSharedEnvsRaw({ accessToken, teamId, projectId }).map((envVars) => {
       return envVars
-        .filter((env): env is typeof env & { id: string; key: string } =>
-          typeof env.id === "string" && typeof env.key === "string"
+        .filter(
+          (env): env is RawSharedEnvVar & { id: string; key: string } =>
+            typeof env.id === "string" && typeof env.key === "string"
         )
         .map((env) => {
           const type = env.type || "plain";
@@ -599,6 +657,7 @@ export class VercelIntegrationRepository {
 
   static getVercelSharedEnvironmentVariableValues(
     client: Vercel,
+    accessToken: string,
     teamId: string,
     projectId?: string // Optional: filter by project
   ): ResultAsync<
@@ -612,17 +671,7 @@ export class VercelIntegrationRepository {
     }>,
     VercelApiError
   > {
-    return wrapVercelCallWithRecovery(
-      client.environment.listSharedEnvVariable({
-        teamId,
-        ...(projectId && { projectId }),
-      }),
-      VercelSchemas.listSharedEnvVariable,
-      "Failed to fetch Vercel shared environment variable values",
-      { teamId, projectId },
-      toVercelApiError
-    ).andThen((listResponse) => {
-      const envVars = listResponse.data || [];
+    return this.#fetchAllSharedEnvsRaw({ accessToken, teamId, projectId }).andThen((envVars) => {
       if (envVars.length === 0) {
         return okAsync([]);
       }
@@ -641,8 +690,8 @@ export class VercelIntegrationRepository {
 
               if (isSecret) return null;
 
-              const listValue = (env as any).value as string | undefined;
-              const applyToAllCustomEnvs = (env as any).applyToAllCustomEnvironments as boolean | undefined;
+              const listValue = env.value;
+              const applyToAllCustomEnvs = env.applyToAllCustomEnvironments;
 
               if (listValue) {
                 return {
@@ -682,7 +731,10 @@ export class VercelIntegrationRepository {
                 projectId,
                 envId,
                 envKey,
-                error: getResult.error instanceof Error ? getResult.error.message : String(getResult.error),
+                error:
+                  getResult.error instanceof Error
+                    ? getResult.error.message
+                    : String(getResult.error),
               });
               return null;
             })
@@ -720,7 +772,9 @@ export class VercelIntegrationRepository {
             { context: "getVercelProjects" }
           ).match(
             (val) => val,
-            (err) => { throw err; }
+            (err) => {
+              throw err;
+            }
           );
 
           const projects = Array.isArray(response)
@@ -732,9 +786,7 @@ export class VercelIntegrationRepository {
 
           // Get pagination token for next page
           const pagination =
-            !Array.isArray(response) && "pagination" in response
-              ? response.pagination
-              : undefined;
+            !Array.isArray(response) && "pagination" in response ? response.pagination : undefined;
           from =
             pagination && "next" in pagination && pagination.next !== null
               ? String(pagination.next)
@@ -805,7 +857,7 @@ export class VercelIntegrationRepository {
     installationId?: string;
     organization: Pick<Organization, "id">;
     raw?: Record<string, any>;
-    origin: 'marketplace' | 'dashboard';
+    origin: "marketplace" | "dashboard";
   }): Promise<OrganizationIntegration> {
     const result = await $transaction(prisma, async (tx) => {
       const secretStore = getSecretStore("DATABASE", {
@@ -960,7 +1012,7 @@ export class VercelIntegrationRepository {
               key: "TRIGGER_SECRET_KEY",
               value: runtimeEnv.apiKey,
               target: vercelTarget,
-              type: "encrypted",
+              type: "sensitive",
               environmentType: runtimeEnv.type,
             });
           }
@@ -1061,7 +1113,7 @@ export class VercelIntegrationRepository {
           key: "TRIGGER_SECRET_KEY",
           value: params.apiKey,
           target: vercelTarget,
-          type: "encrypted",
+          type: "sensitive",
         });
 
         logger.info("Synced regenerated API key to Vercel", {
@@ -1105,7 +1157,9 @@ export class VercelIntegrationRepository {
             { context: "upsertEnvVarForCustomEnvironment" }
           ).match(
             (val) => val,
-            (err) => { throw err; }
+            (err) => {
+              throw err;
+            }
           );
 
           const envs = extractVercelEnvs(existingEnvs);
@@ -1115,28 +1169,26 @@ export class VercelIntegrationRepository {
             return (env as any).customEnvironmentIds?.includes(customEnvironmentId);
           });
 
+          // Always delete-then-create rather than editProjectEnv, because Vercel rejects
+          // in-place type changes (e.g. encrypted -> sensitive).
           if (existingEnv && existingEnv.id) {
-            await client.projects.editProjectEnv({
-              idOrName: vercelProjectId,
-              id: existingEnv.id,
-              ...(teamId && { teamId }),
-              requestBody: {
-                value,
-                type,
-              },
-            });
-          } else {
-            await client.projects.createProjectEnv({
+            await client.projects.batchRemoveProjectEnv({
               idOrName: vercelProjectId,
               ...(teamId && { teamId }),
-              requestBody: {
-                key,
-                value,
-                type,
-                customEnvironmentIds: [customEnvironmentId],
-              } as any,
+              requestBody: { ids: [existingEnv.id] },
             });
           }
+
+          await client.projects.createProjectEnv({
+            idOrName: vercelProjectId,
+            ...(teamId && { teamId }),
+            requestBody: {
+              key,
+              value,
+              type,
+              customEnvironmentIds: [customEnvironmentId],
+            } as any,
+          });
         })(),
         (error) => toVercelApiError(error)
       )
@@ -1164,7 +1216,9 @@ export class VercelIntegrationRepository {
             { context: "removeEnvVarForCustomEnvironment" }
           ).match(
             (val) => val,
-            (err) => { throw err; }
+            (err) => {
+              throw err;
+            }
           );
 
           const envs = extractVercelEnvs(existingEnvs);
@@ -1203,7 +1257,7 @@ export class VercelIntegrationRepository {
       syncEnvVarsMappingKeys: Object.keys(params.syncEnvVarsMapping),
     });
 
-    return this.getVercelClient(params.orgIntegration).andThen((client) =>
+    return this.getVercelClientAndToken(params.orgIntegration).andThen(({ client, accessToken }) =>
       ResultAsync.fromPromise(
         (async () => {
           const errors: string[] = [];
@@ -1240,7 +1294,11 @@ export class VercelIntegrationRepository {
             }
 
             envMapping.push({
-              triggerEnvType: runtimeEnv.type as "PRODUCTION" | "STAGING" | "PREVIEW" | "DEVELOPMENT",
+              triggerEnvType: runtimeEnv.type as
+                | "PRODUCTION"
+                | "STAGING"
+                | "PREVIEW"
+                | "DEVELOPMENT",
               vercelTarget: vercelTarget[0],
               runtimeEnvironmentId: runtimeEnv.id,
             });
@@ -1269,6 +1327,7 @@ export class VercelIntegrationRepository {
           if (params.teamId) {
             const sharedResult = await this.getVercelSharedEnvironmentVariableValues(
               client,
+              accessToken,
               params.teamId,
               params.vercelProjectId
             );
@@ -1279,11 +1338,14 @@ export class VercelIntegrationRepository {
           for (const mapping of envMapping) {
             const iterResult = await ResultAsync.fromPromise(
               (async () => {
-                // Build filter to avoid decrypting vars that will be filtered out anyway
-                const excludeKeys = new Set(["TRIGGER_SECRET_KEY", "TRIGGER_VERSION"]);
+                // Exclude reserved keys before decrypting (a reserved-only batch gets rejected).
                 const shouldIncludeKey = (key: string) =>
-                  !excludeKeys.has(key) &&
-                  shouldSyncEnvVar(params.syncEnvVarsMapping, key, mapping.triggerEnvType as TriggerEnvironmentType);
+                  !isReservedForExternalSync(key) &&
+                  shouldSyncEnvVar(
+                    params.syncEnvVarsMapping,
+                    key,
+                    mapping.triggerEnvType as TriggerEnvironmentType
+                  );
 
                 const envVarsResult = await this.getVercelEnvironmentVariableValues(
                   client,
@@ -1299,7 +1361,9 @@ export class VercelIntegrationRepository {
                     vercelTarget: mapping.vercelTarget,
                     error: envVarsResult.error.message,
                   });
-                  errors.push(`Failed to get env vars for ${mapping.triggerEnvType}: ${envVarsResult.error.message}`);
+                  errors.push(
+                    `Failed to get env vars for ${mapping.triggerEnvType}: ${envVarsResult.error.message}`
+                  );
                   return;
                 }
 
@@ -1309,16 +1373,16 @@ export class VercelIntegrationRepository {
 
                 const filteredSharedEnvVars = sharedEnvVars.filter((envVar) => {
                   const matchesTarget = envVar.target.includes(mapping.vercelTarget);
-                  const matchesCustomEnv = isCustomEnvironment && envVar.applyToAllCustomEnvironments === true;
+                  const matchesCustomEnv =
+                    isCustomEnvironment && envVar.applyToAllCustomEnvironments === true;
                   return matchesTarget || matchesCustomEnv;
                 });
 
                 const projectEnvVarKeys = new Set(projectEnvVars.map((v) => v.key));
-                const sharedEnvVarsToAdd = filteredSharedEnvVars.filter((v) => !projectEnvVarKeys.has(v.key));
-                const mergedEnvVars = [
-                  ...projectEnvVars,
-                  ...sharedEnvVarsToAdd,
-                ];
+                const sharedEnvVarsToAdd = filteredSharedEnvVars.filter(
+                  (v) => !projectEnvVarKeys.has(v.key)
+                );
+                const mergedEnvVars = [...projectEnvVars, ...sharedEnvVarsToAdd];
 
                 if (mergedEnvVars.length === 0) {
                   return;
@@ -1328,7 +1392,7 @@ export class VercelIntegrationRepository {
                   if (envVar.isSecret) {
                     return false;
                   }
-                  if (envVar.key === "TRIGGER_SECRET_KEY" || envVar.key === "TRIGGER_VERSION") {
+                  if (isReservedForExternalSync(envVar.key)) {
                     return false;
                   }
                   return shouldSyncEnvVar(
@@ -1524,7 +1588,9 @@ export class VercelIntegrationRepository {
       { context: "batchUpsertVercelEnvVars" }
     ).match(
       (val) => val,
-      (err) => { throw err; }
+      (err) => {
+        throw err;
+      }
     );
 
     const existingEnvsList = extractVercelEnvs(existingEnvs);
@@ -1656,13 +1722,13 @@ export class VercelIntegrationRepository {
       { context: "removeAllVercelEnvVarsByKey" }
     ).match(
       (val) => val,
-      (err) => { throw err; }
+      (err) => {
+        throw err;
+      }
     );
 
     const envs = extractVercelEnvs(existingEnvs);
-    const idsToRemove = envs
-      .filter((env) => env.key === key && env.id)
-      .map((env) => env.id!);
+    const idsToRemove = envs.filter((env) => env.key === key && env.id).map((env) => env.id!);
 
     if (idsToRemove.length === 0) {
       return;
@@ -1695,7 +1761,9 @@ export class VercelIntegrationRepository {
       { context: "upsertVercelEnvVar" }
     ).match(
       (val) => val,
-      (err) => { throw err; }
+      (err) => {
+        throw err;
+      }
     );
 
     const envs = extractVercelEnvs(existingEnvs);
@@ -1709,29 +1777,27 @@ export class VercelIntegrationRepository {
       return target.length === envTargets.length && target.every((t) => envTargets.includes(t));
     });
 
+    // Always delete-then-create rather than editProjectEnv, because Vercel rejects
+    // in-place type changes (e.g. encrypted -> sensitive). Same approach used by
+    // syncApiKeysToVercel via removeAllVercelEnvVarsByKey.
     if (existingEnv && existingEnv.id) {
-      await client.projects.editProjectEnv({
-        idOrName: vercelProjectId,
-        id: existingEnv.id,
-        ...(teamId && { teamId }),
-        requestBody: {
-          value,
-          target: target as any,
-          type,
-        },
-      });
-    } else {
-      await client.projects.createProjectEnv({
+      await client.projects.batchRemoveProjectEnv({
         idOrName: vercelProjectId,
         ...(teamId && { teamId }),
-        requestBody: {
-          key,
-          value,
-          target: target as any,
-          type,
-        },
+        requestBody: { ids: [existingEnv.id] },
       });
     }
+
+    await client.projects.createProjectEnv({
+      idOrName: vercelProjectId,
+      ...(teamId && { teamId }),
+      requestBody: {
+        key,
+        value,
+        target: target as any,
+        type,
+      },
+    });
   }
 
   static getAutoAssignCustomDomains(

@@ -1,13 +1,11 @@
-import { SimpleStructuredLogger } from "../../utils/structuredLogger.js";
-import { QueueConsumer, RunQueueConsumer, RunQueueConsumerOptions } from "./queueConsumer.js";
-import { QueueMetricsProcessor } from "./queueMetricsProcessor.js";
-import {
-  ScalingStrategy,
-  ScalingStrategyKind,
-  ScalingStrategyOptions,
-} from "./scalingStrategies.js";
-import { ConsumerPoolMetrics } from "./consumerPoolMetrics.js";
 import type { Registry } from "prom-client";
+import { SimpleStructuredLogger } from "../../utils/structuredLogger.js";
+import { ConsumerPoolMetrics } from "./consumerPoolMetrics.js";
+import type { QueueConsumer, RunQueueConsumerOptions } from "./queueConsumer.js";
+import { RunQueueConsumer } from "./queueConsumer.js";
+import { QueueMetricsProcessor } from "./queueMetricsProcessor.js";
+import type { ScalingStrategyKind } from "./scalingStrategies.js";
+import { ScalingStrategy } from "./scalingStrategies.js";
 
 export type QueueConsumerFactory = (opts: RunQueueConsumerOptions) => QueueConsumer;
 
@@ -22,6 +20,12 @@ export type ScalingOptions = {
   batchWindowMs?: number;
   disableJitter?: boolean;
   dampingFactor?: number;
+  /**
+   * When this returns true, scale-up is frozen (scale-down still allowed). Used to
+   * stop the pool from adding consumers to drain a queue that backpressure is
+   * deliberately holding. Synchronous and hot-path-safe.
+   */
+  shouldPauseScaling?: () => boolean;
 };
 
 export type ConsumerPoolOptions = {
@@ -49,6 +53,7 @@ export class RunQueueConsumerPool {
   private readonly maxConsumerCount: number;
   private readonly scalingStrategy: ScalingStrategy;
   private readonly disableJitter: boolean;
+  private readonly shouldPauseScaling?: () => boolean;
 
   private consumers: Map<string, QueueConsumer> = new Map();
   private readonly consumerFactory: QueueConsumerFactory;
@@ -79,6 +84,7 @@ export class RunQueueConsumerPool {
     this.scaleUpCooldownMs = opts.scaling.scaleUpCooldownMs ?? 10000; // 10 seconds default
     this.scaleDownCooldownMs = opts.scaling.scaleDownCooldownMs ?? 60000; // 60 seconds default
     this.disableJitter = opts.scaling.disableJitter ?? false;
+    this.shouldPauseScaling = opts.scaling.shouldPauseScaling;
 
     // Configure EWMA parameters from options
     this.ewmaAlpha = opts.scaling.ewmaAlpha ?? 0.3;
@@ -259,6 +265,16 @@ export class RunQueueConsumerPool {
 
     // Check cooldown periods with jitter
     if (targetCount > this.consumers.size) {
+      // Freeze scale-up while backpressure is engaged - don't add consumers to
+      // drain a queue we're deliberately holding. Scale-down stays allowed.
+      if (this.shouldPauseScaling?.()) {
+        this.logger.debug("Scale up frozen by backpressure", {
+          currentCount: this.consumers.size,
+          targetCount,
+        });
+        return;
+      }
+
       // Scale up
       const effectiveCooldown = this.scaleUpCooldownMs + jitterMs;
       if (timeSinceLastScale < effectiveCooldown) {
@@ -351,6 +367,10 @@ export class RunQueueConsumerPool {
 
       const consumer = this.consumerFactory({
         ...this.consumerOptions,
+        // Share the pool's single metrics instance so every consumer records onto
+        // the same histogram (re-registering the metric name would throw). Fall
+        // back to a caller-supplied instance rather than clobbering it.
+        metrics: this.promMetrics ?? this.consumerOptions.metrics,
         onDequeue: async (messages, timing) => {
           // Always update queue length, default to 0 for empty dequeues or missing value
           this.updateQueueLength(messages[0]?.workerQueueLength ?? 0);

@@ -1,8 +1,9 @@
-import { json } from "@remix-run/server-runtime";
 import { z } from "zod";
 import { $replica } from "~/db.server";
-import { realtimeClient } from "~/services/realtimeClientGlobal.server";
-import { createLoaderApiRoute } from "~/services/routeBuilders/apiBuilder.server";
+import { getRequestAbortSignal } from "~/services/httpAsyncStorage.server";
+import { resolveRealtimeStreamClient } from "~/services/realtime/resolveRealtimeStreamClient.server";
+import { anyResource, createLoaderApiRoute } from "~/services/routeBuilders/apiBuilder.server";
+import { runStore } from "~/v3/runStore.server";
 
 const ParamsSchema = z.object({
   runId: z.string(),
@@ -14,11 +15,11 @@ export const loader = createLoaderApiRoute(
     allowJWT: true,
     corsStrategy: "all",
     findResource: async (params, authentication) => {
-      return $replica.taskRun.findFirst({
-        where: {
-          friendlyId: params.runId,
-          runtimeEnvironmentId: authentication.environment.id,
-        },
+      const where = {
+        friendlyId: params.runId,
+        runtimeEnvironmentId: authentication.environment.id,
+      };
+      const args = {
         include: {
           batch: {
             select: {
@@ -26,27 +27,41 @@ export const loader = createLoaderApiRoute(
             },
           },
         },
-      });
+      };
+      // Replica lag can null out a run that already exists on the owning primary. A spurious 404
+      // here permanently fails the client's realtime subscription (the SSE client treats 404 as
+      // "stream gone" — nonRetryableStatuses). Re-read the primary on a replica miss.
+      const run = await runStore.findRun(where, args, $replica);
+      return run ?? runStore.findRunOnPrimary(where, args);
     },
     authorization: {
       action: "read",
-      resource: (run) => ({
-        runs: run.friendlyId,
-        tags: run.runTags,
-        batch: run.batch?.friendlyId,
-        tasks: run.taskIdentifier,
-      }),
-      superScopes: ["read:runs", "read:all", "admin"],
+      resource: (run) => {
+        const resources = [
+          { type: "runs", id: run.friendlyId },
+          { type: "tasks", id: run.taskIdentifier },
+          ...run.runTags.map((tag) => ({ type: "tags", id: tag })),
+        ];
+        if (run.batch?.friendlyId) {
+          resources.push({ type: "batch", id: run.batch.friendlyId });
+        }
+        return anyResource(resources);
+      },
     },
   },
   async ({ authentication, request, resource: run, apiVersion }) => {
-    return realtimeClient.streamRun(
+    // Resolve the native realtime client; it implements streamRun.
+    const client = await resolveRealtimeStreamClient(authentication.environment);
+
+    return client.streamRun(
       request.url,
       authentication.environment,
       run.id,
       apiVersion,
       authentication.realtime,
-      request.headers.get("x-trigger-electric-version") ?? undefined
+      request.headers.get("x-trigger-electric-version") ?? undefined,
+      // Propagate abort on client disconnect so the upstream Electric long-poll is cancelled too, else undici buffers grow RSS until the poll timeout.
+      getRequestAbortSignal()
     );
   }
 );

@@ -13,7 +13,7 @@ const BodySchema = z.object({
   taskIdentifier: z.string().min(1, "Task identifier is required"),
 });
 
-export const { action } = createActionApiRoute(
+const route = createActionApiRoute(
   {
     params: ParamsSchema,
     body: BodySchema,
@@ -21,8 +21,7 @@ export const { action } = createActionApiRoute(
     corsStrategy: "all",
     authorization: {
       action: "write",
-      resource: () => ({}),
-      superScopes: ["write:runs", "admin"],
+      resource: () => ({ type: "runs" }),
     },
   },
   async ({ params, body, authentication }) => {
@@ -41,11 +40,17 @@ export const { action } = createActionApiRoute(
       }
 
       logger.error("Failed to reset idempotency key via API", {
-        error: error instanceof Error ? { name: error.name, message: error.message, stack: error.stack } : String(error),
+        error:
+          error instanceof Error
+            ? { name: error.name, message: error.message, stack: error.stack }
+            : String(error),
       });
 
       return json({ error: "Internal Server Error" }, { status: 500 });
     }
-
   }
 );
+
+export const action = route.action;
+// The builder's loader handles CORS OPTIONS preflight
+export const loader = route.loader;

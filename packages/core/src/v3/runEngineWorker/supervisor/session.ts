@@ -1,12 +1,18 @@
 import { SupervisorHttpClient } from "./http.js";
-import { PreDequeueFn, PreSkipFn, SupervisorClientCommonOptions } from "./types.js";
-import { WorkerApiDequeueResponseBody, WorkerApiHeartbeatRequestBody } from "./schemas.js";
-import { RunQueueConsumerPool, ScalingOptions } from "./consumerPool.js";
-import { WorkerEvents } from "./events.js";
+import type { PreDequeueFn, PreSkipFn, SupervisorClientCommonOptions } from "./types.js";
+import type {
+  WorkerApiDequeueResponseBody,
+  WorkerApiHeartbeatRequestBody,
+  WorkerQueueClass,
+} from "./schemas.js";
+import type { ScalingOptions } from "./consumerPool.js";
+import { RunQueueConsumerPool } from "./consumerPool.js";
+import type { WorkerEvents } from "./events.js";
 import EventEmitter from "events";
 import { VERSION } from "../../../version.js";
-import { io, Socket } from "socket.io-client";
-import { WorkerClientToServerEvents, WorkerServerToClientEvents } from "../types.js";
+import type { Socket } from "socket.io-client";
+import { io } from "socket.io-client";
+import type { WorkerClientToServerEvents, WorkerServerToClientEvents } from "../types.js";
 import { getDefaultWorkerHeaders } from "./util.js";
 import { IntervalService } from "../../utils/interval.js";
 import { SimpleStructuredLogger } from "../../utils/structuredLogger.js";
@@ -21,6 +27,8 @@ type SupervisorSessionOptions = SupervisorClientCommonOptions & {
   preDequeue?: PreDequeueFn;
   preSkip?: PreSkipFn;
   maxRunCount?: number;
+  /** Which worker-queue class this supervisor's consumers pull from. Defaults to the region queue. */
+  queueClass?: WorkerQueueClass;
   sendRunDebugLogs?: boolean;
   scaling: ScalingOptions;
   metricsRegistry?: Registry;
@@ -56,6 +64,7 @@ export class SupervisorSession extends EventEmitter<WorkerEvents> {
         intervalMs: opts.dequeueIntervalMs,
         idleIntervalMs: opts.dequeueIdleIntervalMs,
         maxRunCount: opts.maxRunCount,
+        queueClass: opts.queueClass,
       },
       scaling: opts.scaling,
       metricsRegistry: opts.metricsRegistry,
@@ -80,7 +89,10 @@ export class SupervisorSession extends EventEmitter<WorkerEvents> {
     });
   }
 
-  private async onDequeue(messages: WorkerApiDequeueResponseBody, timing?: { dequeueResponseMs: number; pollingIntervalMs: number }): Promise<void> {
+  private async onDequeue(
+    messages: WorkerApiDequeueResponseBody,
+    timing?: { dequeueResponseMs: number; pollingIntervalMs: number }
+  ): Promise<void> {
     this.logger.verbose("Dequeued messages with contents", { count: messages.length, messages });
 
     for (const message of messages) {

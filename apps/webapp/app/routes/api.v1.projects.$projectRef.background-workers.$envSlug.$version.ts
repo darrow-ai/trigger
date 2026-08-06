@@ -1,4 +1,5 @@
-import { LoaderFunctionArgs, json } from "@remix-run/server-runtime";
+import type { LoaderFunctionArgs } from "@remix-run/server-runtime";
+import { json } from "@remix-run/server-runtime";
 import { z } from "zod";
 import { prisma } from "~/db.server";
 import {
@@ -6,6 +7,7 @@ import {
   authenticatedEnvironmentForAuthentication,
   branchNameFromRequest,
 } from "~/services/apiAuth.server";
+import { logger } from "~/services/logger.server";
 import zlib from "node:zlib";
 
 const ParamsSchema = z.object({
@@ -21,67 +23,78 @@ export async function loader({ params, request }: LoaderFunctionArgs) {
     return json({ error: "Invalid params" }, { status: 400 });
   }
 
-  const authenticationResult = await authenticateRequest(request);
+  try {
+    const authenticationResult = await authenticateRequest(request);
 
-  if (!authenticationResult) {
-    return json({ error: "Invalid or Missing API key" }, { status: 401 });
-  }
+    if (!authenticationResult) {
+      return json({ error: "Invalid or Missing API key" }, { status: 401 });
+    }
 
-  const environment = await authenticatedEnvironmentForAuthentication(
-    authenticationResult,
-    parsedParams.data.projectRef,
-    parsedParams.data.envSlug,
-    branchNameFromRequest(request)
-  );
+    const environment = await authenticatedEnvironmentForAuthentication(
+      authenticationResult,
+      parsedParams.data.projectRef,
+      parsedParams.data.envSlug,
+      branchNameFromRequest(request)
+    );
 
-  // Find the background worker and tasks and files
-  const backgroundWorker = await prisma.backgroundWorker.findFirst({
-    where: {
-      runtimeEnvironmentId: environment.id,
-      version: parsedParams.data.version,
-    },
-    include: {
-      tasks: true,
-      files: {
-        include: {
-          tasks: {
-            select: {
-              slug: true,
-            },
-          },
-        },
+    // Find the background worker and tasks and files
+    const backgroundWorker = await prisma.backgroundWorker.findFirst({
+      where: {
+        runtimeEnvironmentId: environment.id,
+        version: parsedParams.data.version,
       },
-    },
-  });
+      include: {
+        tasks: true,
+        files: true,
+      },
+    });
 
-  if (!backgroundWorker) {
-    return json({ error: "Background worker not found" }, { status: 404 });
+    if (!backgroundWorker) {
+      return json({ error: "Background worker not found" }, { status: 404 });
+    }
+
+    // Group task slugs by fileId from the already-loaded tasks (which are fetched
+    // via the indexed workerId relation) instead of loading files.tasks, which
+    // queries BackgroundWorkerTask by the unindexed fileId column.
+    const taskSlugsByFileId = new Map<string, Set<string>>();
+    for (const task of backgroundWorker.tasks) {
+      if (!task.fileId) {
+        continue;
+      }
+      const slugs = taskSlugsByFileId.get(task.fileId) ?? new Set<string>();
+      slugs.add(task.slug);
+      taskSlugsByFileId.set(task.fileId, slugs);
+    }
+
+    return json({
+      id: backgroundWorker.friendlyId,
+      version: backgroundWorker.version,
+      cliVersion: backgroundWorker.cliVersion,
+      sdkVersion: backgroundWorker.sdkVersion,
+      contentHash: backgroundWorker.contentHash,
+      createdAt: backgroundWorker.createdAt,
+      updatedAt: backgroundWorker.updatedAt,
+      tasks: backgroundWorker.tasks.map((task) => ({
+        id: task.slug,
+        exportName: task.exportName ?? "@deprecated",
+        filePath: task.filePath,
+        source: task.triggerSource,
+        retryConfig: task.retryConfig,
+        queueConfig: task.queueConfig,
+      })),
+      files: backgroundWorker.files.map((file) => ({
+        id: file.friendlyId,
+        filePath: file.filePath,
+        contentHash: file.contentHash,
+        contents: decompressContent(file.contents),
+        tasks: Array.from(taskSlugsByFileId.get(file.id) ?? []),
+      })),
+    });
+  } catch (error) {
+    if (error instanceof Response) throw error;
+    logger.error("Failed to load background worker", { error });
+    return json({ error: "Internal Server Error" }, { status: 500 });
   }
-
-  return json({
-    id: backgroundWorker.friendlyId,
-    version: backgroundWorker.version,
-    cliVersion: backgroundWorker.cliVersion,
-    sdkVersion: backgroundWorker.sdkVersion,
-    contentHash: backgroundWorker.contentHash,
-    createdAt: backgroundWorker.createdAt,
-    updatedAt: backgroundWorker.updatedAt,
-    tasks: backgroundWorker.tasks.map((task) => ({
-      id: task.slug,
-      exportName: task.exportName ?? "@deprecated",
-      filePath: task.filePath,
-      source: task.triggerSource,
-      retryConfig: task.retryConfig,
-      queueConfig: task.queueConfig,
-    })),
-    files: backgroundWorker.files.map((file) => ({
-      id: file.friendlyId,
-      filePath: file.filePath,
-      contentHash: file.contentHash,
-      contents: decompressContent(file.contents),
-      tasks: Array.from(new Set(file.tasks.map((task) => task.slug))),
-    })),
-  });
 }
 
 function decompressContent(compressedBuffer: Uint8Array): string {

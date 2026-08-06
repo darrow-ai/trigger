@@ -1,6 +1,6 @@
 import { confirm, intro, isCancel, log, multiselect, select } from "@clack/prompts";
 import chalk from "chalk";
-import { Command } from "commander";
+import type { Command } from "commander";
 import { extname } from "node:path";
 import { z } from "zod";
 import { OutroCommandError, wrapCommandAction } from "../cli/common.js";
@@ -328,7 +328,7 @@ async function installMcpServerForClient(
   return { configPath, clientName, scope };
 }
 
-type McpServerConfig = Record<string, string | Array<string> | boolean | undefined>;
+type McpServerConfig = Record<string, string | Array<string> | boolean | number | undefined>;
 type McpServerScope = {
   scope: (typeof scopes)[number];
   location: string;
@@ -538,6 +538,7 @@ function resolveMcpServerConfig(
       return {
         command: "npx",
         args,
+        startup_timeout_sec: 30,
       };
     }
     case "zed": {

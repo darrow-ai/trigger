@@ -1,8 +1,4 @@
-import {
-  CheckCircleIcon,
-  ExclamationTriangleIcon,
-  XCircleIcon,
-} from "@heroicons/react/20/solid";
+import { CheckCircleIcon, ExclamationTriangleIcon, XCircleIcon } from "@heroicons/react/20/solid";
 import type { BatchTaskRunStatus } from "@trigger.dev/database";
 import assertNever from "assert-never";
 import { Spinner } from "~/components/primitives/Spinner";
@@ -46,7 +42,12 @@ export function BatchStatusCombo({
 }
 
 export function BatchStatusLabel({ status }: { status: BatchTaskRunStatus }) {
-  return <span className={batchStatusColor(status)}>{batchStatusTitle(status)}</span>;
+  // system-mono-label: System themes uncolor the label (see tailwind.css)
+  return (
+    <span className={cn("system-mono-label", batchStatusColor(status))}>
+      {batchStatusTitle(status)}
+    </span>
+  );
 }
 
 export function BatchStatusIcon({

@@ -1,9 +1,12 @@
 import type { Result } from "@trigger.dev/core/v3";
 import type { z } from "zod";
 import type { InsertError, QueryError } from "./errors.js";
-import { ClickHouseSettings } from "@clickhouse/client";
-import type { BaseQueryParams, InsertResult } from "@clickhouse/client";
-import { ClickhouseQueryBuilder, ClickhouseQueryFastBuilder } from "./queryBuilder.js";
+import {
+  type ClickHouseSettings,
+  type BaseQueryParams,
+  type InsertResult,
+} from "@clickhouse/client";
+import type { ClickhouseQueryBuilder, ClickhouseQueryFastBuilder } from "./queryBuilder.js";
 
 export type ClickhouseQueryFunction<TInput, TOutput> = (
   params: TInput,
@@ -12,6 +15,20 @@ export type ClickhouseQueryFunction<TInput, TOutput> = (
     params?: BaseQueryParams;
   }
 ) => Promise<Result<TOutput[], QueryError>>;
+
+/**
+ * Like {@link ClickhouseQueryFunction} but yields rows as they stream off the
+ * socket instead of buffering them into an array. The whole result set is never
+ * held in memory at once. Errors are thrown (the async iterable rejects) rather
+ * than returned as a Result tuple.
+ */
+export type ClickhouseQueryStreamFunction<TInput, TOutput> = (
+  params: TInput,
+  options?: {
+    attributes?: Record<string, string | number | boolean>;
+    params?: BaseQueryParams;
+  }
+) => AsyncIterable<TOutput>;
 
 /**
  * Query statistics returned by ClickHouse
@@ -118,6 +135,16 @@ export interface ClickhouseReader {
      * These will be merged with the default settings.
      */
     settings?: ClickHouseSettings;
+    /**
+     * Extra fields to attach to the error log if the query fails. Use this to
+     * record what produced the SQL, e.g. the TSQL a caller actually wrote.
+     */
+    logFields?: Record<string, unknown>;
+    /**
+     * Set when the SQL originates from whoever made the request rather than
+     * from us. Invalid-SQL rejections are then their mistake, not a bug.
+     */
+    userAuthoredQuery?: boolean;
   }): ClickhouseQueryWithStatsFunction<z.input<TIn>, z.output<TOut>>;
 
   queryFast<TOut extends Record<string, any>, TParams extends Record<string, any>>(req: {
@@ -145,6 +172,18 @@ export interface ClickhouseReader {
      */
     settings?: ClickHouseSettings;
   }): ClickhouseQueryFunction<TParams, TOut>;
+
+  /**
+   * Like {@link queryFast} but streams rows instead of buffering them. Returns an
+   * async iterable so the caller can process arbitrarily large result sets with
+   * bounded memory.
+   */
+  queryFastStream<TOut extends Record<string, any>, TParams extends Record<string, any>>(req: {
+    name: string;
+    query: string;
+    columns: Array<string | ColumnExpression>;
+    settings?: ClickHouseSettings;
+  }): ClickhouseQueryStreamFunction<TParams, TOut>;
 
   queryBuilder<TOut extends z.ZodSchema<any>>(req: {
     /**

@@ -1,6 +1,6 @@
-import { ClickHouseSettings } from "@clickhouse/client";
+import type { ClickHouseSettings } from "@clickhouse/client";
 import { z } from "zod";
-import { ClickhouseReader, ClickhouseWriter } from "./client/types.js";
+import type { ClickhouseReader, ClickhouseWriter } from "./client/types.js";
 
 export const TaskEventV1Input = z.object({
   environment_id: z.string(),
@@ -31,6 +31,7 @@ export function insertTaskEvents(ch: ClickhouseWriter, settings?: ClickHouseSett
     settings: {
       enable_json_type: 1,
       type_json_skip_duplicated_paths: 1,
+      input_format_json_infer_array_of_dynamic_from_array_of_different_types: 1,
       input_format_json_throw_on_bad_escape_sequence: 0,
       input_format_json_use_string_type_for_ambiguous_paths_in_named_tuples_inference_from_objects: 1,
       ...settings,
@@ -109,6 +110,44 @@ export function getTraceDetailedSummaryQueryBuilder(
   });
 }
 
+// Row shape for streaming a whole trace out for export (the "Download trace"
+// feature). Unlike the detailed-summary builders this keeps the FULL message
+// (not LEFT(message, 256)) since the export is the source of truth, and it's
+// consumed via executeStream() so the trace is never fully materialised.
+export type TaskEventExportRow = {
+  span_id: string;
+  parent_span_id: string;
+  start_time: string;
+  duration: number | string;
+  status: string;
+  kind: string;
+  message: string;
+  attributes_text: string;
+};
+
+const TASK_EVENT_EXPORT_COLUMNS = [
+  "span_id",
+  "parent_span_id",
+  "start_time",
+  "duration",
+  "status",
+  "kind",
+  "message",
+  "attributes_text",
+] as const;
+
+export function getTraceEventsForExportQueryBuilder(
+  ch: ClickhouseReader,
+  settings?: ClickHouseSettings
+) {
+  return ch.queryBuilderFast<TaskEventExportRow>({
+    name: "getTraceEventsForExport",
+    table: "trigger_dev.task_events_v1",
+    columns: [...TASK_EVENT_EXPORT_COLUMNS],
+    settings,
+  });
+}
+
 export const TaskEventDetailsV1Result = z.object({
   span_id: z.string(),
   parent_span_id: z.string(),
@@ -168,6 +207,7 @@ export function insertTaskEventsV2(ch: ClickhouseWriter, settings?: ClickHouseSe
     settings: {
       enable_json_type: 1,
       type_json_skip_duplicated_paths: 1,
+      input_format_json_infer_array_of_dynamic_from_array_of_different_types: 1,
       input_format_json_throw_on_bad_escape_sequence: 0,
       input_format_json_use_string_type_for_ambiguous_paths_in_named_tuples_inference_from_objects: 1,
       ...settings,
@@ -175,10 +215,7 @@ export function insertTaskEventsV2(ch: ClickhouseWriter, settings?: ClickHouseSe
   });
 }
 
-export function getTraceSummaryQueryBuilderV2(
-  ch: ClickhouseReader,
-  settings?: ClickHouseSettings
-) {
+export function getTraceSummaryQueryBuilderV2(ch: ClickhouseReader, settings?: ClickHouseSettings) {
   return ch.queryBuilderFast<TaskEventSummaryV1Result>({
     name: "getTraceEventsV2",
     table: "trigger_dev.task_events_v2",
@@ -220,10 +257,7 @@ export function getTraceDetailedSummaryQueryBuilderV2(
   });
 }
 
-export function getSpanDetailsQueryBuilderV2(
-  ch: ClickhouseReader,
-  settings?: ClickHouseSettings
-) {
+export function getSpanDetailsQueryBuilderV2(ch: ClickhouseReader, settings?: ClickHouseSettings) {
   return ch.queryBuilder({
     name: "getSpanDetailsV2",
     baseQuery:
@@ -233,6 +267,17 @@ export function getSpanDetailsQueryBuilderV2(
   });
 }
 
+export function getTraceEventsForExportQueryBuilderV2(
+  ch: ClickhouseReader,
+  settings?: ClickHouseSettings
+) {
+  return ch.queryBuilderFast<TaskEventExportRow>({
+    name: "getTraceEventsForExportV2",
+    table: "trigger_dev.task_events_v2",
+    columns: [...TASK_EVENT_EXPORT_COLUMNS],
+    settings,
+  });
+}
 
 // ============================================================================
 // Search Table Query Builders (for logs page, using task_events_search_v1)
@@ -300,7 +345,7 @@ export const LogDetailV2Result = z.object({
   kind: z.string(),
   status: z.string(),
   duration: z.number().or(z.string()),
-  attributes_text: z.string()
+  attributes_text: z.string(),
 });
 
 export type LogDetailV2Result = z.output<typeof LogDetailV2Result>;

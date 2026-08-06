@@ -1,18 +1,31 @@
 import { randomUUID } from "crypto";
 import { env as stdEnv } from "std-env";
 import { z } from "zod";
-import { AdditionalEnvVars, BoolEnv } from "./envUtil.js";
+import { AdditionalEnvVars, BoolEnv, NodeLabelValue, Tolerations } from "./envUtil.js";
 
-const Env = z
+export const Env = z
   .object({
     // This will come from `spec.nodeName` in k8s
     TRIGGER_WORKER_INSTANCE_NAME: z.string().default(randomUUID()),
     TRIGGER_WORKER_HEARTBEAT_INTERVAL_SECONDS: z.coerce.number().default(30),
 
+    // Opt-in, dev-only: stream this process's logs over a local telnet/TCP socket on this port.
+    SUPERVISOR_TELNET_LOGS_PORT: z.coerce.number().optional(),
+
     // Required settings
     TRIGGER_API_URL: z.string().url(),
-    TRIGGER_WORKER_TOKEN: z.string(), // accepts file:// path to read from a file
+    TRIGGER_WORKER_TOKEN: z.string().min(1), // accepts file:// path to read from a file
     MANAGED_WORKER_SECRET: z.string(),
+
+    // Deployment token: sign a token into TRIGGER_DEPLOYMENT_ID at pod creation and verify it on
+    // inbound workload calls. "disabled" = off; "log" = mint + verify + metrics only; "enforce" =
+    // also reject invalid tokens.
+    WORKLOAD_TOKEN_SECRET: z.string().optional(),
+    WORKLOAD_TOKEN_ENFORCEMENT: z.enum(["disabled", "log", "enforce"]).default("disabled"),
+    DELETE_CHECKPOINTS_ON_COMPLETION: BoolEnv.default(false), // irreversible; enable per cluster
+    // Absolute expiry for minted deployment tokens. Deterministic (no wall-clock issued-at) so every
+    // pod of a deployment carries an identical token; bump before this date. Must outlive any run.
+    WORKLOAD_TOKEN_EXP: z.string().datetime().default("2032-01-01T00:00:00.000Z"),
     OTEL_EXPORTER_OTLP_ENDPOINT: z.string().url(), // set on the runners
 
     // Workload API settings (coordinator mode) - the workload API is what the run controller connects to
@@ -34,6 +47,10 @@ const Env = z
 
     // Dequeue settings (provider mode)
     TRIGGER_DEQUEUE_ENABLED: BoolEnv.default(true),
+    // Which worker-queue class this supervisor fleet serves. "default" pulls the
+    // region queue (standard/agent runs); "scheduled" pulls the dedicated
+    // scheduled-lineage queue. Run a separate fleet per class for isolation.
+    TRIGGER_WORKER_QUEUE_CLASS: z.enum(["default", "scheduled"]).default("default"),
     TRIGGER_DEQUEUE_INTERVAL_MS: z.coerce.number().int().default(250),
     TRIGGER_DEQUEUE_IDLE_INTERVAL_MS: z.coerce.number().int().default(1000),
     TRIGGER_DEQUEUE_MAX_RUN_COUNT: z.coerce.number().int().default(1),
@@ -47,10 +64,68 @@ const Env = z
     TRIGGER_DEQUEUE_SCALING_BATCH_WINDOW_MS: z.coerce.number().int().positive().default(1000), // Batch window for metrics processing (ms)
     TRIGGER_DEQUEUE_SCALING_DAMPING_FACTOR: z.coerce.number().min(0).max(1).default(0.7), // Smooths consumer count changes after EWMA (0=no scaling, 1=immediate)
 
+    // Dequeue backpressure - off by default. When enabled, the supervisor reads a
+    // verdict from Redis (written by the cluster-side aggregator) and pauses dequeues
+    // while the worker cluster can't schedule pods. Disabled = total no-op: no Redis
+    // client is created, no reads happen, and the dequeue loop is unaffected.
+    TRIGGER_DEQUEUE_BACKPRESSURE_ENABLED: BoolEnv.default(false),
+    // Safety default: even when enabled, backpressure only logs what it would do.
+    // Set to false to actually skip dequeues / freeze scale-up.
+    TRIGGER_DEQUEUE_BACKPRESSURE_DRY_RUN: BoolEnv.default(true),
+    TRIGGER_DEQUEUE_BACKPRESSURE_REDIS_KEY: z.string().default("engine:dequeue:backpressure"),
+    TRIGGER_DEQUEUE_BACKPRESSURE_REFRESH_MS: z.coerce.number().int().positive().default(1000),
+    TRIGGER_DEQUEUE_BACKPRESSURE_RAMP_MS: z.coerce.number().int().min(0).default(30_000), // Resume ramp window after release; 0 = instant resume
+
+    TRIGGER_DEQUEUE_BACKPRESSURE_MAX_VERDICT_AGE_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(120_000), // Grace window: held verdict older than this → fail-open
+    TRIGGER_DEQUEUE_BACKPRESSURE_REDIS_HOST: z.string().optional(),
+    TRIGGER_DEQUEUE_BACKPRESSURE_REDIS_PORT: z.coerce.number().int().optional(),
+    TRIGGER_DEQUEUE_BACKPRESSURE_REDIS_USERNAME: z.string().optional(),
+    TRIGGER_DEQUEUE_BACKPRESSURE_REDIS_PASSWORD: z.string().optional(),
+    TRIGGER_DEQUEUE_BACKPRESSURE_REDIS_TLS_DISABLED: BoolEnv.default(false),
+    TRIGGER_DEQUEUE_BACKPRESSURE_POD_COUNT_ENABLED: BoolEnv.default(false),
+    TRIGGER_DEQUEUE_BACKPRESSURE_POD_COUNT_DRY_RUN: BoolEnv.default(true),
+    TRIGGER_DEQUEUE_BACKPRESSURE_POD_COUNT_ENGAGE: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(10_000),
+    TRIGGER_DEQUEUE_BACKPRESSURE_POD_COUNT_RELEASE: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(5_000),
+    TRIGGER_DEQUEUE_BACKPRESSURE_POD_COUNT_REFRESH_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(5_000),
+    // Hard timeout on the apiserver /metrics scrape. A hung request would otherwise
+    // never settle and freeze the monitor's refresh loop (fail-open silently).
+    TRIGGER_DEQUEUE_BACKPRESSURE_POD_COUNT_SCRAPE_TIMEOUT_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(10_000),
+
     // Optional services
     TRIGGER_WARM_START_URL: z.string().optional(),
+    TRIGGER_WARM_START_DISPATCH_URL: z.string().optional(),
     TRIGGER_CHECKPOINT_URL: z.string().optional(),
     TRIGGER_METADATA_URL: z.string().optional(),
+
+    // Warm-start delivery verification: after a warm-start hit, probe the
+    // platform and cold-start the run if no runner acted on the dispatch
+    TRIGGER_WARM_START_VERIFY_ENABLED: BoolEnv.default(false),
+    TRIGGER_WARM_START_VERIFY_DELAY_MS: z.coerce
+      .number()
+      .int()
+      .min(1_000)
+      .max(60_000)
+      .default(10_000),
 
     // Used by the resource monitor
     RESOURCE_MONITOR_ENABLED: BoolEnv.default(false),
@@ -87,11 +162,19 @@ const Env = z
     COMPUTE_TRACE_OTLP_ENDPOINT: z.string().url().optional(), // Override for span export (derived from TRIGGER_API_URL if unset)
     COMPUTE_SNAPSHOT_DELAY_MS: z.coerce.number().int().min(0).max(60_000).default(5_000),
     COMPUTE_SNAPSHOT_DISPATCH_LIMIT: z.coerce.number().int().min(1).max(100).default(10),
+    // Instance create retries for transient placement failures (1 = no retries)
+    COMPUTE_INSTANCE_CREATE_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(10).default(3),
+    COMPUTE_INSTANCE_CREATE_RETRY_BASE_DELAY_MS: z.coerce
+      .number()
+      .int()
+      .min(0)
+      .max(10_000)
+      .default(250),
 
     // Kubernetes settings
     KUBERNETES_FORCE_ENABLED: BoolEnv.default(false),
     KUBERNETES_NAMESPACE: z.string().default("default"),
-    KUBERNETES_WORKER_NODETYPE_LABEL: z.string().default("v4-worker"),
+    KUBERNETES_WORKER_NODETYPE_LABEL: NodeLabelValue.default("v4-worker"),
     KUBERNETES_IMAGE_PULL_SECRETS: z.string().optional(), // csv
     KUBERNETES_EPHEMERAL_STORAGE_SIZE_LIMIT: z.string().default("10Gi"),
     KUBERNETES_EPHEMERAL_STORAGE_SIZE_REQUEST: z.string().default("2Gi"),
@@ -121,6 +204,16 @@ const Env = z
 
     KUBERNETES_MEMORY_OVERHEAD_GB: z.coerce.number().min(0).optional(), // Optional memory overhead to add to the limit in GB
     KUBERNETES_SCHEDULER_NAME: z.string().optional(), // Custom scheduler name for pods
+
+    // Pod DNS config — override the cluster default ndots to `KUBERNETES_POD_DNS_NDOTS`.
+    // Default k8s ndots is 5: any name with fewer than 5 dots (e.g. `api.example.com`, 2 dots) is first walked
+    // through every entry in the cluster search list (`<ns>.svc.cluster.local`, `svc.cluster.local`, `cluster.local`)
+    // before being tried as-is, turning one resolution into 4+ CoreDNS queries (×2 with A+AAAA).
+    // Overriding the default can be useful to cut CoreDNS query amplification for external domains.
+    // Note: before enabling, make sure no code path relies on search-list expansion for names with dots ≥ the value
+    // set here — those names will now hit their as-is form first and could resolve externally before falling back.
+    KUBERNETES_POD_DNS_NDOTS_OVERRIDE_ENABLED: BoolEnv.default(false),
+    KUBERNETES_POD_DNS_NDOTS: z.coerce.number().int().min(1).max(15).default(2),
     // Large machine affinity settings - large-* presets prefer a dedicated pool
     KUBERNETES_LARGE_MACHINE_AFFINITY_ENABLED: BoolEnv.default(false),
     KUBERNETES_LARGE_MACHINE_AFFINITY_POOL_LABEL_KEY: z
@@ -164,63 +257,8 @@ const Env = z
       .max(100)
       .default(20),
 
-    // Schedule toleration settings - scheduled runs tolerate taints on the dedicated pool
-    // Comma-separated list of tolerations in the format: key=value:effect
-    // For Exists operator (no value): key:effect
-    KUBERNETES_SCHEDULED_RUN_TOLERATIONS: z
-      .string()
-      .transform((val, ctx) => {
-        const tolerations = val
-          .split(",")
-          .map((entry) => entry.trim())
-          .filter((entry) => entry.length > 0)
-          .map((entry) => {
-            const colonIdx = entry.lastIndexOf(":");
-            if (colonIdx === -1) {
-              ctx.addIssue({
-                code: z.ZodIssueCode.custom,
-                message: `Invalid toleration format (missing effect): "${entry}"`,
-              });
-              return z.NEVER;
-            }
-
-            const effect = entry.slice(colonIdx + 1);
-            const validEffects = ["NoSchedule", "NoExecute", "PreferNoSchedule"];
-            if (!validEffects.includes(effect)) {
-              ctx.addIssue({
-                code: z.ZodIssueCode.custom,
-                message: `Invalid toleration effect "${effect}" in "${entry}". Must be one of: ${validEffects.join(", ")}`,
-              });
-              return z.NEVER;
-            }
-
-            const keyValue = entry.slice(0, colonIdx);
-            const eqIdx = keyValue.indexOf("=");
-            const key = eqIdx === -1 ? keyValue : keyValue.slice(0, eqIdx);
-
-            if (!key) {
-              ctx.addIssue({
-                code: z.ZodIssueCode.custom,
-                message: `Invalid toleration format (empty key): "${entry}"`,
-              });
-              return z.NEVER;
-            }
-
-            if (eqIdx === -1) {
-              return { key, operator: "Exists" as const, effect };
-            }
-
-            return {
-              key,
-              operator: "Equal" as const,
-              value: keyValue.slice(eqIdx + 1),
-              effect,
-            };
-          });
-
-        return tolerations;
-      })
-      .optional(),
+    KUBERNETES_RUNNER_TOLERATIONS: Tolerations.optional(), // every run pod
+    KUBERNETES_SCHEDULED_RUN_TOLERATIONS: Tolerations.optional(), // schedule-tree runs only
 
     // Placement tags settings
     PLACEMENT_TAGS_ENABLED: BoolEnv.default(false),
@@ -244,8 +282,29 @@ const Env = z
     // Debug
     DEBUG: BoolEnv.default(false),
     SEND_RUN_DEBUG_LOGS: BoolEnv.default(false),
+
+    // Wide-event observability - off by default. Emits one flat-keyed JSON
+    // line per natural unit of work (dequeue iteration, HTTP request, socket
+    // lifecycle). High-QPS hotpath, so the kill switch must be honoured.
+    TRIGGER_WIDE_EVENTS_ENABLED: BoolEnv.default(false),
+    // When true, also emit wide events for high-frequency HTTP routes
+    // (heartbeat, snapshots-since, logs/debug). Off in prod to keep event
+    // volume manageable; on in test environments for full-fidelity debugging.
+    TRIGGER_WIDE_EVENTS_NOISY_ROUTES: BoolEnv.default(false),
   })
   .superRefine((data, ctx) => {
+    if (
+      data.TRIGGER_DEQUEUE_BACKPRESSURE_POD_COUNT_ENABLED &&
+      data.TRIGGER_DEQUEUE_BACKPRESSURE_POD_COUNT_RELEASE >=
+        data.TRIGGER_DEQUEUE_BACKPRESSURE_POD_COUNT_ENGAGE
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "TRIGGER_DEQUEUE_BACKPRESSURE_POD_COUNT_RELEASE must be less than TRIGGER_DEQUEUE_BACKPRESSURE_POD_COUNT_ENGAGE",
+        path: ["TRIGGER_DEQUEUE_BACKPRESSURE_POD_COUNT_RELEASE"],
+      });
+    }
     if (data.COMPUTE_SNAPSHOTS_ENABLED && !data.TRIGGER_METADATA_URL) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -258,6 +317,33 @@ const Env = z
         code: z.ZodIssueCode.custom,
         message: "TRIGGER_WORKLOAD_API_DOMAIN is required when COMPUTE_SNAPSHOTS_ENABLED is true",
         path: ["TRIGGER_WORKLOAD_API_DOMAIN"],
+      });
+    }
+    if (data.WORKLOAD_TOKEN_ENFORCEMENT !== "disabled" && !data.WORKLOAD_TOKEN_SECRET) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "WORKLOAD_TOKEN_SECRET is required when WORKLOAD_TOKEN_ENFORCEMENT is not disabled",
+        path: ["WORKLOAD_TOKEN_SECRET"],
+      });
+    }
+    if (data.DELETE_CHECKPOINTS_ON_COMPLETION && data.WORKLOAD_TOKEN_ENFORCEMENT === "disabled") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "DELETE_CHECKPOINTS_ON_COMPLETION needs WORKLOAD_TOKEN_ENFORCEMENT set to log or enforce: the tenancy it deletes by comes from the deployment token, so with tokens disabled it would silently reclaim nothing",
+        path: ["DELETE_CHECKPOINTS_ON_COMPLETION"],
+      });
+    }
+    if (
+      data.TRIGGER_DEQUEUE_BACKPRESSURE_ENABLED &&
+      !data.TRIGGER_DEQUEUE_BACKPRESSURE_REDIS_HOST
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "TRIGGER_DEQUEUE_BACKPRESSURE_REDIS_HOST is required when TRIGGER_DEQUEUE_BACKPRESSURE_ENABLED is true",
+        path: ["TRIGGER_DEQUEUE_BACKPRESSURE_REDIS_HOST"],
       });
     }
   })

@@ -1,8 +1,13 @@
-import { json } from "@remix-run/server-runtime";
-import { validateJWT } from "@trigger.dev/core/v3/jwt";
+import {
+  extractJWTSub,
+  isPublicJWT,
+  validateJWT,
+  type ValidationResult,
+} from "@trigger.dev/core/v3/jwt";
+import { resolveJwtSigningKey } from "@trigger.dev/rbac";
+import { $replica } from "~/db.server";
 import { findEnvironmentById } from "~/models/runtimeEnvironment.server";
-import { AuthenticatedEnvironment } from "../apiAuth.server";
-import { logger } from "../logger.server";
+import type { AuthenticatedEnvironment } from "../apiAuth.server";
 
 export type ValidatePublicJwtKeySuccess = {
   ok: true;
@@ -34,10 +39,22 @@ export async function validatePublicJwtKey(token: string): Promise<ValidatePubli
     return { ok: false, error: "Invalid Public Access Token, environment not found." };
   }
 
-  const result = await validateJWT(
-    token,
-    environment.parentEnvironment?.apiKey ?? environment.apiKey
-  );
+  // A disabled root key does not invalidate public JWTs: disabling rotates
+  // the stored apiKey (killing tokens signed with the old value), and the
+  // rotated value keeps signing server-issued tokens so Realtime still works.
+  let result = await validateJWT(token, resolveJwtSigningKey(environment));
+
+  // PATs are signed with the env's apiKey at mint time. If the env's apiKey
+  // has since been rotated, signature verification fails against the current
+  // key — fall back to any RevokedApiKey rows still in their grace window.
+  // Only run this query on the failure path so the success path is unchanged.
+  if (!result.ok) {
+    result = await validateAgainstRevokedApiKeys(
+      token,
+      environment.parentEnvironment?.id ?? environment.id,
+      result
+    );
+  }
 
   if (!result.ok) {
     switch (result.code) {
@@ -71,62 +88,31 @@ export async function validatePublicJwtKey(token: string): Promise<ValidatePubli
   };
 }
 
-export function isPublicJWT(token: string): boolean {
-  // Split the token
-  const parts = token.split(".");
-  if (parts.length !== 3) return false;
+async function validateAgainstRevokedApiKeys(
+  token: string,
+  signingEnvironmentId: string,
+  primaryResult: ValidationResult
+): Promise<ValidationResult> {
+  const revokedApiKeys = await $replica.revokedApiKey.findMany({
+    where: {
+      runtimeEnvironmentId: signingEnvironmentId,
+      expiresAt: { gt: new Date() },
+    },
+    select: { apiKey: true },
+  });
 
-  try {
-    // Decode the payload (second part)
-    const payload = JSON.parse(decodeBase64Url(parts[1]));
-
-    if (payload === null || typeof payload !== "object") return false;
-
-    // Check for the pub: true claim
-    return "pub" in payload && payload.pub === true;
-  } catch (error) {
-    // If there's any error in decoding or parsing, it's not a valid JWT
-    return false;
-  }
-}
-
-export function extractJwtSigningSecretKey(
-  environment: AuthenticatedEnvironment & { parentEnvironment?: { apiKey: string } }
-) {
-  return environment.parentEnvironment?.apiKey ?? environment.apiKey;
-}
-
-function extractJWTSub(token: string): string | undefined {
-  // Split the token
-  const parts = token.split(".");
-  if (parts.length !== 3) return;
-
-  try {
-    // Decode the payload (second part)
-    const payload = JSON.parse(decodeBase64Url(parts[1]));
-
-    if (payload === null || typeof payload !== "object") return;
-
-    // Check for the pub: true claim
-    return "sub" in payload && typeof payload.sub === "string" ? payload.sub : undefined;
-  } catch (error) {
-    // If there's any error in decoding or parsing, it's not a valid JWT
-    return;
-  }
-}
-
-function decodeBase64Url(str: string): string {
-  // Replace URL-safe characters and add padding
-  str = str.replace(/-/g, "+").replace(/_/g, "/");
-  switch (str.length % 4) {
-    case 2:
-      str += "==";
-      break;
-    case 3:
-      str += "=";
-      break;
+  for (const { apiKey } of revokedApiKeys) {
+    const fallbackResult = await validateJWT(token, apiKey);
+    if (fallbackResult.ok) {
+      return fallbackResult;
+    }
   }
 
-  // Decode using Node.js Buffer
-  return Buffer.from(str, "base64").toString("utf8");
+  return primaryResult;
+}
+
+export { isPublicJWT };
+
+export function extractJwtSigningSecretKey(environment: AuthenticatedEnvironment) {
+  return resolveJwtSigningKey(environment);
 }

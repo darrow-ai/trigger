@@ -1,7 +1,18 @@
 const API_NAME = "resource-catalog";
 
-import { PromptManifest, QueueManifest, TaskManifest, WorkerManifest } from "../schemas/index.js";
-import { PromptMetadataWithFunctions, TaskMetadataWithFunctions, TaskSchema } from "../types/index.js";
+import type {
+  PromptManifest,
+  QueueManifest,
+  SkillManifest,
+  SkillMetadata,
+  TaskManifest,
+  WorkerManifest,
+} from "../schemas/index.js";
+import type {
+  PromptMetadataWithFunctions,
+  TaskMetadataWithFunctions,
+  TaskSchema,
+} from "../types/index.js";
 import { getGlobal, registerGlobal, unregisterGlobal } from "../utils/globals.js";
 import { type ResourceCatalog } from "./catalog.js";
 import { NoopResourceCatalog } from "./noopResourceCatalog.js";
@@ -57,6 +68,10 @@ export class ResourceCatalogAPI {
     return this.#getCatalog().listTaskManifests();
   }
 
+  public listTaskIdCollisions(): Array<{ id: string; filePaths: string[] }> {
+    return this.#getCatalog().listTaskIdCollisions();
+  }
+
   public getTaskManifest(id: string): TaskManifest | undefined {
     return this.#getCatalog().getTaskManifest(id);
   }
@@ -91,6 +106,18 @@ export class ResourceCatalogAPI {
 
   public getPromptSchema(id: string): TaskSchema | undefined {
     return this.#getCatalog().getPromptSchema(id);
+  }
+
+  public registerSkillMetadata(skill: SkillMetadata): void {
+    this.#getCatalog().registerSkillMetadata(skill);
+  }
+
+  public listSkillManifests(): Array<SkillManifest> {
+    return this.#getCatalog().listSkillManifests();
+  }
+
+  public getSkillManifest(id: string): SkillManifest | undefined {
+    return this.#getCatalog().getSkillManifest(id);
   }
 
   #getCatalog(): ResourceCatalog {

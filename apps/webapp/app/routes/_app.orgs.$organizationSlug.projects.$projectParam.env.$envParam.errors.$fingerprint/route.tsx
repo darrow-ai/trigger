@@ -1,52 +1,12 @@
-import { type LoaderFunctionArgs, type ActionFunctionArgs, json } from "@remix-run/server-runtime";
-import { type MetaFunction, useFetcher, useRevalidator } from "@remix-run/react";
+import { parseWithZod } from "@conform-to/zod";
 import { BellAlertIcon } from "@heroicons/react/20/solid";
+import { type MetaFunction, useFetcher, useRevalidator } from "@remix-run/react";
+import { type ActionFunctionArgs, json, type LoaderFunctionArgs } from "@remix-run/server-runtime";
 import { IconAlarmSnooze as IconAlarmSnoozeBase, IconCircleDotted } from "@tabler/icons-react";
-import { parse } from "@conform-to/zod";
-import { z } from "zod";
-import { ErrorStatusBadge } from "~/components/errors/ErrorStatusBadge";
-import { ServiceValidationError } from "~/v3/services/baseService.server";
-import { TypedAwait, typeddefer, useTypedLoaderData } from "remix-typedjson";
-import { requireUser, requireUserId } from "~/services/session.server";
-import {
-  EnvironmentParamSchema,
-  v3CreateBulkActionPath,
-  v3ErrorsPath,
-  v3RunsPath,
-} from "~/utils/pathBuilder";
-import { findProjectBySlug } from "~/models/project.server";
-import { findEnvironmentBySlug } from "~/models/runtimeEnvironment.server";
-import {
-  ErrorGroupPresenter,
-  type ErrorGroupActivity,
-  type ErrorGroupActivityVersions,
-  type ErrorGroupOccurrences,
-  type ErrorGroupSummary,
-  type ErrorGroupState,
-} from "~/presenters/v3/ErrorGroupPresenter.server";
-import { type NextRunList } from "~/presenters/v3/NextRunListPresenter.server";
-import { $replica } from "~/db.server";
-import { logsClickhouseClient, clickhouseClient } from "~/services/clickhouseInstance.server";
-import { NavBar, PageTitle } from "~/components/primitives/PageHeader";
-import { PageBody } from "~/components/layout/AppLayout";
-import {
-  ResizableHandle,
-  ResizablePanel,
-  ResizablePanelGroup,
-} from "~/components/primitives/Resizable";
+import { ErrorId } from "@trigger.dev/core/v3/isomorphic";
+import { isPast } from "date-fns";
 import { AnimatePresence, motion } from "framer-motion";
 import { Suspense, useEffect, useMemo, useRef, useState } from "react";
-import { Spinner } from "~/components/primitives/Spinner";
-import { Paragraph } from "~/components/primitives/Paragraph";
-import { Callout } from "~/components/primitives/Callout";
-import { Header2, Header3 } from "~/components/primitives/Headers";
-
-import { formatDistanceToNow, isPast } from "date-fns";
-
-import * as Property from "~/components/primitives/PropertyTable";
-import { TaskRunsTable } from "~/components/runs/v3/TaskRunsTable";
-import { DateTime, RelativeDateTime } from "~/components/primitives/DateTime";
-import { ErrorId } from "@trigger.dev/core/v3/isomorphic";
 import {
   Bar,
   BarChart,
@@ -57,31 +17,72 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import TooltipPortal from "~/components/primitives/TooltipPortal";
-import { TimeFilter, timeFilterFromTo } from "~/components/runs/v3/SharedFilters";
-import { useOptimisticLocation } from "~/hooks/useOptimisticLocation";
-import { DirectionSchema, ListPagination } from "~/components/ListPagination";
-import { Button, LinkButton } from "~/components/primitives/Buttons";
+import { TypedAwait, typeddefer, useTypedLoaderData } from "remix-typedjson";
+import { z } from "zod";
+import { BugIcon } from "~/assets/icons/BugIcon";
 import { ListCheckedIcon } from "~/assets/icons/ListCheckedIcon";
-import { useOrganization } from "~/hooks/useOrganizations";
-import { useProject } from "~/hooks/useProject";
-import { useEnvironment } from "~/hooks/useEnvironment";
 import { RunsIcon } from "~/assets/icons/RunsIcon";
-import type { TaskRunListSearchFilters } from "~/components/runs/v3/RunFilters";
-import { useSearchParams } from "~/hooks/useSearchParam";
-import { CopyableText } from "~/components/primitives/CopyableText";
-import { cn } from "~/utils/cn";
-import { LogsVersionFilter } from "~/components/logs/LogsVersionFilter";
 import { CodeBlock } from "~/components/code/CodeBlock";
-
-import { Popover, PopoverArrowTrigger, PopoverContent } from "~/components/primitives/Popover";
-import { ErrorGroupActions } from "~/v3/services/errorGroupActions.server";
+import { ErrorStatusBadge } from "~/components/errors/ErrorStatusBadge";
 import {
-  ErrorStatusMenuItems,
   CustomIgnoreDialog,
+  ErrorStatusMenuItems,
   statusActionToastMessage,
 } from "~/components/errors/ErrorStatusMenu";
+import { PageBody } from "~/components/layout/AppLayout";
+import { DirectionSchema, ListPagination } from "~/components/ListPagination";
+import { LogsVersionFilter } from "~/components/logs/LogsVersionFilter";
+import { LinkButton } from "~/components/primitives/Buttons";
+import { PermissionLink } from "~/components/primitives/PermissionLink";
+import { Callout } from "~/components/primitives/Callout";
+import { CopyableText } from "~/components/primitives/CopyableText";
+import { DateTime, RelativeDateTime } from "~/components/primitives/DateTime";
+import { Header2, Header3 } from "~/components/primitives/Headers";
+import { NavBar, PageAccessories, PageTitle } from "~/components/primitives/PageHeader";
+import { Paragraph } from "~/components/primitives/Paragraph";
+import { Popover, PopoverArrowTrigger, PopoverContent } from "~/components/primitives/Popover";
+import * as Property from "~/components/primitives/PropertyTable";
+import {
+  ResizableHandle,
+  ResizablePanel,
+  ResizablePanelGroup,
+} from "~/components/primitives/Resizable";
+import { Spinner } from "~/components/primitives/Spinner";
 import { useToast } from "~/components/primitives/Toast";
+import TooltipPortal from "~/components/primitives/TooltipPortal";
+import type { TaskRunListSearchFilters } from "~/components/runs/v3/RunFilters";
+import { TimeFilter, timeFilterFromTo } from "~/components/runs/v3/SharedFilters";
+import { TaskRunsTable } from "~/components/runs/v3/TaskRunsTable";
+import { $replica } from "~/db.server";
+import { useEnvironment } from "~/hooks/useEnvironment";
+import { useOptimisticLocation } from "~/hooks/useOptimisticLocation";
+import { useOrganization } from "~/hooks/useOrganizations";
+import { useProject } from "~/hooks/useProject";
+import { useSearchParams } from "~/hooks/useSearchParam";
+import { findProjectBySlug } from "~/models/project.server";
+import { findEnvironmentBySlug } from "~/models/runtimeEnvironment.server";
+import {
+  type ErrorGroupActivity,
+  type ErrorGroupActivityVersions,
+  type ErrorGroupOccurrences,
+  ErrorGroupPresenter,
+  type ErrorGroupState,
+  type ErrorGroupSummary,
+} from "~/presenters/v3/ErrorGroupPresenter.server";
+import { type NextRunList } from "~/presenters/v3/NextRunListPresenter.server";
+import { clickhouseFactory } from "~/services/clickhouse/clickhouseFactoryInstance.server";
+import { requireUser, requireUserId } from "~/services/session.server";
+import { rbac } from "~/services/rbac.server";
+import { checkPermissions } from "~/services/routeBuilders/permissions.server";
+import { cn } from "~/utils/cn";
+import {
+  EnvironmentParamSchema,
+  v3CreateBulkActionPath,
+  v3ErrorsPath,
+  v3RunsPath,
+} from "~/utils/pathBuilder";
+import { ServiceValidationError } from "~/v3/services/baseService.server";
+import { ErrorGroupActions } from "~/v3/services/errorGroupActions.server";
 
 export const meta: MetaFunction<typeof loader> = ({ data }) => {
   return [
@@ -136,10 +137,10 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   }
 
   const formData = await request.formData();
-  const submission = parse(formData, { schema: actionSchema });
+  const submission = parseWithZod(formData, { schema: actionSchema });
 
-  if (!submission.value) {
-    return json(submission);
+  if (submission.status !== "success") {
+    return json(submission.reply());
   }
 
   const actions = new ErrorGroupActions();
@@ -163,6 +164,11 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       let occurrenceCountAtIgnoreTime: number | undefined;
 
       if (submission.value.totalOccurrences) {
+        const clickhouseClient = await clickhouseFactory.getClickhouseForOrganization(
+          environment.organizationId,
+          "query"
+        );
+
         const qb = clickhouseClient.errors.listQueryBuilder();
         qb.where("organization_id = {organizationId: String}", {
           organizationId: project.organizationId,
@@ -236,6 +242,11 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const directionRaw = url.searchParams.get("direction") ?? undefined;
   const direction = directionRaw ? DirectionSchema.parse(directionRaw) : undefined;
 
+  const [logsClickhouseClient, clickhouseClient] = await Promise.all([
+    clickhouseFactory.getClickhouseForOrganization(environment.organizationId, "logs"),
+    clickhouseFactory.getClickhouseForOrganization(environment.organizationId, "standard"),
+  ]);
+
   const presenter = new ErrorGroupPresenter($replica, logsClickhouseClient, clickhouseClient);
 
   const detailPromise = presenter
@@ -271,6 +282,19 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     )
     .catch(() => ({ data: [] as ErrorGroupActivity, versions: [] as string[] }));
 
+  // Display flags for the row-menu and bulk-replay controls — the cancel/
+  // replay action routes enforce write:runs independently. Permissive in OSS.
+  const runAuth = await rbac.authenticateSession(request, {
+    userId,
+    organizationId: project.organizationId,
+  });
+  const runPermissions = runAuth.ok
+    ? checkPermissions(runAuth.ability, {
+        canCancelRuns: { action: "write", resource: { type: "runs" } },
+        canReplayRuns: { action: "write", resource: { type: "runs" } },
+      })
+    : { canCancelRuns: true, canReplayRuns: true };
+
   return typeddefer({
     data: detailPromise,
     activity: activityPromise,
@@ -278,12 +302,21 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     projectParam,
     envParam,
     fingerprint,
+    ...runPermissions,
   });
 };
 
 export default function Page() {
-  const { data, activity, organizationSlug, projectParam, envParam, fingerprint } =
-    useTypedLoaderData<typeof loader>();
+  const {
+    data,
+    activity,
+    organizationSlug,
+    projectParam,
+    envParam,
+    fingerprint,
+    canCancelRuns,
+    canReplayRuns,
+  } = useTypedLoaderData<typeof loader>();
 
   const location = useOptimisticLocation();
   const searchParams = new URLSearchParams(location.search);
@@ -324,13 +357,23 @@ export default function Page() {
           }}
           title={<span className="font-mono text-xs">{ErrorId.toFriendlyId(fingerprint)}</span>}
         />
+        <PageAccessories>
+          <LinkButton
+            to={alertsHref}
+            variant="secondary/small"
+            LeadingIcon={BellAlertIcon}
+            leadingIconClassName="text-alerts"
+          >
+            Configure alerts…
+          </LinkButton>
+        </PageAccessories>
       </NavBar>
 
       <PageBody scrollable={false}>
         <Suspense
           fallback={
-            <div className="my-2 flex items-center justify-center">
-              <div className="mx-auto flex items-center gap-2">
+            <div className="flex h-full items-center justify-center">
+              <div className="flex items-center gap-2">
                 <Spinner />
                 <Paragraph variant="small">Loading error details…</Paragraph>
               </div>
@@ -366,7 +409,8 @@ export default function Page() {
                   projectParam={projectParam}
                   envParam={envParam}
                   fingerprint={fingerprint}
-                  alertsHref={alertsHref}
+                  canCancelRuns={canCancelRuns}
+                  canReplayRuns={canReplayRuns}
                 />
               );
             }}
@@ -385,7 +429,8 @@ function ErrorGroupDetail({
   projectParam,
   envParam,
   fingerprint,
-  alertsHref,
+  canCancelRuns,
+  canReplayRuns,
 }: {
   errorGroup: ErrorGroupSummary | undefined;
   runList: NextRunList | undefined;
@@ -394,7 +439,8 @@ function ErrorGroupDetail({
   projectParam: string;
   envParam: string;
   fingerprint: string;
-  alertsHref: string;
+  canCancelRuns: boolean;
+  canReplayRuns: boolean;
 }) {
   const { value, values } = useSearchParams();
   const organization = useOrganization();
@@ -464,7 +510,9 @@ function ErrorGroupDetail({
                   >
                     View all runs
                   </LinkButton>
-                  <LinkButton
+                  <PermissionLink
+                    hasPermission={canReplayRuns}
+                    noPermissionTooltip="You don't have permission to replay runs"
                     variant="secondary/small"
                     to={v3CreateBulkActionPath(
                       organization,
@@ -477,7 +525,7 @@ function ErrorGroupDetail({
                     LeadingIcon={ListCheckedIcon}
                   >
                     Bulk replay…
-                  </LinkButton>
+                  </PermissionLink>
                   <ListPagination list={runList} />
                 </div>
               )}
@@ -497,11 +545,16 @@ function ErrorGroupDetail({
                 isLoading={false}
                 variant="dimmed"
                 additionalTableState={{ errorId: ErrorId.toFriendlyId(fingerprint) }}
+                canCancelRuns={canCancelRuns}
+                canReplayRuns={canReplayRuns}
               />
             ) : (
-              <Paragraph variant="small" className="p-4 text-text-dimmed">
-                No runs found for this error.
-              </Paragraph>
+              <div className="flex flex-1 flex-col items-center justify-center gap-3">
+                <BugIcon className="size-16 text-secondary" />
+                <Paragraph className="max-w-32 text-center text-text-dimmed">
+                  No runs found for this error.
+                </Paragraph>
+              </div>
             )}
           </div>
         </div>
@@ -510,11 +563,7 @@ function ErrorGroupDetail({
       {/* Right-hand detail sidebar */}
       <ResizableHandle id="error-detail-handle" />
       <ResizablePanel id="error-detail" min="280px" default="380px" max="500px" isStaticAtRest>
-        <ErrorDetailSidebar
-          errorGroup={errorGroup}
-          fingerprint={fingerprint}
-          alertsHref={alertsHref}
-        />
+        <ErrorDetailSidebar errorGroup={errorGroup} fingerprint={fingerprint} />
       </ResizablePanel>
     </ResizablePanelGroup>
   );
@@ -523,26 +572,16 @@ function ErrorGroupDetail({
 function ErrorDetailSidebar({
   errorGroup,
   fingerprint,
-  alertsHref,
 }: {
   errorGroup: ErrorGroupSummary;
   fingerprint: string;
-  alertsHref: string;
 }) {
   return (
     <div className="grid h-full grid-rows-[auto_1fr] overflow-hidden bg-background-bright">
-      <div className="flex items-center justify-between border-b border-grid-dimmed py-2 pl-3 pr-2">
+      <div className="border-b border-grid-dimmed px-3 py-2">
         <Header2 className="truncate">Details</Header2>
-        <LinkButton
-          to={alertsHref}
-          variant="secondary/small"
-          LeadingIcon={BellAlertIcon}
-          leadingIconClassName="text-alerts"
-        >
-          Configure alerts
-        </LinkButton>
       </div>
-      <div className="overflow-y-auto px-3 py-3 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-charcoal-600">
+      <div className="overflow-y-auto px-3 py-3 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-surface-control">
         <div className="flex flex-col gap-4">
           <Property.Table>
             {/* Status */}
@@ -550,7 +589,11 @@ function ErrorDetailSidebar({
               <Property.Label>Error status</Property.Label>
               <Property.Value>
                 <div className="flex items-center justify-between">
-                  <ErrorStatusBadge status={errorGroup.state.status} className="w-fit" />
+                  <ErrorStatusBadge
+                    status={errorGroup.state.status}
+                    prominence="bright"
+                    className="w-fit"
+                  />
                   <ErrorStatusDropdown
                     state={errorGroup.state}
                     taskIdentifier={errorGroup.taskIdentifier}
@@ -763,7 +806,7 @@ function ErrorStatusDropdown({
           <IconCircleDotted className="-ml-1 mr-1 size-3.5 text-text-bright" />
           Mark error as…
         </PopoverArrowTrigger>
-        <PopoverContent className="inline-flex !min-w-0 flex-col p-1" align="end">
+        <PopoverContent className="inline-flex min-w-0! flex-col p-1" align="end">
           <ErrorStatusMenuItems
             status={state.status}
             taskIdentifier={taskIdentifier}
@@ -834,7 +877,7 @@ function ActivityChart({
   return (
     <ResponsiveContainer width="100%" height="100%">
       <BarChart data={data} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
-        <CartesianGrid vertical={false} stroke="#272A2E" strokeDasharray="3 3" />
+        <CartesianGrid vertical={false} stroke="var(--color-grid-bright)" strokeDasharray="3 3" />
         <XAxis
           dataKey="__timestamp"
           tickFormatter={xAxisFormatter}
@@ -842,14 +885,14 @@ function ActivityChart({
           height={24}
           axisLine={false}
           tickLine={false}
-          tick={{ fontSize: 11, fill: "#878C99" }}
+          tick={{ fontSize: 11, fill: "var(--color-text-dimmed)" }}
         />
         <YAxis
           width={30}
           tickMargin={4}
           axisLine={false}
           tickLine={false}
-          tick={{ fontSize: 11, fill: "#878C99" }}
+          tick={{ fontSize: 11, fill: "var(--color-text-dimmed)" }}
           domain={["auto", (dataMax: number) => dataMax * 1.15]}
         />
         <Tooltip
@@ -898,7 +941,7 @@ const ActivityTooltip = ({
   return (
     <TooltipPortal active={active}>
       <div className="rounded-sm border border-grid-bright bg-background-dimmed px-3 py-2">
-        <Header3 className="border-b border-b-charcoal-650 pb-2">{formattedDate}</Header3>
+        <Header3 className="border-b border-b-border-bright pb-2">{formattedDate}</Header3>
         <div className="mt-2 flex flex-col gap-1">
           {payload.map((entry, i) => {
             const value = (entry.value as number) ?? 0;
@@ -920,7 +963,7 @@ function ActivityChartBlankState() {
   return (
     <div className="flex min-h-0 flex-1 items-end gap-px rounded-sm">
       {[...Array(42)].map((_, i) => (
-        <div key={i} className="h-full flex-1 bg-charcoal-850" />
+        <div key={i} className="h-full flex-1 bg-background-dimmed" />
       ))}
     </div>
   );

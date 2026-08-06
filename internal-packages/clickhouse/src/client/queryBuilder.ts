@@ -1,6 +1,6 @@
 import { z } from "zod";
-import { ClickhouseQueryFunction, ClickhouseReader, ColumnExpression } from "./types.js";
-import { ClickHouseSettings } from "@clickhouse/client";
+import type { ClickhouseQueryFunction, ClickhouseReader, ColumnExpression } from "./types.js";
+import type { ClickHouseSettings } from "@clickhouse/client";
 export type QueryParamValue = string | number | boolean | Array<string | number | boolean> | null;
 export type QueryParams = Record<string, QueryParamValue>;
 
@@ -253,6 +253,24 @@ export class ClickhouseQueryFastBuilder<TOutput extends Record<string, any>> {
     });
 
     return queryFunction(params);
+  }
+
+  /**
+   * Like {@link execute} but streams rows instead of buffering them into an
+   * array. Returns an async iterable so the whole result set is never resident
+   * in memory at once.
+   */
+  executeStream(): AsyncIterable<TOutput> {
+    const { query, params } = this.build();
+
+    const streamFunction = this.reader.queryFastStream<TOutput, Record<string, any>>({
+      name: this.name,
+      query,
+      columns: this.columns,
+      settings: this.settings,
+    });
+
+    return streamFunction(params);
   }
 
   build(): { query: string; params: QueryParams } {

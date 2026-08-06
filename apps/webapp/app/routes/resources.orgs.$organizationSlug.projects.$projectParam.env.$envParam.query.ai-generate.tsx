@@ -8,7 +8,7 @@ import type { AITimeFilter } from "~/routes/_app.orgs.$organizationSlug.projects
 import { requireUserId } from "~/services/session.server";
 import { EnvironmentParamSchema } from "~/utils/pathBuilder";
 import { AIQueryService } from "~/v3/services/aiQueryService.server";
-import { querySchemas } from "~/v3/querySchemas";
+import { listableQuerySchemas } from "~/v3/querySchemas";
 
 const RequestSchema = z.object({
   prompt: z.string().min(1, "Prompt is required"),
@@ -85,7 +85,9 @@ export async function action({ request, params }: ActionFunctionArgs) {
   const { prompt, mode, currentQuery } = submission.data;
 
   const service = new AIQueryService(
-    querySchemas,
+    listableQuerySchemas({
+      includeQueueMetrics: env.QUEUE_METRICS_QUERY_TABLES_VISIBLE === "1",
+    }),
     openai(env.AI_RUN_FILTER_MODEL ?? "gpt-4o-mini")
   );
 
@@ -116,19 +118,19 @@ export async function action({ request, params }: ActionFunctionArgs) {
         for await (const part of result.fullStream) {
           switch (part.type) {
             case "text-delta": {
-              sendEvent({ type: "thinking", content: part.textDelta });
+              sendEvent({ type: "thinking", content: part.text });
               break;
             }
             case "tool-call": {
               sendEvent({
                 type: "tool_call",
                 tool: part.toolName,
-                args: part.args,
+                args: part.input,
               });
 
               // If it's a setTimeFilter call, emit the time_filter event immediately
               if (part.toolName === "setTimeFilter") {
-                const args = part.args as { period?: string; from?: string; to?: string };
+                const args = part.input as { period?: string; from?: string; to?: string };
                 sendEvent({
                   type: "time_filter",
                   filter: {

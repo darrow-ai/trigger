@@ -44,13 +44,12 @@ export const getCurrentWorker = {
       contents.push(`The worker has ${worker.tasks.length} tasks registered:`);
 
       for (const task of worker.tasks) {
-        contents.push(`- ${task.slug} in ${task.filePath}`);
+        const label = task.triggerSource === "AGENT" ? " [agent]" : "";
+        contents.push(`- ${task.slug}${label} in ${task.filePath}`);
       }
 
       contents.push("");
-      contents.push(
-        "Use the `get_task_schema` tool with a task slug to get its payload schema."
-      );
+      contents.push("Use the `get_task_schema` tool with a task slug to get its payload schema.");
     } else {
       contents.push(`The worker has no tasks registered.`);
     }
@@ -127,7 +126,7 @@ export const triggerTaskTool = {
     const contents = [
       `Task ${input.taskId} triggered and run with ID created: ${result.id}.`,
       `View the run in the dashboard: ${taskRunUrl}`,
-      `Use the ${toolsMetadata.wait_for_run_to_complete.name} tool to wait for the run to complete and the ${toolsMetadata.get_run_details.name} tool to get the details of the run.`,
+      `The run is now executing in the background. Do not wait for it to complete unless the user asked you to. If they did, use the ${toolsMetadata.wait_for_run_to_complete.name} tool. Otherwise, use the ${toolsMetadata.get_run_details.name} tool to check on it when needed.`,
     ];
 
     if (input.environment === "dev") {
@@ -197,16 +196,10 @@ export const getTaskSchemaTool = {
 
     if (!task) {
       const available = workerResult.data.worker.tasks.map((t) => t.slug).join(", ");
-      return respondWithError(
-        `Task "${input.taskSlug}" not found. Available tasks: ${available}`
-      );
+      return respondWithError(`Task "${input.taskSlug}" not found. Available tasks: ${available}`);
     }
 
-    const content = [
-      `## ${task.slug}`,
-      "",
-      `**File:** ${task.filePath}`,
-    ];
+    const content = [`## ${task.slug}`, "", `**File:** ${task.filePath}`];
 
     if (task.payloadSchema) {
       content.push("");

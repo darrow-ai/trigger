@@ -1,8 +1,6 @@
-import {
-  AsyncIterableStream,
-  createAsyncIterableStreamFromAsyncIterable,
-} from "../streams/asyncIterableStream.js";
-import {
+import type { AsyncIterableStream } from "../streams/asyncIterableStream.js";
+import { createAsyncIterableStreamFromAsyncIterable } from "../streams/asyncIterableStream.js";
+import type {
   RealtimeStreamOperationOptions,
   RealtimeStreamInstance,
   RealtimeStreamsManager,
@@ -15,7 +13,7 @@ export class NoopRealtimeStreamsManager implements RealtimeStreamsManager {
     options?: RealtimeStreamOperationOptions
   ): RealtimeStreamInstance<T> {
     return {
-      wait: () => Promise.resolve(),
+      wait: () => Promise.resolve({}),
       get stream(): AsyncIterableStream<T> {
         return createAsyncIterableStreamFromAsyncIterable(source);
       },

@@ -3,8 +3,11 @@ import {
   ApiRunListPresenter,
   ApiRunListSearchParams,
 } from "~/presenters/v3/ApiRunListPresenter.server";
-import { logger } from "~/services/logger.server";
-import { createLoaderApiRoute } from "~/services/routeBuilders/apiBuilder.server";
+import {
+  anyResource,
+  createLoaderApiRoute,
+  everyResource,
+} from "~/services/routeBuilders/apiBuilder.server";
 
 export const loader = createLoaderApiRoute(
   {
@@ -13,8 +16,25 @@ export const loader = createLoaderApiRoute(
     corsStrategy: "all",
     authorization: {
       action: "read",
-      resource: (_, __, searchParams) => ({ tasks: searchParams["filter[taskIdentifier]"] }),
-      superScopes: ["read:runs", "read:all", "admin"],
+      resource: (_, __, searchParams) => {
+        const taskFilter = searchParams["filter[taskIdentifier]"] ?? [];
+        // Pre-RBAC, the resource was `{ tasks: searchParams["filter[taskIdentifier]"] }`
+        // and the legacy `checkAuthorization` iterated `Object.keys` — so a
+        // JWT with type-level `read:tasks` (no id) granted access to the
+        // unfiltered runs list. The new ability model only matches against
+        // resources we list. Keep type-level runs/tasks as alternatives so
+        // broad scopes retain that behavior. ID-scoped keys, however, must
+        // match every task in a multi-task filter; matching one item must not
+        // expose the others.
+        if (taskFilter.length === 0) {
+          return anyResource([{ type: "runs" }, { type: "tasks" }]);
+        }
+
+        return everyResource(
+          taskFilter.map((id) => ({ type: "tasks", id })),
+          [{ type: "runs" }, { type: "tasks" }]
+        );
+      },
     },
     findResource: async () => 1, // This is a dummy function, we don't need to find a resource
   },

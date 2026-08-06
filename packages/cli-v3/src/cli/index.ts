@@ -12,12 +12,14 @@ import { configurePromoteCommand } from "../commands/promote.js";
 import { configureSwitchProfilesCommand } from "../commands/switch.js";
 import { configureUpdateCommand } from "../commands/update.js";
 import { configureWhoamiCommand } from "../commands/whoami.js";
+import { configureMintTokenCommand } from "../commands/mint-token.js";
 import { configureMcpCommand } from "../commands/mcp.js";
+import { configureReportCommand } from "../commands/report.js";
 import { COMMAND_NAME } from "../consts.js";
 import { VERSION } from "../version.js";
 import { installExitHandler } from "./common.js";
 import { configureInstallMcpCommand } from "../commands/install-mcp.js";
-import { configureInstallRulesCommand } from "../commands/install-rules.js";
+import { configureSkillsCommand } from "../commands/skills.js";
 
 export const program = new Command();
 
@@ -33,6 +35,7 @@ configureEnvCommand(program);
 configureDeployCommand(program);
 configurePromoteCommand(program);
 configureWhoamiCommand(program);
+configureMintTokenCommand(program);
 configureLogoutCommand(program);
 configureListProfilesCommand(program);
 configureSwitchProfilesCommand(program);
@@ -40,7 +43,8 @@ configureUpdateCommand(program);
 configurePreviewCommand(program);
 configureAnalyzeCommand(program);
 configureMcpCommand(program);
+configureReportCommand(program);
 configureInstallMcpCommand(program);
-configureInstallRulesCommand(program);
+configureSkillsCommand(program);
 
 installExitHandler();

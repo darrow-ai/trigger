@@ -1,49 +1,25 @@
-import { z } from "zod";
+import type { z } from "zod";
 import { errAsync, fromPromise, type ResultAsync } from "neverthrow";
 import { prisma } from "~/db.server";
-import { type PlatformNotificationScope, type PlatformNotificationSurface } from "@trigger.dev/database";
+import {
+  type PlatformNotificationScope,
+  type PlatformNotificationSurface,
+} from "@trigger.dev/database";
 import { incrementCliRequestCounter } from "./platformNotificationCounter.server";
+import {
+  CreatePlatformNotificationSchema,
+  type CreatePlatformNotificationInput,
+  type PayloadV1,
+  PayloadV1Schema,
+  UpdatePlatformNotificationSchema,
+} from "./platformNotificationSchemas";
+import { isCliVersionEligible } from "./platformNotificationVersionTargeting";
 
-// --- Payload schema (spec v1) ---
-
-const DiscoverySchema = z.object({
-  filePatterns: z.array(z.string().min(1)).min(1),
-  contentPattern: z
-    .string()
-    .max(200)
-    .optional()
-    .refine(
-      (val) => {
-        if (!val) return true;
-        try {
-          new RegExp(val);
-          return true;
-        } catch {
-          return false;
-        }
-      },
-      { message: "contentPattern must be a valid regular expression" }
-    ),
-  matchBehavior: z.enum(["show-if-found", "show-if-not-found"]),
-});
-
-const CardDataV1Schema = z.object({
-  type: z.enum(["card", "info", "warn", "error", "success", "changelog"]),
-  title: z.string(),
-  description: z.string(),
-  image: z.string().url().optional(),
-  actionLabel: z.string().optional(),
-  actionUrl: z.string().url().optional(),
-  dismissOnAction: z.boolean().optional(),
-  discovery: DiscoverySchema.optional(),
-});
-
-const PayloadV1Schema = z.object({
-  version: z.literal("1"),
-  data: CardDataV1Schema,
-});
-
-export type PayloadV1 = z.infer<typeof PayloadV1Schema>;
+export {
+  CreatePlatformNotificationSchema,
+  UpdatePlatformNotificationSchema,
+} from "./platformNotificationSchemas";
+export type { CreatePlatformNotificationInput, PayloadV1 } from "./platformNotificationSchemas";
 
 export type PlatformNotificationWithPayload = {
   id: string;
@@ -59,13 +35,13 @@ export type PlatformNotificationWithPayload = {
 export async function getAdminNotificationsList({
   page = 1,
   pageSize = 20,
-  hideArchived = false,
+  hideInactive = false,
 }: {
   page?: number;
   pageSize?: number;
-  hideArchived?: boolean;
+  hideInactive?: boolean;
 }) {
-  const where = hideArchived ? { archivedAt: null } : {};
+  const where = hideInactive ? { archivedAt: null, endsAt: { gt: new Date() } } : {};
 
   const [notifications, total] = await Promise.all([
     prisma.platformNotification.findMany({
@@ -98,6 +74,9 @@ export async function getAdminNotificationsList({
         title: n.title,
         surface: n.surface,
         scope: n.scope,
+        userId: n.userId,
+        organizationId: n.organizationId,
+        projectId: n.projectId,
         priority: n.priority,
         startsAt: n.startsAt,
         endsAt: n.endsAt,
@@ -109,6 +88,13 @@ export async function getAdminNotificationsList({
         payloadDescription: parsed.success ? parsed.data.data.description : null,
         payloadActionUrl: parsed.success ? parsed.data.data.actionUrl : null,
         payloadImage: parsed.success ? parsed.data.data.image : null,
+        payloadDismissOnAction: parsed.success
+          ? (parsed.data.data.dismissOnAction ?? false)
+          : false,
+        payloadDiscovery: parsed.success ? (parsed.data.data.discovery ?? null) : null,
+        payloadMinimumCliVersion: parsed.success
+          ? (parsed.data.data.minimumCliVersion ?? null)
+          : null,
         cliMaxShowCount: n.cliMaxShowCount,
         cliMaxDaysAfterFirstSeen: n.cliMaxDaysAfterFirstSeen,
         cliShowEvery: n.cliShowEvery,
@@ -280,16 +266,66 @@ export async function recordNotificationClicked({
   });
 }
 
+// --- Membership verification ---
+
+export async function verifyOrgMembership({
+  userId,
+  organizationId,
+  projectId,
+}: {
+  userId: string;
+  organizationId?: string;
+  projectId?: string;
+}): Promise<{ organizationId?: string; projectId?: string }> {
+  if (!organizationId) return {};
+
+  const membership = await prisma.orgMember.findFirst({
+    where: { userId, organizationId },
+    select: { organizationId: true },
+  });
+
+  if (!membership) return {};
+
+  if (projectId) {
+    const project = await prisma.project.findFirst({
+      where: { id: projectId, organizationId, deletedAt: null },
+      select: { id: true },
+    });
+    if (!project) return { organizationId };
+  }
+
+  return { organizationId, projectId };
+}
+
 // --- Read: recent changelogs (for Help & Feedback) ---
 
-export async function getRecentChangelogs({ limit = 2 }: { limit?: number } = {}) {
-  // NOTE: Intentionally not filtering by archivedAt, startsAt, or endsAt.
+export async function getRecentChangelogs({
+  userId,
+  organizationId,
+  projectId,
+  limit = 2,
+}: {
+  userId: string;
+  organizationId?: string;
+  projectId?: string;
+  limit?: number;
+}) {
+  // NOTE: Intentionally not filtering by archivedAt or endsAt.
   // We want to show archived and expired changelogs in the "What's new" section
   // so users can still find recent release notes.
+  // We DO filter by scope (to prevent user-scoped changelogs leaking to others)
+  // and by startsAt (to hide changelogs scheduled for the future).
   const notifications = await prisma.platformNotification.findMany({
     where: {
       surface: "WEBAPP",
       payload: { path: ["data", "type"], equals: "changelog" },
+      startsAt: { lte: new Date() },
+      OR: [
+        { scope: "GLOBAL" },
+        { scope: "USER", userId },
+        ...(organizationId ? [{ scope: "ORGANIZATION" as const, organizationId }] : []),
+        ...(projectId ? [{ scope: "PROJECT" as const, projectId }] : []),
+      ],
     },
     orderBy: [{ createdAt: "desc" }],
     take: limit,
@@ -358,9 +394,11 @@ function isCliNotificationExpired(
 export async function getNextCliNotification({
   userId,
   projectRef,
+  cliVersion,
 }: {
   userId: string;
   projectRef?: string;
+  cliVersion?: string;
 }): Promise<{
   id: string;
   payload: PayloadV1;
@@ -443,10 +481,11 @@ export async function getNextCliNotification({
     const interaction = n.interactions[0] ?? null;
 
     if (interaction?.cliDismissedAt) continue;
-    if (isCliNotificationExpired(interaction, n)) continue;
 
     const parsed = PayloadV1Schema.safeParse(n.payload);
     if (!parsed.success) continue;
+    if (!isCliVersionEligible(parsed.data.data.minimumCliVersion, cliVersion)) continue;
+    if (isCliNotificationExpired(interaction, n)) continue;
 
     // Check cliShowEvery using the global request counter
     if (n.cliShowEvery !== null && requestCounter % n.cliShowEvery !== 0) {
@@ -457,8 +496,7 @@ export async function getNextCliNotification({
     // If this display reaches cliMaxShowCount, also set cliDismissedAt now
     // so it's recorded immediately rather than waiting for a future request.
     const reachedMaxShows =
-      n.cliMaxShowCount !== null &&
-      ((interaction?.showCount ?? 0) + 1) >= n.cliMaxShowCount;
+      n.cliMaxShowCount !== null && (interaction?.showCount ?? 0) + 1 >= n.cliMaxShowCount;
 
     const updated = await prisma.platformNotificationInteraction.upsert({
       where: { notificationId_userId: { notificationId: n.id, userId } },
@@ -486,142 +524,9 @@ export async function getNextCliNotification({
   return null;
 }
 
-// --- Create: admin endpoint support ---
+// --- Create and update: admin endpoint support ---
 
-const SCOPE_REQUIRED_FK: Record<string, "userId" | "organizationId" | "projectId"> = {
-  USER: "userId",
-  ORGANIZATION: "organizationId",
-  PROJECT: "projectId",
-};
-
-const ALL_FK_FIELDS = ["userId", "organizationId", "projectId"] as const;
-const CLI_ONLY_FIELDS = ["cliMaxDaysAfterFirstSeen", "cliMaxShowCount", "cliShowEvery"] as const;
-
-export const CreatePlatformNotificationSchema = z
-  .object({
-    title: z.string().min(1),
-    payload: PayloadV1Schema,
-    surface: z.enum(["WEBAPP", "CLI"]),
-    scope: z.enum(["USER", "PROJECT", "ORGANIZATION", "GLOBAL"]),
-    userId: z.string().optional(),
-    organizationId: z.string().optional(),
-    projectId: z.string().optional(),
-    startsAt: z
-      .string()
-      .datetime()
-      .transform((s) => new Date(s))
-      .optional(),
-    endsAt: z
-      .string()
-      .datetime()
-      .transform((s) => new Date(s)),
-    priority: z.number().int().default(0),
-    cliMaxDaysAfterFirstSeen: z.number().int().positive().optional(),
-    cliMaxShowCount: z.number().int().positive().optional(),
-    cliShowEvery: z.number().int().min(2).optional(),
-  })
-  .superRefine((data, ctx) => {
-    validateScopeForeignKeys(data, ctx);
-    validateSurfaceFields(data, ctx);
-    validatePayloadTypeForSurface(data, ctx);
-    validateStartsAt(data, ctx);
-    validateEndsAt(data, ctx);
-  });
-
-function validateScopeForeignKeys(
-  data: { scope: string; userId?: string; organizationId?: string; projectId?: string },
-  ctx: z.RefinementCtx
-) {
-  const requiredFk = SCOPE_REQUIRED_FK[data.scope];
-
-  if (requiredFk && !data[requiredFk]) {
-    ctx.addIssue({
-      code: "custom",
-      message: `${requiredFk} is required when scope is ${data.scope}`,
-      path: [requiredFk],
-    });
-  }
-
-  const forbiddenFks = ALL_FK_FIELDS.filter((fk) => fk !== requiredFk);
-  for (const fk of forbiddenFks) {
-    if (data[fk]) {
-      ctx.addIssue({
-        code: "custom",
-        message: `${fk} must not be set when scope is ${data.scope}`,
-        path: [fk],
-      });
-    }
-  }
-}
-
-function validateSurfaceFields(
-  data: {
-    surface: string;
-    cliMaxDaysAfterFirstSeen?: number;
-    cliMaxShowCount?: number;
-    cliShowEvery?: number;
-  },
-  ctx: z.RefinementCtx
-) {
-  if (data.surface !== "WEBAPP") return;
-
-  for (const field of CLI_ONLY_FIELDS) {
-    if (data[field] !== undefined) {
-      ctx.addIssue({
-        code: "custom",
-        message: `${field} is not allowed for WEBAPP surface`,
-        path: [field],
-      });
-    }
-  }
-}
-
-function validateStartsAt(data: { startsAt?: Date }, ctx: z.RefinementCtx) {
-  if (!data.startsAt) return;
-
-  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
-  if (data.startsAt < oneHourAgo) {
-    ctx.addIssue({
-      code: "custom",
-      message: "startsAt must be within the last hour or in the future",
-      path: ["startsAt"],
-    });
-  }
-}
-
-const CLI_TYPES = new Set(["info", "warn", "error", "success"]);
-const WEBAPP_TYPES = new Set(["card", "changelog"]);
-
-function validatePayloadTypeForSurface(
-  data: { surface: string; payload: PayloadV1 },
-  ctx: z.RefinementCtx
-) {
-  const allowedTypes = data.surface === "CLI" ? CLI_TYPES : WEBAPP_TYPES;
-  if (!allowedTypes.has(data.payload.data.type)) {
-    ctx.addIssue({
-      code: "custom",
-      message: `payload.data.type "${data.payload.data.type}" is not allowed for ${data.surface} surface`,
-      path: ["payload", "data", "type"],
-    });
-  }
-}
-
-function validateEndsAt(data: { startsAt?: Date; endsAt: Date }, ctx: z.RefinementCtx) {
-  const effectiveStart = data.startsAt ?? new Date();
-  if (data.endsAt <= effectiveStart) {
-    ctx.addIssue({
-      code: "custom",
-      message: "endsAt must be after startsAt",
-      path: ["endsAt"],
-    });
-  }
-}
-
-export type CreatePlatformNotificationInput = z.input<typeof CreatePlatformNotificationSchema>;
-
-type CreateError =
-  | { type: "validation"; issues: z.ZodIssue[] }
-  | { type: "db"; message: string };
+type CreateError = { type: "validation"; issues: z.ZodIssue[] } | { type: "db"; message: string };
 
 export function createPlatformNotification(
   input: CreatePlatformNotificationInput
@@ -658,4 +563,61 @@ export function createPlatformNotification(
       message: e instanceof Error ? e.message : String(e),
     })
   );
+}
+
+export function updatePlatformNotification(
+  input: z.input<typeof UpdatePlatformNotificationSchema>
+): ResultAsync<{ id: string; friendlyId: string }, CreateError> {
+  const parseResult = UpdatePlatformNotificationSchema.safeParse(input);
+
+  if (!parseResult.success) {
+    return errAsync({ type: "validation", issues: parseResult.error.issues });
+  }
+
+  const data = parseResult.data;
+
+  return fromPromise(
+    prisma.platformNotification.update({
+      where: { id: data.id },
+      data: {
+        title: data.title,
+        payload: data.payload,
+        surface: data.surface as PlatformNotificationSurface,
+        scope: data.scope as PlatformNotificationScope,
+        userId: data.scope === "USER" ? data.userId : null,
+        organizationId: data.scope === "ORGANIZATION" ? data.organizationId : null,
+        projectId: data.scope === "PROJECT" ? data.projectId : null,
+        startsAt: data.startsAt,
+        endsAt: data.endsAt,
+        priority: data.priority,
+        cliMaxDaysAfterFirstSeen:
+          data.surface === "CLI" ? (data.cliMaxDaysAfterFirstSeen ?? null) : null,
+        cliMaxShowCount: data.surface === "CLI" ? (data.cliMaxShowCount ?? null) : null,
+        cliShowEvery: data.surface === "CLI" ? (data.cliShowEvery ?? null) : null,
+      },
+      select: { id: true, friendlyId: true },
+    }),
+    (e): CreateError => ({
+      type: "db",
+      message: e instanceof Error ? e.message : String(e),
+    })
+  );
+}
+
+export async function deletePlatformNotification(id: string): Promise<void> {
+  await prisma.platformNotification.delete({ where: { id } });
+}
+
+export async function publishNowPlatformNotification(id: string): Promise<void> {
+  await prisma.platformNotification.update({
+    where: { id },
+    data: { startsAt: new Date() },
+  });
+}
+
+export async function archivePlatformNotification(id: string): Promise<void> {
+  await prisma.platformNotification.update({
+    where: { id },
+    data: { archivedAt: new Date() },
+  });
 }

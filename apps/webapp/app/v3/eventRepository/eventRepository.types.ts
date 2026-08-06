@@ -1,4 +1,4 @@
-import { Attributes, Tracer } from "@opentelemetry/api";
+import type { Attributes, Tracer } from "@opentelemetry/api";
 import type {
   ExceptionEventProperties,
   SpanEvents,
@@ -14,6 +14,7 @@ import type {
   TaskEventStatus,
   TaskRun,
 } from "@trigger.dev/database";
+import type { MetricsV1Input } from "@internal/clickhouse";
 import type { DetailedTraceEvent, TaskEventStoreTable } from "../taskEventStore.server";
 export type { ExceptionEventProperties };
 
@@ -307,6 +308,8 @@ export type TraceSummary = {
   rootSpan: SpanSummary;
   spans: Array<SpanSummary>;
   overridesBySpanId?: Record<string, SpanOverride>;
+  /** Set when a subtree fetch hit the row cap before collecting all descendants. */
+  isTruncated?: boolean;
 };
 
 export type SpanDetailedSummary = {
@@ -329,9 +332,29 @@ export type SpanDetailedSummary = {
   children: Array<SpanDetailedSummary>;
 };
 
+// A single trace event for the streaming export path (the "Download trace"
+// feature). Deliberately flat and self-contained: it carries its own parent ref
+// so hierarchy is reconstructable downstream without ever building a tree. Used
+// by `streamTraceEvents`, which yields these one at a time so an arbitrarily
+// large trace is never fully resident in memory.
+export type StreamedTraceEvent = {
+  spanId: string;
+  parentSpanId: string;
+  startTime: Date;
+  durationNs: number;
+  level: string;
+  message: string;
+  isError: boolean;
+  // Span attributes/properties as a raw JSON string, emitted verbatim (the
+  // ClickHouse store already materialises it as text — no per-row parse).
+  propertiesText: string;
+};
+
 export type TraceDetailedSummary = {
   traceId: string;
   rootSpan: SpanDetailedSummary;
+  /** Set when a fetch hit the row cap before collecting all spans. */
+  isTruncated?: boolean;
 };
 
 // ============================================================================
@@ -345,8 +368,9 @@ export type TraceDetailedSummary = {
 export interface IEventRepository {
   maximumLiveReloadingSetting: number;
   // Event insertion methods
-  insertMany(events: CreateEventInput[]): Promise<void>;
+  insertMany(events: CreateEventInput[]): void;
   insertManyImmediate(events: CreateEventInput[]): Promise<void>;
+  insertManyMetrics(rows: MetricsV1Input[]): void;
 
   // Run event completion methods
   completeSuccessfulRunEvent(params: { run: CompleteableTaskRun; endTime?: Date }): Promise<void>;
@@ -396,6 +420,17 @@ export interface IEventRepository {
     options?: { includeDebugLogs?: boolean }
   ): Promise<TraceSummary | undefined>;
 
+  /** Fetch the anchor span, its ancestors (for override propagation), and all descendants. */
+  getTraceSubtreeSummary(
+    storeTable: TaskEventStoreTable,
+    environmentId: string,
+    traceId: string,
+    anchorSpanId: string,
+    startCreatedAt: Date,
+    endCreatedAt?: Date,
+    options?: { includeDebugLogs?: boolean }
+  ): Promise<TraceSummary | undefined>;
+
   getTraceDetailedSummary(
     storeTable: TaskEventStoreTable,
     environmentId: string,
@@ -404,6 +439,29 @@ export interface IEventRepository {
     endCreatedAt?: Date,
     options?: { includeDebugLogs?: boolean }
   ): Promise<TraceDetailedSummary | undefined>;
+
+  /** Fetch the anchor span subtree as a detailed hierarchical trace rooted at anchorSpanId. */
+  getTraceDetailedSubtreeSummary(
+    storeTable: TaskEventStoreTable,
+    environmentId: string,
+    traceId: string,
+    anchorSpanId: string,
+    startCreatedAt: Date,
+    endCreatedAt?: Date,
+    options?: { includeDebugLogs?: boolean }
+  ): Promise<TraceDetailedSummary | undefined>;
+
+  // Streams a trace's events in start_time order, one at a time, without ever
+  // materialising the full result set or a tree. Powers the streaming trace
+  // export so arbitrarily large traces download with bounded memory.
+  streamTraceEvents(
+    storeTable: TaskEventStoreTable,
+    environmentId: string,
+    traceId: string,
+    startCreatedAt: Date,
+    endCreatedAt?: Date,
+    options?: { includeDebugLogs?: boolean }
+  ): AsyncIterable<StreamedTraceEvent>;
 
   getRunEvents(
     storeTable: TaskEventStoreTable,

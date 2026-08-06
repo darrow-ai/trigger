@@ -1,5 +1,6 @@
 import type {
   TemplateCreateRequest,
+  TemplateCreateResponse,
   InstanceCreateRequest,
   InstanceCreateResponse,
   InstanceSnapshotRequest,
@@ -10,6 +11,13 @@ export type ComputeClientOptions = {
   gatewayUrl: string;
   authToken?: string;
   timeoutMs: number;
+  /**
+   * Called once per outbound request to collect cross-service correlation
+   * headers (e.g. `traceparent`, `x-request-id`) from the caller's current
+   * scope. The returned record is merged onto the outbound headers. Return
+   * `{}` (or omit the option) to skip propagation.
+   */
+  getPropagationHeaders?: () => Record<string, string>;
 };
 
 export class ComputeClient {
@@ -39,6 +47,14 @@ class HttpTransport {
     if (this.opts.authToken) {
       h["Authorization"] = `Bearer ${this.opts.authToken}`;
     }
+    const propagation = this.opts.getPropagationHeaders?.();
+    if (propagation) {
+      for (const [key, value] of Object.entries(propagation)) {
+        if (value) {
+          h[key] = value;
+        }
+      }
+    }
     return h;
   }
 
@@ -46,7 +62,11 @@ class HttpTransport {
     return options?.signal ?? AbortSignal.timeout(this.opts.timeoutMs);
   }
 
-  async post<T = unknown>(path: string, body: unknown, options?: RequestOptions): Promise<T | undefined> {
+  async post<T = unknown>(
+    path: string,
+    body: unknown,
+    options?: RequestOptions
+  ): Promise<T | undefined> {
     const url = `${this.opts.gatewayUrl}${path}`;
 
     const response = await fetch(url, {
@@ -106,8 +126,10 @@ class TemplatesNamespace {
   async create(
     req: TemplateCreateRequest,
     options?: RequestOptions
-  ): Promise<void> {
-    await this.http.post("/api/templates", req, options);
+  ): Promise<TemplateCreateResponse | undefined> {
+    // Background mode returns 202 with no body; sync/callback mode returns
+    // the full result. Caller decides whether to inspect.
+    return this.http.post<TemplateCreateResponse>("/api/templates", req, options);
   }
 }
 
