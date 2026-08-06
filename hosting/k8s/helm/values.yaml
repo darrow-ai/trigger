@@ -491,6 +491,7 @@ electric:
     port: 3000
     targetPort: 3000
   resources: {}
+  nodeSelector: {}
 
   # Health probe configuration
   livenessProbe:

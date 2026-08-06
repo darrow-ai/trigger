@@ -1,8 +1,8 @@
 apiVersion: v2
-name: trigger
+name: trigger-chart
 description: The official Trigger.dev Helm chart
 type: application
-version: 4.0.5
+version: 4.0.6
 appVersion: v4.0.4
 home: https://trigger.dev
 sources:

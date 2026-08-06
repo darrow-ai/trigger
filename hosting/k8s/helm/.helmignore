@@ -11,7 +11,7 @@
 scripts/
 
 # Exclude package files
-*.tgz
+# *.tgz
 
 # Exclude additional values files
 values-*.yaml

@@ -88,7 +88,7 @@ export async function createEcrClient({
   region: string;
   assumeRole?: AssumeRoleConfig;
 }) {
-  if (!assumeRole) {
+  if (!assumeRole || !assumeRole.roleArn) {
     return new ECRClient({ region });
   }
 
